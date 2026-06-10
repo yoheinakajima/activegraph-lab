@@ -212,6 +212,22 @@ def _seed_findings(graph, mission_id: str, branch_id: str, *,
             "a missing API into invisible policy.",
             [],
         ),
+        (
+            "Finding: the lab's first live crawl recorded raw fetch JSON "
+            "envelopes and nav/SVG markup as site 'claims' — one claim in the "
+            "public log literally begins '{\"url\": \"https://activegraph.ai\", "
+            "\"status\": 200…'. The old extractor accepted any 30+-char "
+            "sentence containing a cue word OR a digit, and envelope JSON and "
+            "SVG path data are full of both. Fixed by stripping non-content "
+            "subtrees (script/style/svg/nav/footer, entities decoded) and "
+            "putting a shape gate in front of the cue check: candidates must "
+            "be length-bounded, sentence-terminated, mostly real words, never "
+            "parseable as JSON, no markup characters. Rejected candidates are "
+            "dropped silently — logging the cleanup would be its own "
+            "pollution. Deterministic extraction needs a shape gate, not just "
+            "cue words.",
+            [],
+        ),
     ]
     for text, extra_refs in findings:
         f = graph.add_object("observation", {

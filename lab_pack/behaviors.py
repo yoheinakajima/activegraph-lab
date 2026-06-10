@@ -166,7 +166,13 @@ def emit_lab_event(graph, event_type: str, payload: dict) -> None:
 
 # ---------------------------------------------------------------- text helpers
 
-_TAG_RE = re.compile(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", re.S | re.I)
+from html import unescape as _unescape
+
+# Non-content subtrees: their text is chrome, not claims. The live log showed
+# nav link rows and SVG path data recorded as "claims" before these were
+# dropped (the finding seeded in bundle._seed_findings tells that story).
+_DROP_RE = re.compile(
+    r"<(script|style|svg|nav|footer)[^>]*>.*?</\1\s*>", re.S | re.I)
 _HTML_RE = re.compile(r"<[^>]+>")
 _HREF_RE = re.compile(r"""href\s*=\s*["']([^"'#]+)["']""", re.I)
 
@@ -176,19 +182,51 @@ _CLAIM_CUES = (
     "deterministic", "fork", "inspect", "%",
 )
 
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*[.,;:!?)\"']*$")
+
 
 def _strip_html(html: str) -> str:
-    return _HTML_RE.sub(" ", _TAG_RE.sub(" ", html))
+    """Readable text only: drop script/style/svg/nav/footer subtrees, strip
+    remaining tags, decode entities, collapse whitespace."""
+    text = _HTML_RE.sub(" ", _DROP_RE.sub(" ", html))
+    return re.sub(r"\s+", " ", _unescape(text)).strip()
+
+
+def _sentence_like(s: str) -> bool:
+    """A claim candidate must read like prose: length-bounded, never JSON,
+    no markup fragments, mostly real words, sentence-terminated. The live log
+    showed raw fetch envelopes ('{"url": ..., "status": 200...') and SVG path
+    data pass the old cue check via its any-digit clause; this is the shape
+    gate in front of it."""
+    if not (30 <= len(s) <= 360):
+        return False
+    if any(ch in s for ch in "<>{}"):  # markup / JSON fragments
+        return False
+    if not s.endswith((".", "!", "?")):
+        return False
+    try:
+        json.loads(s)
+        return False  # whole candidate parses as JSON — an envelope, not prose
+    except ValueError:
+        pass
+    words = s.split()
+    wordish = sum(1 for w in words if _WORD_RE.match(w))
+    return len(words) >= 5 and wordish >= max(4, int(0.6 * len(words)))
 
 
 def _claims_from_text(text: str, cap: int) -> list[str]:
-    """Deterministic claim extraction: assertive sentences containing claim cues."""
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) >= 30]
+    """Deterministic claim extraction: sentence-like candidates containing
+    claim cues. Rejected candidates are dropped silently — the cleanup is not
+    an observation; polluting the log with it would be its own pollution."""
+    sentences = [re.sub(r"\s+", " ", s.strip())
+                 for s in re.split(r"(?<=[.!?])\s+", text)]
     claims = []
     for s in sentences:
+        if not _sentence_like(s):
+            continue
         low = s.lower()
         if any(cue in low for cue in _CLAIM_CUES) or re.search(r"\d", s):
-            claims.append(re.sub(r"\s+", " ", s)[:300])
+            claims.append(s)
         if len(claims) >= cap:
             break
     return claims
