@@ -1306,4 +1306,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Run as a script, this module is `__main__`; server/mcp.py imports it as
+    # `server.lab_server`. Alias the two so module globals (_llm_info, the
+    # rate limiter deque) are one copy, not divergent twins.
+    sys.modules.setdefault("server.lab_server", sys.modules[__name__])
     main()
