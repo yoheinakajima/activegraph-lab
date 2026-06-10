@@ -42,32 +42,14 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _db_path() -> str:
-    override = os.environ.get("ACTIVEGRAPH_DB")
-    if override:
-        return override
-    data = _REPO / "data"
-    data.mkdir(exist_ok=True)
-    return str(data / "lab.sqlite")
-
-
 def _memory_db_path() -> str:
+    """ADR-009 OPEN: memory_gateway's own store stays local-SQLite for now."""
     override = os.environ.get("ACTIVEGRAPH_MEMORY_DB")
     if override:
         return override
     data = _REPO / "data"
     data.mkdir(exist_ok=True)
     return str(data / "lab_memory.sqlite")
-
-
-def _store_has_run(path: str) -> bool:
-    if not os.path.exists(path):
-        return False
-    try:
-        from activegraph.store import SQLiteEventStore
-        return SQLiteEventStore.most_recent_run_id(path) is not None
-    except Exception:
-        return False
 
 
 def _rebuild_lab_registries(rt) -> None:
@@ -119,6 +101,7 @@ def _rebuild_lab_registries(rt) -> None:
 
 def _build_runtime():
     from activegraph import Runtime
+    from lab_pack import storage
     from lab_pack.bundle import build_lab, load_lab_packs
     from lab_pack.llm import select_lab_provider
     from lab_pack.settings import LabSettings
@@ -128,16 +111,18 @@ def _build_runtime():
     print(f"[lab_server] LLM: mode={_llm_info['mode']} provider={_llm_info['provider']} "
           f"model={_llm_info.get('model')}", flush=True)
 
-    db = _db_path()
-    if _store_has_run(db):
+    # ADR-009: backend selection lives in lab_pack/storage.py only. The URL
+    # is a credential (ADR-011) — log the backend name, never the URL.
+    db = storage.store_url()
+    if storage.store_has_run(db):
+        mode = "resumed"
         rt = Runtime.load(db, llm_provider=provider)
         load_lab_packs(rt, memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
         _rebuild_lab_registries(rt)
-        print(f"[lab_server] resumed run from {db} "
-              f"({len(rt.graph.events)} events)", flush=True)
     else:
+        mode = "fresh"
         rt = build_lab(
             llm_provider=provider,
             lab_settings=LabSettings(),
@@ -146,8 +131,10 @@ def _build_runtime():
         )
         rt.run_until_idle()
         rt.save_state()
-        print(f"[lab_server] fresh lab built, persisting to {db} "
-              f"({len(rt.graph.events)} events)", flush=True)
+    pending = sum(1 for d in rt.graph.objects(type="decision")
+                  if d.data.get("status") == "pending")
+    print(f"[lab_server] boot: mode={mode} backend={storage.backend()} "
+          f"events={len(rt.graph.events)} pending_decisions={pending}", flush=True)
     return rt
 
 
@@ -644,19 +631,21 @@ class Handler(BaseHTTPRequestHandler):
     # ── POST /reset ─────────────────────────────────────────────────────────
 
     def _handle_reset(self):
+        from lab_pack import storage
         global _rt
         with _lock:
             _rt = None
-            failed = []
-            for p in (_db_path(), _memory_db_path()):
-                for f in (p, p + "-wal", p + "-shm"):
+            err = storage.dev_reset()
+            if err is None:
+                for f in (_memory_db_path(), _memory_db_path() + "-wal",
+                          _memory_db_path() + "-shm"):
                     try:
                         if os.path.exists(f):
                             os.remove(f)
                     except OSError:
-                        failed.append(f)
-            if failed:
-                self._send_error_json(f"could not remove: {failed}", 500)
+                        err = f"could not remove: {f}"
+            if err:
+                self._send_error_json(err, 500)
                 return
             rt = _get_rt_unlocked()
         self._send_json({"status": "reset", "event_count": len(rt.graph.events)})

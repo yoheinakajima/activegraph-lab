@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 
 dependencies = [
-    "activegraph[llm]==1.0.5.post2",
+    "activegraph[llm,postgres]==1.0.5.post2",
     # Pinned per ADR-005. Bumping this SHA is a gated decision the lab
     # records about itself. Local dev override (single line):
     #   pip install -e ../activegraph-packs

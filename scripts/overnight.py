@@ -66,10 +66,12 @@ def main() -> int:
     from lab_pack.tools import activate_branch_fn, default_fetch_url
     from lab_pack.watchdog import check_stalls
 
-    db = REPO / "data" / "lab.sqlite"
-    db.parent.mkdir(exist_ok=True)
-    if db.exists():
-        print(f"[overnight] refusing to overwrite existing {db} — move it first")
+    from lab_pack import storage
+    db = storage.store_url()
+    if storage.store_has_run(db):
+        print(f"[overnight] refusing to seed over an existing run "
+              f"(backend={storage.backend()}) — the server will resume it; "
+              "move/clear the store first if you want a fresh mission")
         return 1
 
     settings = LabSettings(drafts_dir=str(REPO / "drafts"))
