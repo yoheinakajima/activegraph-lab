@@ -464,9 +464,18 @@ def _event_index(event_id: str) -> int:
         return -1
 
 
+_KIND_BY_TYPE = {
+    "comm_message": "chat", "comm_response_candidate": "chat",
+    "observation": "observation", "branch": "branch", "decision": "decision",
+    "artifact": "draft", "task": "task", "evaluation": "evaluation",
+    "mission": "mission", "source": "crawl",
+}
+
+
 def _build_entries(g, timeline=None) -> list[dict]:
     """Every renderable feed entry, chronological. Shared by /lab/feed,
-    /lab/entries (pagination) and /lab/stream (SSE)."""
+    /lab/entries (pagination) and /lab/stream (SSE). Each entry carries a
+    coarse `kind` for the /lab filter row (3a)."""
     entries: list[dict] = []
     if timeline is None:
         timeline = _seam_template_timeline(g)
@@ -474,11 +483,13 @@ def _build_entries(g, timeline=None) -> list[dict]:
         tmpl = (lambda kind, _i=i: _template_at(timeline, kind, _i))
         sentence = None
         branch_id = None
+        kind = None
         if e.type == "object.created":
             obj = e.payload.get("object", {}) or {}
             data = obj.get("data", {}) or {}
             sentence = _narrate_created(g, obj.get("type"), data, obj.get("id"), tmpl)
             branch_id = _branch_of_object(g, obj.get("type"), data, obj.get("id"))
+            kind = _KIND_BY_TYPE.get(str(obj.get("type")))
             if obj.get("type") == "comm_message" and not branch_id:
                 branch_id = (data.get("metadata") or {}).get("lab_branch_id")
         elif e.type == "patch.applied":
@@ -487,24 +498,49 @@ def _build_entries(g, timeline=None) -> list[dict]:
             if obj is not None:
                 sentence = _narrate_patch(g, obj, e.payload.get("diff") or {})
                 branch_id = _branch_of_object(g, str(obj.type), obj.data, str(obj.id))
+                kind = _KIND_BY_TYPE.get(str(obj.type))
+        elif e.type == "artifact.published":
+            # Marker events (ADR-013/015) are pure log entries — narrate here.
+            slug = e.payload.get("slug")
+            sentence = (f"Published: “{e.payload.get('title') or slug}” "
+                        f"→ /posts/{slug}")
+            kind = "publish"
+            a = g.get_object(e.payload.get("artifact_id"))
+            if a is not None:
+                branch_id = (a.data.get("metadata") or {}).get("lab_branch_id")
+        elif e.type == "lab.paused":
+            sentence = "Lab paused by the operator — LLM behaviors idle; answer stays live."
+            kind = "control"
+        elif e.type == "lab.resumed":
+            sentence = "Lab resumed by the operator."
+            kind = "control"
         if sentence:
             entry = {
                 "event_id": str(e.id),
                 "timestamp": str(e.timestamp) if e.timestamp else None,
                 "branch_id": branch_id,
                 "sentence": sentence,
+                "kind": kind or "event",
             }
+            if e.type == "artifact.published" and e.payload.get("slug"):
+                entry["post_url"] = f"/posts/{e.payload['slug']}"
             # B4: blog drafts carry a preview snippet + link into the thread view.
             if e.type == "object.created":
                 obj = e.payload.get("object", {}) or {}
                 data = obj.get("data", {}) or {}
                 if (data.get("metadata") or {}).get("lab") == "blog_draft":
                     body = data.get("content") or ""
+                    live = g.get_object(obj.get("id"))
+                    live_meta = (live.data.get("metadata") or {}) if live is not None else {}
                     entry["artifact"] = {
                         "id": obj.get("id"),
-                        "slug": (data.get("metadata") or {}).get("slug"),
+                        "slug": live_meta.get("slug")
+                                or (data.get("metadata") or {}).get("slug"),
                         "title": data.get("title"),
                         "preview": _shorten(body.split("##", 1)[-1], 220),
+                        # 3b: once published, the feed entry cross-links the post.
+                        "published": bool(live is not None
+                                          and live.data.get("status") == "published"),
                     }
             entry["index"] = i
             entries.append(entry)
@@ -520,6 +556,23 @@ def _feed(rt, limit: int = 100) -> dict:
     total_entries = len(all_entries)
     entries = all_entries[-limit:] if limit and limit > 0 else all_entries
     oldest_rendered = entries[0]["event_id"] if entries else None
+
+    # 3a: resolved decisions, newest first — the inbox's collapsed history.
+    resolved = []
+    for d in g.objects(type="decision"):
+        if d.data.get("status") not in ("approved", "rejected"):
+            continue
+        subject = g.get_object(d.data.get("subject_ref"))
+        resolved.append({
+            "id": str(d.id),
+            "kind": d.data.get("kind"),
+            "status": d.data.get("status"),
+            "rationale": _shorten(d.data.get("rationale") or "", 200),
+            "subject_ref": d.data.get("subject_ref"),
+            "subject_title": (subject.data.get("title") if subject is not None else None),
+            "branch_id": _branch_of_object(g, "decision", d.data, d.id),
+        })
+    resolved.sort(key=lambda x: _event_index(x["id"].replace("#", "_")), reverse=True)
 
     # The inbox: pending decisions with their evidence attached inline.
     inbox = []
@@ -561,6 +614,7 @@ def _feed(rt, limit: int = 100) -> dict:
         "llm": _llm_info,
         "mission": missions[0] if missions else None,
         "inbox": inbox,
+        "resolved": resolved,
         "total_entries": total_entries,
         "oldest_rendered": oldest_rendered,
         "mission_entries": mission_entries,
