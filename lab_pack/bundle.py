@@ -239,6 +239,56 @@ def _seed_findings(graph, mission_id: str, branch_id: str, *,
                          "evidence_refs": extra_refs},
         })
         graph.add_relation(branch_id, f.id, "supported_by")
+    queue_findings_once(graph, branch_id=branch_id, mission_id=mission_id)
+
+
+# Findings discovered after first deploy. The log is the only persistence
+# and _seed_findings never re-runs on a resumed runtime, so these can only
+# ever be APPENDED — keyed so the boot backfill is idempotent.
+LIVE_FINDINGS: list[dict] = [
+    {
+        "key": "mcp_send_chat_predicate_gap",
+        "text": (
+            "Finding: the first external MCP session surfaced a reply gap in "
+            "send_chat — operator messages tagged source=operator_via_mcp "
+            "landed in the public log (event_count advanced) but drew no "
+            "reply, and the tool returned a generic error. The lab's own "
+            "llm.requested-before-execution property was the diagnostic: "
+            "llm_calls_today stayed flat, and since blocked attempts log "
+            "BEFORE the provider runs, a flat counter means the answer "
+            "behavior never fired at all — predicate/dispatch territory, not "
+            "budget, parse, or provider failure. Fix: the answer subscription "
+            "matches operator authority (the server-stamped sender), never "
+            "the literal source tag, and send_chat now returns a structured "
+            "partial success (message event ids + reply-pending) instead of "
+            "a generic error when only the reply phase fails."
+        ),
+    },
+]
+
+
+def queue_findings_once(graph, *, branch_id: str, mission_id: str) -> int:
+    """Append any LIVE_FINDINGS missing from the graph (dedup by
+    metadata.finding_key). Called from _seed_findings on fresh builds and
+    from the server at boot on resumed ones. Returns the number appended."""
+    present = {(o.data.get("metadata") or {}).get("finding_key")
+               for o in graph.objects(type="observation")}
+    appended = 0
+    for finding in LIVE_FINDINGS:
+        if finding["key"] in present:
+            continue
+        f = graph.add_object("observation", {
+            "text": finding["text"],
+            "confidence": 0.9,
+            "category": "fact",
+            "metadata": {"lab": "finding", "finding": True,
+                         "finding_key": finding["key"],
+                         "lab_branch_id": branch_id, "mission_id": mission_id,
+                         "evidence_refs": []},
+        })
+        graph.add_relation(branch_id, f.id, "supported_by")
+        appended += 1
+    return appended
 
 
 def load_lab_packs(

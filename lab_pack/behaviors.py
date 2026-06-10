@@ -1428,6 +1428,13 @@ def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
 @llm_behavior(
     name="answer",
     on=["object.created"],
+    # INVARIANT (ADR-016): this predicate matches the channel, never the
+    # message's metadata.source provenance tag. Operator authority is the
+    # server-stamped sender (a valid token IS the operator); source is
+    # display provenance — operator, operator_via_mcp, and any future
+    # operator_via_* tag must all draw a reply. Narrowing this `where` to a
+    # literal source tag silently orphans every other operator surface
+    # (locked by the thread_equals_branch fixture and scripts/test_mcp.py).
     where={
         "object.type": "comm_message",
         "object.data.channel": "lab",

@@ -246,6 +246,19 @@ def _build_runtime():
         n = seams.apply_approved(rt.graph)
         if n:
             print(f"[lab_server] seams: re-applied {n} approved prompt seam(s)", flush=True)
+        # Findings discovered after first deploy reach a resumed log here
+        # (fresh builds get them via _seed_findings; the key dedups).
+        from lab_pack.bundle import queue_findings_once
+        mission = next(iter(rt.graph.objects(type="mission")), None)
+        seed_branch = next(iter(rt.graph.objects(type="branch")), None)
+        if mission is not None and seed_branch is not None:
+            n_f = queue_findings_once(rt.graph, branch_id=str(seed_branch.id),
+                                      mission_id=str(mission.id))
+            if n_f:
+                rt.run_until_idle()
+                rt.save_state()
+                print(f"[lab_server] findings: backfilled {n_f} live finding(s)",
+                      flush=True)
     else:
         mode = "fresh"
         rt = build_lab(
@@ -746,11 +759,14 @@ def _status_line() -> str:
 # ─── the chat path ────────────────────────────────────────────────────────────
 
 
-def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
-    """The one chat code path: POST /chat and the MCP send_chat tool both land
-    here (ADR-016). Runs on the runtime worker. `source` tags the message's
-    metadata (e.g. operator_via_mcp) so the public log distinguishes the human
-    from their assistant; either way the sender IS the operator (2b: a valid
+def _chat_post_message(rt, branch_id: str, content: str,
+                       source: Optional[str] = None):
+    """Phase 1 of the one chat code path: append the operator's message (and
+    the thread on first use) and save. Returns the ids a caller can report
+    even when the reply phase fails or times out — once this returns, the
+    message HAS landed in the log. `source` tags the message's metadata
+    (e.g. operator_via_mcp) so the public log distinguishes the human from
+    their assistant; either way the sender IS the operator (2b: a valid
     token is the operator — no anonymous write path, and the client does not
     get to choose its identity)."""
     from lab_pack.behaviors import _THREAD_TO_BRANCH
@@ -766,17 +782,46 @@ def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
         rt.graph, branch_id, content,
         user_ref="operator", thread_id=thread_id, source=source,
     )
+    _save(rt)
+    return {"branch_id": branch_id, "thread_id": thread_id,
+            "message_id": str(msg.id),
+            "message_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
+
+
+def _chat_collect_reply(rt, message_id: str):
+    """Phase 2: run behaviors to the next idle boundary and project the
+    answer candidate for this message. None = no reply landed (the message
+    itself is already committed by phase 1)."""
+    events_before = len(rt.graph.events)
     rt.run_until_idle()
     _save(rt)
     cands = [c for c in rt.graph.objects(type="comm_response_candidate")
-             if c.data.get("message_id") == msg.id
+             if str(c.data.get("message_id")) == str(message_id)
              and c.data.get("created_by_behavior") == "lab.answer"]
-    reply = cands[-1].data.get("content") if cands else "No reply produced."
-    horizon = (cands[-1].data.get("metadata") or {}).get("event_horizon") if cands else None
-    return {"content": reply, "thread_id": thread_id,
-            "branch_id": branch_id, "event_horizon": horizon,
-            "message_id": str(msg.id),
-            "created_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
+    if not cands:
+        return None
+    return {"content": cands[-1].data.get("content"),
+            "event_horizon": (cands[-1].data.get("metadata") or {}).get("event_horizon"),
+            "reply_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
+
+
+def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
+    """The one chat code path: POST /chat and the MCP send_chat tool both land
+    here (ADR-016), composed from the two phases above so MCP can bound the
+    reply wait separately from the message append. Runs on the runtime
+    worker."""
+    posted = _chat_post_message(rt, branch_id, content, source)
+    if posted is None:
+        return None
+    reply = _chat_collect_reply(rt, posted["message_id"])
+    return {"content": reply["content"] if reply else "No reply produced.",
+            "thread_id": posted["thread_id"],
+            "branch_id": posted["branch_id"],
+            "event_horizon": reply["event_horizon"] if reply else None,
+            "message_id": posted["message_id"],
+            "message_event_ids": posted["message_event_ids"],
+            "created_event_ids": posted["message_event_ids"]
+            + (reply["reply_event_ids"] if reply else [])}
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
