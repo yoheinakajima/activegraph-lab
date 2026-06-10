@@ -429,6 +429,150 @@ def run_draft_writer() -> bool:
     return c.done("draft_writer")
 
 
+def run_editorial() -> bool:
+    spec = _load("editorial.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: editorial — digest threshold, earned research, pending cap, escape hatch")
+    print("=" * 64)
+
+    import tempfile
+    settings = dict(spec.get("settings") or {})
+    settings["drafts_dir"] = tempfile.mkdtemp(prefix="lab-editorial-")
+
+    clear_lab_registry()
+    rt = Runtime(Graph(), llm_provider=LabMockProvider())
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def drafts():
+        return [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
+
+    def requests():
+        return _lab_obs(g, "draft_request")
+
+    def add_finding(text):
+        f = g.add_object("observation", {
+            "text": text, "confidence": 0.9, "category": "fact",
+            "metadata": {"lab": "finding", "finding": True,
+                         "mission_id": mission.id, "evidence_refs": []},
+        })
+        rt.run_until_idle()
+        return f
+
+    # ── A: findings accumulate; threshold → ONE digest note ────────────────
+    add_finding("Finding one: replay is deterministic at this pin.")
+    add_finding("Finding two: the packs repo is split on relation order.")
+    c.that(not requests() and not drafts(),
+           f"2 findings < threshold → no draft request, no draft "
+           f"({len(requests())}, {len(drafts())})")
+    add_finding("Finding three: entry-point discovery works across repos.")
+    c.that(len(requests()) == 1 and len(drafts()) == 1,
+           f"3rd finding reaches the threshold → exactly one digest "
+           f"({len(requests())} requests, {len(drafts())} drafts)")
+    if drafts():
+        d0 = drafts()[0]
+        meta = d0.data.get("metadata") or {}
+        c.that(meta.get("post_kind") == exp["digest_note"]["post_kind"],
+               f"digest draft is post_kind=note (got {meta.get('post_kind')})")
+        c.that(len(meta.get("finding_ids") or []) == exp["digest_note"]["findings_covered"],
+               f"digest covers all {exp['digest_note']['findings_covered']} queued findings")
+        covers = [r for r in g.relations() if str(r.type) == "covers"]
+        c.that(len(covers) >= 3, f"covers relations recorded ({len(covers)})")
+    print(f"  A: 2 findings idle, 3rd → one note digest covering 3")
+
+    # ── B0: a thin decided branch (1 evidence) earns nothing ───────────────
+    def decide_branch(title, n_evidence):
+        b = create_branch_fn(g, mission.id, title, "intent", status="active")
+        rt.run_until_idle()
+        for i in range(n_evidence):
+            o = g.add_object("observation", {
+                "text": f"Evidence {i} for {title}: verified against the runtime.",
+                "confidence": 0.8, "category": "fact",
+                "metadata": {"lab": "interpretation", "lab_branch_id": b.id},
+            }, actor="research.worker")
+            g.add_relation(b.id, o.id, "supported_by")
+        d = g.add_object("decision", {
+            "subject_ref": b.id, "kind": "promote", "status": "pending",
+            "rationale": f"fixture: decide {title}", "evidence_refs": [],
+            "metadata": {},
+        })
+        rt.run_until_idle()
+        approve_decision_fn(g, d.id, True, "fixture approve")
+        rt.run_until_idle()
+        return b
+
+    before = len(requests())
+    thin1 = decide_branch("Thin branch one", 1)
+    c.that(g.get_object(thin1.id).data.get("status") == "decided"
+           and len(requests()) == before,
+           "thin decided branch (1 evidence) → no research request")
+
+    # ── B: decided branch with >= research_min_evidence → research draft ───
+    rich = decide_branch("Rich branch", 3)
+    research = [r for r in requests()
+                if (r.data.get("metadata") or {}).get("requested_by") == "lab.gate"]
+    c.that(len(research) == 1, f"rich decided branch → one research request ({len(research)})")
+    research_drafts = [a for a in drafts()
+                       if (a.data.get("metadata") or {}).get("post_kind") == "research"]
+    c.that(len(research_drafts) == 1,
+           f"research draft created, post_kind=research ({len(research_drafts)})")
+    print(f"  B: thin branch idles; rich branch (3 evidence) → research draft")
+
+    # ── B2: second thin branch → synthesis across decided branches ─────────
+    thin2 = decide_branch("Thin branch two", 2)
+    gate_reqs = [r for r in requests()
+                 if (r.data.get("metadata") or {}).get("requested_by") == "lab.gate"]
+    c.that(len(gate_reqs) == 2,
+           f"two thin decided branches, combined evidence 3 → synthesis request "
+           f"({len(gate_reqs)} gate requests)")
+    print(f"  B2: thin1 + thin2 (1+2 evidence) → synthesis research draft")
+
+    # ── C: pending cap reached → drafting idles, one observation ───────────
+    pending_pub = [d for d in g.objects(type="decision")
+                   if d.data.get("kind") == "publish" and d.data.get("status") == "pending"]
+    c.that(len(pending_pub) == 3, f"3 publish decisions pending = the cap ({len(pending_pub)})")
+    n_drafts = len(drafts())
+    add_finding("Finding four: queued behind the cap.")
+    add_finding("Finding five: still queued.")
+    add_finding("Finding six: the queue reaches the threshold under the cap.")
+    add_finding("Finding seven: the idle observation must not repeat.")
+    idle = _lab_obs(g, "drafting_idle")
+    c.that(len(drafts()) == n_drafts,
+           f"cap reached → no new draft ({len(drafts())} == {n_drafts})")
+    c.that(len(idle) == exp["drafting_idle_observations"],
+           f"drafting idles with exactly one observation per episode ({len(idle)})")
+    print(f"  C: cap {settings['max_drafts_pending']} pending → drafting idles, "
+          f"{len(idle)} idle observation")
+
+    # ── D: the operator escape hatch bypasses the cap ──────────────────────
+    _, msg = send_branch_message_fn(g, rich.id, "please draft this up as a post")
+    rt.run_until_idle()
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "draft requested" in (cands[0].data.get("content") or ""),
+           "operator chat reply confirms the draft request")
+    op_reqs = [r for r in requests()
+               if (r.data.get("metadata") or {}).get("requested_by") == "operator"]
+    c.that(len(op_reqs) == 1, f"operator draft request recorded ({len(op_reqs)})")
+    c.that(len(drafts()) == n_drafts + 1,
+           f"operator request bypasses the pending cap ({len(drafts())})")
+    print(f"  D: operator 'draft' in chat → draft despite the cap")
+
+    c.that(len(drafts()) == exp["blog_drafts_total"],
+           f"expected {exp['blog_drafts_total']} drafts total, got {len(drafts())}")
+    c.that(len(requests()) == exp["draft_requests_total"],
+           f"expected {exp['draft_requests_total']} draft requests, got {len(requests())}")
+    c.that(all(a.data.get("status") == "draft" for a in drafts()),
+           "every draft stays gated (status=draft, nothing auto-published)")
+    return c.done("editorial")
+
+
 def run_seams() -> bool:
     spec = _load("seams.yaml")
     print("\n" + "=" * 64)
@@ -721,6 +865,7 @@ def run_all() -> None:
         run_thread_equals_branch(),
         run_capability_gap(),
         run_draft_writer(),
+        run_editorial(),
         run_seams(),
         run_graph_code(),
         run_compat_regression(),

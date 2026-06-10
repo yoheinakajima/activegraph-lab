@@ -50,6 +50,10 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "max_claims_per_page",
     "max_open_branches",
     "progress_interval_seconds",
+    # Editorial policy (ADR-014): tuning these IS self-modification.
+    "digest_min_findings",
+    "research_min_evidence",
+    "max_drafts_pending",
 })
 
 # Word-ish boundary match so "lab_pack.kernel" hits imports, attribute

@@ -109,16 +109,50 @@ def _rebuild_lab_registries(rt) -> None:
     for d in g.objects(type="decision"):
         if d.data.get("status") == "pending":
             lb._PENDING_BY_SUBJECT[d.data.get("subject_ref", "")] = d.id
+            if d.data.get("kind") == "publish":
+                lb._PENDING_PUBLISH.add(d.id)
         elif d.data.get("kind") == "publish" and d.data.get("status") == "approved":
             lb._APPROVED_PUBLISH.add(d.data.get("subject_ref", ""))
         if d.data.get("status") in ("approved", "rejected"):
             lb._APPLIED_DECISIONS.add(d.id)
+    # 5a: observation provenance — actor + timestamp from each object.created
+    # event (replay rebuilds objects, not the in-process provenance registry).
+    created_by: dict[str, tuple[str, str]] = {}
+    for e in g.events:
+        if str(e.type) == "object.created":
+            o_ = e.payload.get("object") or {}
+            if o_.get("type") == "observation":
+                created_by[o_.get("id")] = (str(e.actor or "system"),
+                                            str(e.timestamp or ""))
     for o in g.objects(type="observation"):
         meta = o.data.get("metadata") or {}
         if meta.get("lab") == "capability_gap" and meta.get("task_id"):
             lb._GAP_CHECKED.add(meta["task_id"])
         if meta.get("lab") == "site_claim":
             lb._PLANNED_OBS.add(o.id)
+        if meta.get("lab"):
+            actor, ts = created_by.get(str(o.id), ("system", ""))
+            branch = g.get_object(meta.get("lab_branch_id")) \
+                if meta.get("lab_branch_id") else None
+            lb._OBS_PROVENANCE[str(o.id)] = {
+                "finding_id": str(o.id),
+                "text": (o.data.get("text") or "")[:500],
+                "branch_id": meta.get("lab_branch_id"),
+                "branch_title": (branch.data.get("title") if branch is not None else None),
+                "created_at": ts,
+                "created_by": actor,
+                "origin": ("seeded" if actor == "system"
+                           else f"live work by the {actor} behavior"),
+                "evidence_refs": list(meta.get("evidence_refs") or []),
+            }
+        if meta.get("finding"):
+            lb._QUEUED_FINDINGS[str(o.id)] = lb._OBS_PROVENANCE.get(str(o.id)) \
+                or {"finding_id": str(o.id)}
+        if meta.get("lab") == "draft_request":
+            for f in meta.get("finding_ids") or []:
+                lb._COVERED_FINDINGS.add(f)
+            if meta.get("requested_by") == "lab.gate" and meta.get("lab_branch_id"):
+                lb._RESEARCH_REQUESTED.add(meta["lab_branch_id"])
     for e in g.objects(type="evaluation"):
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
@@ -130,8 +164,12 @@ def _rebuild_lab_registries(rt) -> None:
                 lb._SLUGS.add(meta["slug"])
                 if a.data.get("status") == "published":
                     lb._PUBLISHED_SLUGS.add(meta["slug"])
-            if meta.get("finding_id"):
+            if meta.get("request_id"):
+                lb._DRAFTED_OBS.add(meta["request_id"])
+            elif meta.get("finding_id"):
+                # pre-ADR-014 drafts triggered straight off the finding
                 lb._DRAFTED_OBS.add(meta["finding_id"])
+                lb._COVERED_FINDINGS.add(meta["finding_id"])
             if meta.get("lab_branch_id"):
                 lb._FINDING_EMITTED.add(meta["lab_branch_id"])
     for r in g.relations():
@@ -140,6 +178,12 @@ def _rebuild_lab_registries(rt) -> None:
             lb._THREAD_TO_BRANCH[src] = tgt
         elif rel_type == "dispatched":
             lb._DISPATCHED.add(src)
+        elif rel_type == "supported_by":
+            bucket = lb._BRANCH_EVIDENCE.setdefault(src, [])
+            if tgt not in bucket:
+                bucket.append(tgt)
+        elif rel_type == "covers":
+            lb._COVERED_FINDINGS.add(tgt)
 
 
 def _build_runtime():
@@ -332,6 +376,9 @@ DEFAULT_TEMPLATES = {
     "draft_mirror_failure": "{short_text}",
     "synthetic_crawl":  "{short_text}",
     "seam_refused":     "Refused a seam proposal: {short_text}",
+    "draft_request":    "Draft requested: {short_text}",
+    "drafting_idle":    "{short_text}",
+    "behavior_skipped": "{short_text}",
 }
 
 

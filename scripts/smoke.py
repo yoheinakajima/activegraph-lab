@@ -122,20 +122,30 @@ def main() -> int:
     check(len(cands) == 1 and "as of event" in cands[0].data.get("content", ""),
           "stamped answer produced")
 
-    print("== draft_writer: seeded findings -> drafts + gated publish decisions ==")
+    print("== editorial discipline (ADR-014): seeded findings -> ONE digest ==")
+    findings = [o for o in g.objects(type="observation")
+                if (o.data.get("metadata") or {}).get("finding")]
     drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
     pub_pending = [d for d in g.objects(type="decision")
                    if d.data.get("kind") == "publish" and d.data.get("status") == "pending"]
-    check(len(drafts) >= 3, f"blog drafts from seeded findings ({len(drafts)})")
+    check(len(findings) >= 5, f"seeded findings queued ({len(findings)})")
+    check(len(drafts) >= 1, f"digest drafted from accumulated findings ({len(drafts)})")
+    check(len(drafts) < len(findings),
+          f"no fire-per-finding: {len(drafts)} draft(s) from {len(findings)} findings")
+    digest_meta = drafts[0].data.get("metadata") or {} if drafts else {}
+    check(digest_meta.get("post_kind") == "note",
+          f"digest draft is post_kind=note ({digest_meta.get('post_kind')})")
+    check(len(digest_meta.get("finding_ids") or []) >= 3,
+          f"digest covers >=3 findings ({len(digest_meta.get('finding_ids') or [])})")
     check(all(a.data.get("status") == "draft" for a in drafts),
           "every draft is gated (status=draft, nothing published)")
-    check(len(pub_pending) >= 3, f"publish decisions pending ({len(pub_pending)})")
+    check(len(pub_pending) >= 1, f"publish decisions pending ({len(pub_pending)})")
     check(all("[^" in (a.data.get("content") or "") for a in drafts),
           "every draft carries evidence footnotes")
     check(all("*Provenance:*" in (a.data.get("content") or "") for a in drafts),
           "every draft carries a provenance block")
     files = list(Path(settings.drafts_dir).glob("*.md"))
-    check(len(files) >= 3, f"drafts mirrored to disk ({len(files)})")
+    check(len(files) >= 1, f"drafts mirrored to disk ({len(files)})")
 
     main_run_llm_calls = llm_usage()["total"]
 

@@ -70,6 +70,14 @@ class BlogDraft(BaseModel):
         default="",
         description="URL slug (lowercase, hyphens). Derived from the title if empty.",
     )
+    post_kind: Literal["note", "research", "build"] = Field(
+        default="note",
+        description=(
+            "Editorial kind (ADR-014). The draft request in the view carries "
+            "code-injected classification guidance and a suggested kind; "
+            "follow it unless the content clearly says otherwise."
+        ),
+    )
     body_markdown: str = Field(
         description=(
             "The post body in markdown, 400-900 words, per the draft contract: "
@@ -161,9 +169,12 @@ class LabMockProvider:
             finding = _extract_field(messages, "text") or f"a finding ({digest})"
             footnotes = "\n".join(f"[^{i+1}]: {e}" for i, e in enumerate(ev))
             cites = "".join(f"[^{i+1}]" for i in range(len(ev)))
+            hint_m = re.findall(r'"post_kind_hint":\s*"(note|research|build)"', blob)
+            kind = hint_m[-1] if hint_m else "note"
             parsed = BlogDraft(
                 title=f"Lab note: {finding[:60].rstrip('. ')}",
                 slug=f"lab-note-{digest}",
+                post_kind=kind,
                 body_markdown=(
                     f"## What we tried\n\nI followed the mission's loop on this finding: "
                     f"{finding[:200]}{cites}\n\n"

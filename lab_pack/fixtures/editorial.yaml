@@ -1,0 +1,32 @@
+description: |
+  Editorial policy (ADR-014, Phase 4): findings accumulate — below
+  digest_min_findings nothing drafts; at the threshold ONE note-kind digest
+  covers the queue. Research drafts are earned: a decided branch needs
+  research_min_evidence linked evidence objects, or >=2 decided branches are
+  synthesized when their combined evidence meets the bar. When pending
+  publish decisions reach max_drafts_pending, automatic drafting idles and
+  records one observation per episode; the operator's chat escape hatch
+  bypasses the cap.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+  digest_min_findings: 3
+  research_min_evidence: 3
+  max_drafts_pending: 3
+
+expected_outputs:
+  digest_note:
+    findings_covered: 3
+    post_kind: note
+  research_draft:
+    post_kind: research
+  synthesis_draft:
+    post_kind: research
+  drafting_idle_observations: 1
+  blog_drafts_total: 4          # digest + research + synthesis + operator
+  draft_requests_total: 4

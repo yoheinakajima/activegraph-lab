@@ -87,7 +87,9 @@ def _run() -> int:
         # IMPORTANT: persist_to=None — the sentinel DATABASE_URL points
         # nowhere; backend() still reads it, which is exactly what we audit.
         rt = build_lab(
-            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=6,
+            # max_total=3: under ADR-014 the digest drafts once, so the
+            # session makes fewer LLM calls — 3 still exhausts mid-run.
+            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=3,
                                             prompt_bodies=_lab_prompt_bodies()),
             lab_settings=LabSettings(drafts_dir=tempfile.mkdtemp()),
             fetch_handler=fetch)

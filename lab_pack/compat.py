@@ -18,13 +18,21 @@ delete this module and read ``(r.type, r.source, r.target)`` directly.
 from __future__ import annotations
 
 
+def _field(r, name: str):
+    """Relation field access for Relation objects AND the raw dicts that ride
+    in relation.created event payloads."""
+    return r.get(name) if isinstance(r, dict) else getattr(r, name)
+
+
 def decode_relation(r) -> tuple[str, str, str]:
-    """Return ``(relation_type, source_id, target_id)`` for either encoding."""
-    if "#" in str(r.type):
+    """Return ``(relation_type, source_id, target_id)`` for either encoding.
+    Accepts a Relation object or a relation payload dict."""
+    rtype, src, tgt = _field(r, "type"), _field(r, "source"), _field(r, "target")
+    if "#" in str(rtype):
         # Type-first call: type landed in `source`, subject in `target`,
         # object in `type` (core/research/tool_gateway style).
-        return str(r.source), str(r.target), str(r.type)
-    return str(r.type), str(r.source), str(r.target)
+        return str(src), str(tgt), str(rtype)
+    return str(rtype), str(src), str(tgt)
 
 
 def relation_touches(r, object_id: str) -> bool:

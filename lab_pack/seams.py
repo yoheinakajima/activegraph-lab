@@ -147,16 +147,19 @@ def active_version(graph, seam_name: str) -> int:
 
 def effective_setting(graph, settings: Any, name: str) -> Any:
     """A whitelisted setting's value: approved seam override, else the
-    pydantic settings value. Type follows the settings field (int here)."""
+    pydantic settings value. The override is coerced to the settings field's
+    own type (int or float); an uncoercible body falls back to the default."""
+    default = getattr(settings, name)
     if name not in SEAM_ELIGIBLE_SETTINGS:
-        return getattr(settings, name)
+        return default
     version, body = resolve(graph, f"setting.{name}", None)
     if version == 0 or body is None:
-        return getattr(settings, name)
+        return default
     try:
-        return int(str(body).strip())
+        caster = float if isinstance(default, float) else int
+        return caster(str(body).strip())
     except ValueError:
-        return getattr(settings, name)
+        return default
 
 
 def seam_versions_stamp(graph, *names: str) -> dict[str, int]:

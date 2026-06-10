@@ -1,7 +1,8 @@
 description: |
-  The writing capability: a finding-tagged observation triggers draft_writer,
-  which produces a blog_draft artifact (graph canonical + drafts/<slug>.md
-  mirror) and a pending publish decision. Approve path publishes the
+  The writing capability under ADR-014: findings are QUEUED by digest, which
+  requests drafts; draft_writer triggers only on draft_request observations.
+  digest_min_findings=1 here so each finding yields one note draft (graph
+  canonical + drafts/<slug>.md mirror) and a pending publish decision. Approve path publishes the
   artifact; reject path marks it rejected and prefixes the mirror file with
   a REJECTED header (file stays on disk). Nothing publishes without an
   approved decision.
@@ -13,6 +14,7 @@ mission:
 settings:
   crawl_enabled: false
   dispatch_gap_check: false
+  digest_min_findings: 1
 
 branch:
   title: Verify the replay claim
