@@ -61,6 +61,11 @@ from .llm import (
     is_inert,
     llm_usage,
 )
+from .seams import (
+    clear_seam_cache,
+    effective_setting,
+    seam_versions_stamp,
+)
 from .settings import LabSettings
 
 _PROMPTS = {p.name: p.body for p in load_prompts_from_dir(Path(__file__).parent / "prompts")}
@@ -101,6 +106,16 @@ def clear_lab_registry() -> None:
     _DRAFTED_OBS.clear()
     _FINDING_EMITTED.clear()
     _SLUGS.clear()
+    clear_seam_cache()
+    # Seam hot-loads mutate live behavior descriptions; restore file defaults
+    # so fixture runs are isolated from each other.
+    for b in BEHAVIORS:
+        name = getattr(b, "name", "")
+        if name in _PROMPTS and getattr(b, "description", None) != _PROMPTS[name]:
+            try:
+                setattr(b, "description", _PROMPTS[name])
+            except Exception:
+                object.__setattr__(b, "description", _PROMPTS[name])
 
 
 def _now() -> str:
@@ -253,7 +268,10 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     url = call_info["url"]
     state = _CRAWLS.setdefault(mission_id, {"visited": set(), "fetched": 0, "queued": set()})
     state["queued"].discard(url)
-    if url in state["visited"] or state["fetched"] >= settings.crawl_page_cap:
+    page_cap = effective_setting(graph, settings, "crawl_page_cap")
+    max_depth = effective_setting(graph, settings, "crawl_max_depth")
+    max_claims = effective_setting(graph, settings, "max_claims_per_page")
+    if url in state["visited"] or state["fetched"] >= page_cap:
         return
     state["visited"].add(url)
     state["fetched"] += 1
@@ -289,7 +307,7 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
 
     try:
         # Claim observations — the gap list's raw material.
-        for claim in _claims_from_text(text, settings.max_claims_per_page):
+        for claim in _claims_from_text(text, max_claims):
             obs = graph.add_object("observation", {
                 "text": claim,
                 "confidence": 0.7,
@@ -300,8 +318,8 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
             graph.add_relation(obj_id, obs.id, "grounds")
 
         # Same-domain links, depth- and cap-bounded.
-        if depth < settings.crawl_max_depth:
-            budget = settings.crawl_page_cap - state["fetched"] - len(state["queued"])
+        if depth < max_depth:
+            budget = page_cap - state["fetched"] - len(state["queued"])
             for link in _links_from_html(html, fetched_url):
                 if budget <= 0:
                     break
@@ -325,9 +343,13 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
         meta["crawl"] = {
             "fetched": state["fetched"],
             "queued": len(state["queued"]),
-            "page_cap": settings.crawl_page_cap,
+            "page_cap": page_cap,
             "last_url": fetched_url,
-            "progress_interval_seconds": settings.progress_interval_seconds,
+            "progress_interval_seconds": effective_setting(
+                graph, settings, "progress_interval_seconds"),
+            "seam_versions": seam_versions_stamp(
+                graph, "setting.crawl_page_cap", "setting.crawl_max_depth",
+                "setting.max_claims_per_page"),
         }
         graph.patch_object(mission_id, {"metadata": meta})
 
@@ -368,7 +390,7 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
 
     if out is None or not getattr(out, "should_branch", False):
         return
-    if _BRANCH_COUNT["open"] >= settings.max_open_branches:
+    if _BRANCH_COUNT["open"] >= effective_setting(graph, settings, "max_open_branches"):
         return
 
     branch = graph.add_object("branch", {
@@ -381,6 +403,7 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
             "reasoning": out.reasoning,
             "claim_observation_id": obs_id,
             "proposed_by": "lab.plan",
+            "seam_versions": seam_versions_stamp(graph, "prompt.plan"),
         },
     })
     _BRANCH_COUNT["open"] += 1
@@ -595,7 +618,9 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
         "text": out.summary,
         "confidence": 0.8,
         "category": "fact",
-        "metadata": {"lab": "interpretation", "lab_branch_id": branch_id, "task_id": task_id},
+        "metadata": {"lab": "interpretation", "lab_branch_id": branch_id,
+                     "task_id": task_id,
+                     "seam_versions": seam_versions_stamp(graph, "prompt.interpret")},
     })
     graph.add_relation(branch_id, obs.id, "supported_by")
     graph.patch_object(branch_id, {"status": "interpreting"})
@@ -733,6 +758,27 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
             except Exception:
                 pass
             _mark_draft_rejected(graph, subject, settings)
+    elif kind == "self_modify" and subject:
+        # The gate treats self_modify exactly like publish: absolute. Approval
+        # hot-loads the seam (no restart); graph-code drafts stay dormant
+        # behind LAB_ALLOW_GRAPH_CODE regardless (ADR-012).
+        artifact = graph.get_object(subject)
+        a_kind = artifact.data.get("kind") if artifact else None
+        if status == "approved":
+            try:
+                graph.patch_object(subject, {"status": "approved"})
+            except Exception:
+                pass
+            if a_kind == "seam":
+                from .seams import hot_load
+                hot_load(graph, subject)
+        else:
+            # A rejected seam was never active — nothing to unload; the
+            # cache keeps serving whatever was approved before (or nothing).
+            try:
+                graph.patch_object(subject, {"status": "rejected"})
+            except Exception:
+                pass
     # schema_change / dependency_pin / other: the record itself is the outcome;
     # humans act on it outside the runtime (e.g. bump the pin in pyproject).
 
@@ -931,7 +977,8 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
         "status": "draft",
         "observation_ids": evidence,
         "metadata": {"lab": "blog_draft", "slug": slug,
-                     "lab_branch_id": branch_id, "finding_id": obs_id},
+                     "lab_branch_id": branch_id, "finding_id": obs_id,
+                     "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer")},
     })
     if branch_id:
         graph.add_relation(branch_id, artifact.id, "produced")
@@ -1068,6 +1115,7 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
         "created_by_behavior": "lab.answer",
         "metadata": {
             "event_horizon": str(event.id),
+            "seam_versions": seam_versions_stamp(graph, "prompt.answer"),
             "provenance": {
                 "branch_id": branch_id,
                 "mission_id": (branch.data.get("mission_id") if branch else None),

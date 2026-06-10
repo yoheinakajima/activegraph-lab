@@ -86,9 +86,14 @@ class Decision(BaseModel):
     subject_ref: str = Field(
         description="ID of the object this decision governs (branch, artifact, ...)."
     )
-    kind: Literal["promote", "publish", "schema_change", "dependency_pin", "other"] = Field(
+    kind: Literal[
+        "promote", "publish", "self_modify", "schema_change", "dependency_pin", "other"
+    ] = Field(
         default="other",
-        description="What category of gate this is.",
+        description=(
+            "What category of gate this is. self_modify (ADR-012) gates seams "
+            "and graph code; the gate treats it exactly like publish: absolute."
+        ),
     )
     status: Literal["pending", "approved", "rejected"] = Field(
         default="pending",

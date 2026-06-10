@@ -28,6 +28,19 @@
     <div id="mission-log"></div>
   </section>
 
+  <!-- Seams view: the self-modification surfaces, read-only (4f) -->
+  <section id="seams-view" hidden>
+    <div id="thread-head-seams">
+      <button id="seams-back">&larr; feed</button>
+      <h2>Seams</h2>
+    </div>
+    <p class="seams-blurb">Prompts, feed templates, and whitelisted settings
+      resolve from approved graph artifacts with file fallback (ADR-012).
+      Proposals queue in the inbox as <code>self_modify</code> decisions.</p>
+    <div id="seams-table"></div>
+    <div id="graph-code-table"></div>
+  </section>
+
   <!-- Thread view: one branch, one scroll, chat input at the bottom -->
   <section id="thread-view" hidden>
     <div id="thread-head">
@@ -49,6 +62,8 @@
 
 <footer>
   <a id="auth-link" href="#"></a>
+  &nbsp;·&nbsp;
+  <a id="seams-link" href="#">seams</a>
 </footer>
 
 <script src="/app.js"></script>

@@ -39,3 +39,7 @@ Two planes over one log. Fast plane: `answer` responds in one behavior cascade b
 ## Bundle and server
 
 `lab_pack/bundle.py: build_lab()` composes core, tool_gateway, secrets, memory_gateway, agent_profile, identity_auth, communication, chat, research, codebase, and lab_pack, then creates the mission for https://activegraph.ai with the `read_the_website` seed branch. `server/` is a thin HTTP server copying the demo_server.py pattern: `/graph`, `/trace`, `/chat`, `/reset`, plus read-only `GET /lab/feed`. SQLite persistence under `data/`, paths overridable via env vars. No new storage, no new state.
+
+## Seams (ADR-012, Phase 4)
+
+Prompts, feed narration templates, and whitelisted settings are the lab's first self-modification surface. A seam is a core artifact (kind=seam, metadata: seam_name, version, parent_version) promoted through a decision (kind=self_modify) that the gate treats exactly like publish. `lab_pack/seams.py` (kernel) resolves each seam_name to the highest approved version with file fallback, hot-loads on approval (no restart), and refuses bodies referencing the kernel manifest at proposal AND load time. Inside behaviors the graph is restricted, so resolution is cache-only — populated exclusively by hot_load and boot-time apply_approved, which is also why a seam can never activate without passing the gate. Replay fidelity: behaviors stamp consumed seam versions onto their outputs (replay never re-fires behaviors, so outputs replay verbatim), and feed templates resolve as-of each entry's event via the approval events in the log.

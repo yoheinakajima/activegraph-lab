@@ -126,6 +126,16 @@ h3.register {
 .draft-preview .snippet { color: var(--dim); font-style: italic; }
 
 #role { color: var(--warn); }
+table.seams { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.seams th, table.seams td {
+  text-align: left; padding: 5px 8px; border-bottom: 1px dotted var(--line);
+}
+table.seams th { color: var(--dim); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.src-graph { color: var(--accent); }
+.src-file { color: var(--dim); }
+.seams-blurb { color: var(--dim); font-size: 13px; }
+#thread-head-seams { display: flex; gap: 14px; align-items: center; margin: 14px 0; }
+#thread-head-seams h2 { margin: 0; font-size: 20px; }
 .observer-note { color: var(--dim); font-style: italic; font-size: 13px; }
 footer { max-width: 760px; margin: 30px auto; padding: 0 22px; }
 footer a { color: var(--dim); font-size: 12px; }

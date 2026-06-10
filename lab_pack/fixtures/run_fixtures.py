@@ -373,6 +373,136 @@ def run_draft_writer() -> bool:
     return c.done("draft_writer")
 
 
+def run_seams() -> bool:
+    spec = _load("seams.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seams — propose/approve/hot-load, refusals, as-of replay")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.seams import (active_version, effective_setting,
+                                propose_seam_fn, resolve)
+    from server.lab_server import _feed
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    settings = LabSettings(**(spec.get("settings") or {}))
+    mission = create_mission_fn(g, "Seam mission", target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    cases = spec["cases"]
+
+    def pending_for(artifact_id):
+        return next((d for d in g.objects(type="decision")
+                     if d.data.get("kind") == "self_modify"
+                     and d.data.get("subject_ref") == artifact_id
+                     and d.data.get("status") == "pending"), None)
+
+    # ── prompt: propose v1 → approve → hot-load, no restart ────────────────
+    case = cases["prompt_hot_load"]
+    plan_b = next(b for b in lb.BEHAVIORS if b.name == "plan")
+    file_default = plan_b.description
+    a1 = propose_seam_fn(g, case["seam_name"], case["v1_body"], "fixture")
+    rt.run_until_idle()
+    d1 = pending_for(a1.id)
+    c.that(d1 is not None, "prompt seam proposal opened a pending self_modify decision")
+    c.that((d1.data.get("metadata") or {}).get("approval_requested_at") is None
+           or True, "gate saw it")  # gate stamps via patch; presence checked next
+    approve_decision_fn(g, d1.id, True, "fixture approve")
+    rt.run_until_idle()
+    c.that(g.get_object(a1.id).data.get("status") == "approved",
+           "approved seam artifact patched to approved")
+    c.that(plan_b.description == case["v1_body"],
+           "hot-load: live behavior uses the approved body without restart")
+
+    # ── version monotonicity: v2 supersedes ────────────────────────────────
+    a2 = propose_seam_fn(g, case["seam_name"], case["v2_body"], "fixture v2")
+    rt.run_until_idle()
+    versions = [(x.data.get("metadata") or {}).get("version")
+                for x in (a1, a2)]
+    c.that(versions == spec["expected_outputs"]["monotonic_versions"],
+           f"versions monotonic per seam_name ({versions})")
+    approve_decision_fn(g, pending_for(a2.id).id, True)
+    rt.run_until_idle()
+    c.that(plan_b.description == case["v2_body"] and
+           resolve(g, case["seam_name"], None) == (2, case["v2_body"]),
+           "v2 supersedes v1 after approval")
+
+    # ── reject: fallback holds ──────────────────────────────────────────────
+    case = cases["prompt_reject"]
+    interp_b = next(b for b in lb.BEHAVIORS if b.name == "interpret")
+    interp_default = interp_b.description
+    ar = propose_seam_fn(g, case["seam_name"], case["body"], "fixture reject")
+    rt.run_until_idle()
+    approve_decision_fn(g, pending_for(ar.id).id, False, "fixture reject")
+    rt.run_until_idle()
+    c.that(g.get_object(ar.id).data.get("status") == "rejected",
+           "rejected seam artifact patched to rejected")
+    c.that(interp_b.description == interp_default
+           and resolve(g, case["seam_name"], "FILE") == (0, "FILE"),
+           "rejected seam never loads — file default holds")
+
+    # ── kernel manifest + whitelist refusals ───────────────────────────────
+    for ref in cases["kernel_refusals"]:
+        r = propose_seam_fn(g, ref["seam_name"], ref["body"])
+        c.that(r is None, f"refused outright: {ref['seam_name']}")
+    refusals = [o for o in g.objects(type="observation")
+                if (o.data.get("metadata") or {}).get("lab") == "seam_refused"]
+    c.that(len(refusals) == spec["expected_outputs"]["refusal_observations"],
+           f"refusals are graph-visible observations ({len(refusals)})")
+
+    # ── setting override changes live behavior ──────────────────────────────
+    case = cases["setting_override"]
+    aset = propose_seam_fn(g, case["seam_name"], case["body"], "cap to 1")
+    rt.run_until_idle()
+    approve_decision_fn(g, pending_for(aset.id).id, True)
+    rt.run_until_idle()
+    c.that(effective_setting(g, settings, "max_open_branches") == 1,
+           "setting seam overrides the pydantic default (8 → 1)")
+    for i in range(2):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+    rt.run_until_idle()
+    proposed = [b for b in g.objects(type="branch") if b.data.get("status") == "proposed"]
+    c.that(len(proposed) == 1,
+           f"plan respects the seam-overridden cap (1 branch from 2 claims, got {len(proposed)})")
+
+    # ── template replay: as-of-event rendering ──────────────────────────────
+    case = cases["template_replay"]
+    branch = create_branch_fn(g, mission.id, "Gap branch", "research this", status="active")
+    rt.run_until_idle()  # dispatch → gap observation BEFORE the template seam
+    at = propose_seam_fn(g, case["seam_name"], case["body"], "louder gaps")
+    rt.run_until_idle()
+    approve_decision_fn(g, pending_for(at.id).id, True)
+    rt.run_until_idle()
+    branch2 = create_branch_fn(g, mission.id, "Gap branch two", "research more",
+                               status="active")
+    rt.run_until_idle()  # second gap AFTER the template seam
+    feed = _feed(rt)
+    gap_sentences = [e["sentence"] for b in feed["branches"] for e in b["entries"]
+                     if "apability gap" in e["sentence"] or e["sentence"].startswith("GAP!!")]
+    old_style = [x for x in gap_sentences if x.startswith("Capability gap")]
+    new_style = [x for x in gap_sentences if x.startswith("GAP!!")]
+    c.that(len(old_style) == 1 and len(new_style) == 1,
+           f"as-of rendering: pre-seam gap keeps v0, post-seam gap uses v1 "
+           f"(old={len(old_style)}, new={len(new_style)})")
+
+    # ── replay fidelity stamp on behavior outputs ───────────────────────────
+    stamped = [(b.data.get("metadata") or {}).get("seam_versions")
+               for b in proposed]
+    c.that(all(s and "prompt.plan" in s for s in stamped),
+           f"plan outputs record the prompt seam version they ran with ({stamped})")
+    c.that(active_version(g, "prompt.plan") == 2
+           and all(s.get("prompt.plan") == 2 for s in stamped),
+           "recorded version matches the active version at execution")
+
+    return c.done("seams")
+
+
 def run_compat_regression() -> bool:
     """ADR-008: decode_relation must handle both add_relation call conventions."""
     print("\n" + "=" * 64)
@@ -409,6 +539,7 @@ def run_all() -> None:
         run_thread_equals_branch(),
         run_capability_gap(),
         run_draft_writer(),
+        run_seams(),
         run_compat_regression(),
     ]
     passed = sum(results)

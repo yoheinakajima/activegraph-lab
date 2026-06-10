@@ -174,9 +174,40 @@ function render() {
 
   renderAuth();
   $("composer").style.display = isOperator() ? "" : "none";
-  if (VIEW.mode === "feed") renderFeed(); else renderThread();
+  if (VIEW.mode === "feed") renderFeed();
+  else if (VIEW.mode === "thread") renderThread();
   $("feed-view").hidden = VIEW.mode !== "feed";
   $("thread-view").hidden = VIEW.mode !== "thread";
+  $("seams-view").hidden = VIEW.mode !== "seams";
+}
+
+/* 4f: the Seams view — read-only projection of /lab/seams. */
+async function renderSeams() {
+  let data;
+  try {
+    data = await (await fetch("/lab/seams")).json();
+  } catch (e) {
+    $("seams-table").textContent = "Could not load /lab/seams.";
+    return;
+  }
+  const rows = (data.seams || []).map(s =>
+    `<tr><td>${escapeHtml(s.seam_name)}</td>` +
+    `<td class="src-${s.source}">${s.source}` +
+    (s.active_version ? ` v${s.active_version}` : "") + `</td>` +
+    `<td>${"effective_value" in s ? escapeHtml(String(s.effective_value)) : ""}</td>` +
+    `<td>${(s.pending || []).length ? (s.pending || []).join(", ") + " pending" : ""}</td></tr>`
+  ).join("");
+  $("seams-table").innerHTML =
+    `<h3 class="register">Self-modification surfaces</h3>` +
+    `<table class="seams"><tr><th>seam</th><th>source</th><th>value</th><th>proposals</th></tr>${rows}</table>`;
+  const gc = data.graph_code || [];
+  $("graph-code-table").innerHTML =
+    `<h3 class="register">Graph code (${data.graph_code_enabled ? "ENABLED" : "dark — LAB_ALLOW_GRAPH_CODE unset"})</h3>` +
+    (gc.length
+      ? `<table class="seams"><tr><th>draft</th><th>status</th><th>state</th></tr>` +
+        gc.map(d => `<tr><td>${escapeHtml(d.name)}</td><td>${d.status}</td><td>${d.state}</td></tr>`).join("") +
+        `</table>`
+      : `<div class="empty">No behavior or tool drafts yet.</div>`);
 }
 
 function renderFeed() {
@@ -243,6 +274,13 @@ function renderThread() {
 }
 
 $("back").onclick = () => { VIEW = { mode: "feed", branchId: null }; render(); };
+$("seams-back").onclick = () => { VIEW = { mode: "feed", branchId: null }; render(); };
+$("seams-link").onclick = (e) => {
+  e.preventDefault();
+  VIEW = { mode: "seams", branchId: null };
+  render();
+  renderSeams();
+};
 
 $("composer").onsubmit = async (ev) => {
   ev.preventDefault();

@@ -162,6 +162,10 @@ def _build_runtime():
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
         _rebuild_lab_registries(rt)
+        from lab_pack import seams
+        n = seams.apply_approved(rt.graph)
+        if n:
+            print(f"[lab_server] seams: re-applied {n} approved prompt seam(s)", flush=True)
     else:
         mode = "fresh"
         rt = build_lab(
@@ -239,30 +243,74 @@ def _branch_of_object(g, obj_type: str, data: dict, obj_id: str) -> Optional[str
     return None
 
 
-# One-sentence templates per lab observation kind (C2). Anything lab-tagged
-# but unmatched falls through to the generic template — nothing renders blank.
-_OBS_TEMPLATES = {
-    "site_claim":       lambda d, m: f"Noticed a claim on {m.get('url')}: “{_shorten(d.get('text'), 120)}”",
-    "capability_gap":   lambda d, m: _shorten(d.get("text"), 160),
-    "interpretation":   lambda d, m: f"Interpreted the results: {_shorten(d.get('text'), 130)}",
-    "gate_violation":   lambda d, m: _shorten(d.get("text"), 160),
-    "fetch_failure":    lambda d, m: (f"Couldn't fetch {m.get('url')} "
-                                      f"(status {m.get('status')}) — recorded as evidence."),
-    "stall":            lambda d, m: _shorten(d.get("text"), 160),
-    "llm_budget":       lambda d, m: f"LLM budget exhausted — stopping model calls cleanly. {_shorten(d.get('text'), 90)}",
-    "llm_parse_failure": lambda d, m: (f"Model output didn't parse in "
-                                       f"{m.get('behavior') or 'a behavior'} — salvaged what I could, raw output kept."),
-    "finding":          lambda d, m: f"Logged a finding: “{_shorten(d.get('text'), 140)}”",
-    "upstream_friction": lambda d, m: f"Recorded upstream friction: “{_shorten(d.get('text'), 130)}”",
-    "draft_mirror_failure": lambda d, m: _shorten(d.get("text"), 140),
-    "synthetic_crawl":  lambda d, m: _shorten(d.get("text"), 160),
+# One-sentence templates per lab observation kind (C2). These are the FILE
+# defaults; template.feed.<kind> seams override them per-entry, resolved
+# AS-OF the entry's event (4c replay fidelity) — old entries keep rendering
+# with the version that was active when they happened.
+# Available fields: {text} {short_text} {url} {status} {behavior}
+DEFAULT_TEMPLATES = {
+    "site_claim":       "Noticed a claim on {url}: \u201c{short_text}\u201d",
+    "capability_gap":   "{short_text}",
+    "interpretation":   "Interpreted the results: {short_text}",
+    "gate_violation":   "{short_text}",
+    "fetch_failure":    "Couldn't fetch {url} (status {status}) — recorded as evidence.",
+    "stall":            "{short_text}",
+    "llm_budget":       "LLM budget exhausted — stopping model calls cleanly. {short_text}",
+    "llm_parse_failure": "Model output didn't parse in {behavior} — salvaged what I could, raw output kept.",
+    "finding":          "Logged a finding: \u201c{short_text}\u201d",
+    "upstream_friction": "Recorded upstream friction: \u201c{short_text}\u201d",
+    "draft_mirror_failure": "{short_text}",
+    "synthetic_crawl":  "{short_text}",
+    "seam_refused":     "Refused a seam proposal: {short_text}",
 }
 
 
-def _narrate_created(g, obj_type: str, data: dict, obj_id: str) -> Optional[str]:
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def _seam_template_timeline(g) -> list:
+    """Approved template.feed.* seams as (event_index, kind, version, body),
+    built from the approval events in the log (4c: as-of-event resolution)."""
+    from lab_pack.kernel import kernel_reference
+    out = []
+    for i, e in enumerate(g.events):
+        if str(e.type) != "patch.applied":
+            continue
+        if ((e.payload.get("diff") or {}).get("status") or {}).get("new") != "approved":
+            continue
+        a = g.get_object(e.payload.get("target"))
+        if a is None or a.data.get("kind") != "seam":
+            continue
+        meta = a.data.get("metadata") or {}
+        name = str(meta.get("seam_name") or "")
+        if not name.startswith("template.feed."):
+            continue
+        body = a.data.get("content") or ""
+        if kernel_reference(body):
+            continue
+        out.append((i, name[len("template.feed."):],
+                    int(meta.get("version") or 0), body))
+    return out
+
+
+def _template_at(timeline: list, kind: str, event_index: int) -> Optional[str]:
+    best = None
+    for idx, k, version, body in timeline:
+        if k == kind and idx <= event_index:
+            if best is None or idx >= best[0]:
+                best = (idx, body)
+    return best[1] if best else None
+
+
+def _narrate_created(g, obj_type: str, data: dict, obj_id: str,
+                     tmpl=None) -> Optional[str]:
     """One human sentence per event, template-based (LLM narration deferred).
     Every lab-emitted event type has a template; lab-tagged objects with an
-    unknown kind hit the fallback so nothing renders blank."""
+    unknown kind hit the fallback so nothing renders blank. `tmpl(kind)`
+    returns a seam-overridden template body or None (as-of the entry event).
+    """
     meta = data.get("metadata") or {}
     if obj_type == "mission":
         return f"Mission started: {data.get('title')} — target {data.get('target_url')}."
@@ -273,14 +321,29 @@ def _narrate_created(g, obj_type: str, data: dict, obj_id: str) -> Optional[str]
         return (f"Approval requested ({data.get('kind')}): {_shorten(data.get('rationale') or '', 110)}")
     if obj_type == "observation":
         kind = meta.get("lab")
-        if kind in _OBS_TEMPLATES:
-            return _OBS_TEMPLATES[kind](data, meta)
-        if kind:  # lab-tagged but unknown — fallback, never blank
-            return f"Recorded {kind.replace('_', ' ')}: “{_shorten(data.get('text'), 130)}”"
+        if kind:
+            template = (tmpl(kind) if tmpl else None) or DEFAULT_TEMPLATES.get(kind)
+            if template is None:  # lab-tagged but unknown — fallback, never blank
+                template = "Recorded " + kind.replace("_", " ") + ": “{short_text}”"
+            ctx = _SafeDict(
+                text=data.get("text") or "",
+                short_text=_shorten(data.get("text"),
+                                    160 if kind != "site_claim" else 120),
+                url=meta.get("url") or "",
+                status=meta.get("status"),
+                behavior=meta.get("behavior") or "a behavior",
+            )
+            try:
+                return template.format_map(ctx)
+            except Exception:
+                return _shorten(data.get("text"), 160)
         return None  # generic core observations stay off the feed
     if obj_type == "artifact" and meta.get("lab") == "blog_draft":
         return (f"Drafted a blog post: “{data.get('title')}” ({meta.get('slug')}.md) "
                 "— publish approval pending.")
+    if obj_type == "artifact" and meta.get("lab") == "seam":
+        return (f"Seam proposed: {meta.get('seam_name')} v{meta.get('version')} "
+                "— self_modify approval pending.")
     if obj_type == "artifact" and meta.get("lab") == "upstream_issue":
         return f"Drafted an upstream issue: “{data.get('title')}” (publishing gated)."
     if obj_type == "task" and meta.get("lab_branch_id"):
@@ -329,13 +392,15 @@ def _feed(rt) -> dict:
     each, grouped by branch, pending decisions pinned on top (the inbox)."""
     g = rt.graph
     entries: list[dict] = []
-    for e in g.events:
+    timeline = _seam_template_timeline(g)
+    for i, e in enumerate(g.events):
+        tmpl = (lambda kind, _i=i: _template_at(timeline, kind, _i))
         sentence = None
         branch_id = None
         if e.type == "object.created":
             obj = e.payload.get("object", {}) or {}
             data = obj.get("data", {}) or {}
-            sentence = _narrate_created(g, obj.get("type"), data, obj.get("id"))
+            sentence = _narrate_created(g, obj.get("type"), data, obj.get("id"), tmpl)
             branch_id = _branch_of_object(g, obj.get("type"), data, obj.get("id"))
             if obj.get("type") == "comm_message" and not branch_id:
                 branch_id = (data.get("metadata") or {}).get("lab_branch_id")
@@ -479,6 +544,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(_feed(rt))
             elif path == "/lab/draft":
                 self._handle_draft(qs)
+            elif path == "/lab/seams":
+                self._handle_seams()
             elif path == "/graph":
                 self._handle_graph()
             elif path == "/trace":
@@ -535,6 +602,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             self._send_error_json("internal error", 500)
+
+    # ── GET /lab/seams ──────────────────────────────────────────────────────
+
+    def _handle_seams(self):
+        """The Seams view (read-only): every self-modification surface, its
+        active version, source (file|graph), and pending proposals."""
+        from lab_pack import seams
+        rt = _get_rt()
+        with _lock:
+            status = seams.seam_status(rt.graph)
+        self._send_json(status)
 
     # ── GET /healthz ────────────────────────────────────────────────────────
 
