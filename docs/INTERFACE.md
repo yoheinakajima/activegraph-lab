@@ -22,6 +22,10 @@ Every answer is stamped with the last event it could see ("as of event N"). If w
 
 Forking anchors to a committed event only (`branch.fork_event_id`). In-flight work stays with the parent branch.
 
+## Steering verbs
+
+Inside a branch thread: `pause` → branch status `paused` (ADR-007); `resume` → `active` (only from paused); `approve`/`reject` → resolves the branch's pending decision. The reply confirms; the mutation lands at the event boundary.
+
 ## Deferred
 
 Graph pane. Fork diff view. LLM-narrated feed entries. OPEN: feed pagination (currently the server returns the full projection; paginate when it hurts).

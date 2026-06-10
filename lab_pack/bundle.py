@@ -135,6 +135,9 @@ def _seed_upstream_friction(graph, mission_id: str, branch_id: str) -> None:
             "type-first encoding, so mixed graphs decode inconsistently. "
             "Suggest standardizing on the signature order and updating the "
             "Inspector decode.\n\n"
+            "The lab's interim handling is ADR-008 (docs/DECISIONS.md): write "
+            "signature-order everywhere, decode both encodings through "
+            "lab_pack/compat.py until upstream standardizes.\n\n"
             "Evidence: " + obs.id
         ),
         "format": "markdown",

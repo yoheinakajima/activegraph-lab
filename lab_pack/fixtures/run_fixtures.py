@@ -231,11 +231,7 @@ def run_thread_equals_branch() -> bool:
             bdata = g.get_object(branch.id).data
             c.that(bdata.get("status") == mut["status"],
                    f"expected branch status {mut['status']}, got {bdata.get('status')}")
-            if mut.get("paused_flag"):
-                c.that(bool((bdata.get("metadata") or {}).get("paused")),
-                       "branch metadata.paused flag not set")
-            print(f"    branch after steering: status={bdata.get('status')} "
-                  f"paused={bdata.get('metadata', {}).get('paused')}")
+            print(f"    branch after steering: status={bdata.get('status')}")
 
     exp = spec["expected_outputs"]
     cands = g.objects(type="comm_response_candidate")
@@ -287,12 +283,42 @@ def run_capability_gap() -> bool:
     return c.done("capability_gap")
 
 
+def run_compat_regression() -> bool:
+    """ADR-008: decode_relation must handle both add_relation call conventions."""
+    print("\n" + "=" * 64)
+    print("Fixture: compat_regression — decode_relation handles both conventions")
+    print("=" * 64)
+
+    from activegraph import Graph
+    from lab_pack.compat import decode_relation, relation_touches
+
+    g = Graph()
+    a = g.add_object("thing", {"n": 1})
+    b = g.add_object("thing", {"n": 2})
+    sig = g.add_relation(a.id, b.id, "signature_order")      # chat/lab style
+    inv = g.add_relation("type_first", a.id, b.id)           # core/research style
+
+    c = Check()
+    c.that(decode_relation(sig) == ("signature_order", a.id, b.id),
+           f"signature-order decode wrong: {decode_relation(sig)}")
+    c.that(decode_relation(inv) == ("type_first", a.id, b.id),
+           f"type-first decode wrong: {decode_relation(inv)}")
+    c.that(relation_touches(sig, a.id) and relation_touches(inv, b.id),
+           "relation_touches failed on one of the conventions")
+    c.that(not relation_touches(sig, "thing#99"),
+           "relation_touches false positive")
+    print(f"  signature-order → {decode_relation(sig)}")
+    print(f"  type-first      → {decode_relation(inv)}")
+    return c.done("compat_regression")
+
+
 def run_all() -> None:
     results = [
         run_bootstrap(),
         run_branch_lifecycle(),
         run_thread_equals_branch(),
         run_capability_gap(),
+        run_compat_regression(),
     ]
     passed = sum(results)
     print(f"\n{'=' * 64}")

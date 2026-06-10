@@ -52,7 +52,13 @@ from urllib.parse import urljoin, urlparse
 
 from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
-from .llm import AnswerReply, InterpretSummary, PlanProposal
+from .llm import (
+    AnswerReply,
+    InterpretSummary,
+    PlanProposal,
+    consume_llm_anomalies,
+    is_inert,
+)
 from .settings import LabSettings
 
 _PROMPTS = {p.name: p.body for p in load_prompts_from_dir(Path(__file__).parent / "prompts")}
@@ -244,38 +250,65 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     state["visited"].add(url)
     state["fetched"] += 1
 
-    # The fetch handler returns JSON {"url", "status", "content"}; the gateway
-    # stores it (sanitized) as the source content.
+    # The fetch handler returns JSON {"url", "status", "content", "error"?};
+    # the gateway stores it (sanitized) as the source content.
     content = data.get("content") or ""
     try:
         payload = json.loads(content)
         html = payload.get("content", "")
         fetched_url = payload.get("url") or url
+        status = payload.get("status", 200)
+        fetch_error = payload.get("error")
     except (json.JSONDecodeError, AttributeError):
-        html, fetched_url = content, url
+        html, fetched_url, status, fetch_error = content, url, 200, None
+
+    # A failed page is evidence, not an error: record it and move on. The
+    # crawl never aborts on one page.
+    if fetch_error or (isinstance(status, int) and (status == 0 or status >= 400)):
+        graph.add_object("observation", {
+            "text": (f"Fetch failed for {fetched_url}: status={status}"
+                     + (f" ({fetch_error})" if fetch_error else "")
+                     + ". The page could not be read from this environment."),
+            "confidence": 1.0,
+            "source_ids": [obj_id],
+            "category": "risk",
+            "metadata": {"lab": "fetch_failure", "mission_id": mission_id,
+                         "url": fetched_url, "status": status},
+        })
+        html = ""  # no claims, no links from a failed page
 
     text = _strip_html(html)
 
-    # Claim observations — the gap list's raw material.
-    for claim in _claims_from_text(text, settings.max_claims_per_page):
-        obs = graph.add_object("observation", {
-            "text": claim,
-            "confidence": 0.7,
-            "source_ids": [obj_id],
-            "category": "fact",
-            "metadata": {"lab": "site_claim", "mission_id": mission_id, "url": fetched_url},
-        })
-        graph.add_relation(obj_id, obs.id, "grounds")
+    try:
+        # Claim observations — the gap list's raw material.
+        for claim in _claims_from_text(text, settings.max_claims_per_page):
+            obs = graph.add_object("observation", {
+                "text": claim,
+                "confidence": 0.7,
+                "source_ids": [obj_id],
+                "category": "fact",
+                "metadata": {"lab": "site_claim", "mission_id": mission_id, "url": fetched_url},
+            })
+            graph.add_relation(obj_id, obs.id, "grounds")
 
-    # Same-domain links, depth- and cap-bounded.
-    if depth < settings.crawl_max_depth:
-        budget = settings.crawl_page_cap - state["fetched"] - len(state["queued"])
-        for link in _links_from_html(html, fetched_url):
-            if budget <= 0:
-                break
-            if link not in state["visited"] and link not in state["queued"]:
-                _queue_fetch(graph, mission_id, link, depth + 1)
-                budget -= 1
+        # Same-domain links, depth- and cap-bounded.
+        if depth < settings.crawl_max_depth:
+            budget = settings.crawl_page_cap - state["fetched"] - len(state["queued"])
+            for link in _links_from_html(html, fetched_url):
+                if budget <= 0:
+                    break
+                if link not in state["visited"] and link not in state["queued"]:
+                    _queue_fetch(graph, mission_id, link, depth + 1)
+                    budget -= 1
+    except Exception as exc:
+        # Per-page isolation: one malformed page never aborts the crawl.
+        graph.add_object("observation", {
+            "text": f"Page processing failed for {fetched_url}: {type(exc).__name__}: {exc}",
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "fetch_failure", "mission_id": mission_id,
+                         "url": fetched_url, "status": status},
+        })
 
     # Progress event per page: a mission patch is a committed, projectable event.
     mission = graph.get_object(mission_id)
@@ -315,6 +348,7 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
     The narrated reasoning rides in the branch.created event payload
     (data.metadata.reasoning) — prioritization is prose, never a formula.
     """
+    consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
     obs_id = obj.get("id")
     data = obj.get("data", {})
@@ -397,13 +431,13 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
 def _task_reacted(graph, task_id: str) -> bool:
     """Did any pack react to the task? Reaction = a relation linking work
     products to the task (core convention: executes/generates), in either
-    relation-argument convention (see docs/ARCHITECTURE.md), or a status
+    relation-argument convention (ADR-008, lab_pack/compat.py), or a status
     change away from 'active'."""
+    from .compat import decode_relation, relation_touches
     try:
         for r in graph.relations():
-            touches = task_id in (str(r.source), str(r.target), str(r.type))
-            rel_type = str(r.type) if "#" not in str(r.type) else str(r.source)
-            if touches and rel_type in ("executes", "generates"):
+            rel_type, _, _ = decode_relation(r)
+            if rel_type in ("executes", "generates") and relation_touches(r, task_id):
                 return True
     except Exception:
         pass
@@ -536,12 +570,13 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
     interpreting, decision (promote, pending) — gate takes it from there.
     outcome='follow_up' additionally proposes a child branch.
     """
+    consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
     data = obj.get("data", {})
     meta = data.get("metadata") or {}
     branch_id = meta.get("lab_branch_id")
     task_id = meta.get("task_id")
-    if not branch_id or out is None:
+    if not branch_id or out is None or is_inert(getattr(out, "summary", None)):
         return
 
     branch = graph.get_object(branch_id)
@@ -707,16 +742,12 @@ def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
         return None
 
     if any(w in low for w in _STEER_PAUSE):
-        # OPEN (docs/INTERFACE.md): branch status has no 'paused' value
-        # (CONTRACT enum); pause maps to 'scoped' + a metadata flag.
-        meta = dict(branch.data.get("metadata") or {})
-        meta["paused"] = True
-        graph.patch_object(branch_id, {"status": "scoped", "metadata": meta})
-        return "branch paused (status=scoped)"
+        graph.patch_object(branch_id, {"status": "paused"})
+        return "branch paused"
     if any(w in low for w in _STEER_RESUME):
-        meta = dict(branch.data.get("metadata") or {})
-        meta.pop("paused", None)
-        graph.patch_object(branch_id, {"status": "active", "metadata": meta})
+        if branch.data.get("status") != "paused":
+            return None
+        graph.patch_object(branch_id, {"status": "active"})
         return "branch resumed (status=active)"
     if any(w in low for w in _STEER_APPROVE):
         decision_id = _PENDING_BY_SUBJECT.get(branch_id)
@@ -779,12 +810,18 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
     if not branch_id:
         return  # Not a branch thread — the generic chat pack may still reply.
 
+    consume_llm_anomalies(graph)
     mutation = _apply_steering(graph, branch_id, data.get("content") or "")
 
     branch = graph.get_object(branch_id)
     reply = (getattr(out, "reply", None) or "").strip() if out is not None else ""
-    if not reply:
-        reply = "No reply was produced."
+    if not reply or is_inert(reply):
+        # Budget or parse trouble — still answer honestly from graph state.
+        reply = ("I couldn't produce a model-written reply (LLM budget or "
+                 "output-parse issue — recorded as an observation). ")
+        if branch is not None:
+            reply += (f"Branch “{branch.data.get('title')}” is currently "
+                      f"{branch.data.get('status')}.")
     if mutation:
         reply += f"\n\nApplied: {mutation}."
     reply += f"\n\n— as of event {event.id}"

@@ -25,10 +25,14 @@ messages:
     expect_reply: true
     expect_stamp: true
     expect_mutation:
-      status: scoped          # OPEN: no 'paused' enum value; pause = scoped + flag
-      paused_flag: true
+      status: paused          # ADR-007
+  - content: ok, resume it
+    expect_reply: true
+    expect_stamp: true
+    expect_mutation:
+      status: active
 
 expected_outputs:
   response_candidates:
-    count: 2
+    count: 3
   discusses_relation: true

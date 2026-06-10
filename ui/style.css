@@ -84,6 +84,7 @@ h3.register {
 .chip.active { color: var(--accent); border-color: var(--accent); }
 .chip.decided { color: #9ec0d8; border-color: #9ec0d8; }
 .chip.scoped, .chip.proposed { color: var(--warn); border-color: var(--warn); }
+.chip.paused { color: #c97a6a; border-color: #c97a6a; }
 
 .entry { padding: 4px 0; border-top: 1px dotted var(--line); }
 .entry:first-of-type { border-top: 0; }

@@ -54,3 +54,17 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Date: 2026-06-10
 - Decision: The lab never calls domain packs directly. Its work behavior writes core task objects with a routing convention (task.kind or tags); research and codebase pack behaviors react. No adapters/ directory.
 - Rationale: Packs compose through graph state, not function calls — the packs repo's central design rule. An adapter layer would be a coordinator in disguise.
+
+## ADR-007: 'paused' is a branch status
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: The branch status enum gains `paused` (proposed|scoped|active|paused|interpreting|decided|archived), replacing the scoped + metadata.paused workaround for the pause steering verb.
+- Rationale: Pause is an owner-visible state the feed must render and steering must round-trip (pause → resume). Overloading `scoped` made the projection lie about intent. Enum values on a lab-owned type are a code change plus this ADR — not a new object type, so no gated decision is required (ADR-003 gates types, not fields).
+
+## ADR-008: Relation call-convention handling
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: The lab writes relations in signature order — `add_relation(source_id, target_id, type)` — everywhere, and reads mixed graphs through one documented helper, `lab_pack/compat.py:decode_relation`, which discriminates per relation (object ids contain `#`, relation type names never do). All lab code that reads relations goes through this helper.
+- Rationale: The packs repo is split on argument order (core/research/tool_gateway type-first; chat signature-order); a composed graph holds both encodings. Signature order is what runtime view traversal and relation queries require, so the lab writes it; the decode shim is quarantined in one place, linked to the friction observation seeded under the mission, and goes away if upstream standardizes (the lab's draft issue artifact proposes exactly that).

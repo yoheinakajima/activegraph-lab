@@ -22,15 +22,39 @@ from .behaviors import _THREAD_TO_BRANCH
 _MAX_FETCH_CHARS = 200_000
 
 
+_FETCH_UA = (
+    "Mozilla/5.0 (compatible; activegraph-lab/0.1; "
+    "+https://github.com/yoheinakajima/activegraph-lab)"
+)
+
+
 def default_fetch_url(url: str, **_kwargs) -> dict:
-    """Default live web fetcher (urllib, 20s timeout, size-capped)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "activegraph-lab/0.1"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = resp.read(_MAX_FETCH_CHARS).decode("utf-8", errors="replace")
-            return {"url": url, "status": resp.status, "content": body}
-    except Exception as exc:
-        return {"url": url, "status": 0, "content": "", "error": f"{type(exc).__name__}: {exc}"}
+    """Default live web fetcher: real User-Agent, 20s timeout, 2 retries with
+    backoff (1s, 2s). Never raises — a failed page returns {status, error} and
+    ingest records it as a fetch-failure observation (a 403 is evidence)."""
+    import time
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _FETCH_UA,
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    })
+    last: dict = {"url": url, "status": 0, "content": "", "error": "not attempted"}
+    for attempt in range(3):  # initial try + 2 retries
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read(_MAX_FETCH_CHARS).decode("utf-8", errors="replace")
+                return {"url": url, "status": resp.status, "content": body}
+        except urllib.error.HTTPError as exc:
+            last = {"url": url, "status": exc.code, "content": "",
+                    "error": f"HTTPError: {exc.code} {exc.reason}"}
+            if exc.code in (401, 403, 404, 410):
+                break  # retrying won't change a definitive answer
+        except Exception as exc:
+            last = {"url": url, "status": 0, "content": "",
+                    "error": f"{type(exc).__name__}: {exc}"}
+        if attempt < 2:
+            time.sleep(1 * (attempt + 1))
+    return last
 
 
 def register_web_fetch(handler=None, *, overwrite: bool = False) -> bool:

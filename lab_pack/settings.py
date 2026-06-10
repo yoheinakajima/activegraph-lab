@@ -69,10 +69,34 @@ class LabSettings(BaseModel):
         default="lab",
         description="comm_message channel the answer behavior listens on.",
     )
-    model: Optional[str] = Field(
-        default=None,
+    drafts_dir: str = Field(
+        default="drafts",
         description=(
-            "LLM model name override for the lab's llm_behaviors. None resolves "
-            "to the active provider's default_model at call time."
+            "Directory where blog_draft artifacts are mirrored as <slug>.md "
+            "for easy reading. The graph copy is canonical; the file is a mirror."
+        ),
+    )
+    model: Optional[str] = Field(
+        default="claude-sonnet-4-20250514",
+        description=(
+            "Model for the lab's llm_behaviors when the Anthropic provider is "
+            "active (key from ANTHROPIC_API_KEY env var ONLY — never the graph, "
+            "never logs). Ignored for other providers; LAB_LLM_MODEL overrides."
+        ),
+    )
+    max_llm_calls_per_behavior_run: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Per-behavior LLM call cap within one run cycle (counters reset by "
+            "reset_llm_run_counters(), called by the server/runner per drain)."
+        ),
+    )
+    max_total_llm_calls_per_session: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Hard session-wide LLM call cap. Exhaustion records an observation "
+            "and stops cleanly — behaviors receive inert outputs, never errors."
         ),
     )

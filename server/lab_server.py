@@ -115,7 +115,7 @@ def _build_runtime():
     from lab_pack.settings import LabSettings
 
     global _llm_info
-    provider, _llm_info = select_lab_provider()
+    provider, _llm_info = select_lab_provider(settings=LabSettings())
     print(f"[lab_server] LLM: mode={_llm_info['mode']} provider={_llm_info['provider']} "
           f"model={_llm_info.get('model')}", flush=True)
 
@@ -153,13 +153,7 @@ def _get_rt():
 # ─── serialization (projection helpers) ───────────────────────────────────────
 
 
-def _decode_relation(r) -> tuple[str, str, str]:
-    """Return (type, source_id, target_id) for either relation-argument
-    convention in the composed graph: object ids contain '#', relation type
-    names never do (docs/ARCHITECTURE.md)."""
-    if "#" in str(r.type):  # type-first call (core/research/tool_gateway style)
-        return str(r.source), str(r.target), str(r.type)
-    return str(r.type), str(r.source), str(r.target)
+from lab_pack.compat import decode_relation as _decode_relation  # ADR-008
 
 
 def _safe(obj: Any) -> Any:
@@ -391,8 +385,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path in ("/app.js", "/style.css"):
                 self._send_static(path)
             elif path == "/lab/feed":
+                from lab_pack.watchdog import check_stalls
                 with _lock:
-                    self._send_json(_feed(_get_rt_unlocked()))
+                    rt = _get_rt_unlocked()
+                    check_stalls(rt)  # A5: stalled work is released, never hangs silently
+                    self._send_json(_feed(rt))
             elif path == "/graph":
                 self._handle_graph()
             elif path == "/trace":
@@ -497,7 +494,10 @@ class Handler(BaseHTTPRequestHandler):
         """Post a message into a branch's thread; reply comes from the lab's
         answer behavior, stamped with its event horizon."""
         from lab_pack.behaviors import _THREAD_TO_BRANCH
+        from lab_pack.llm import reset_llm_run_counters
         from lab_pack.tools import send_branch_message_fn
+
+        reset_llm_run_counters()  # A4: per-behavior budget is per run cycle
 
         rt = _get_rt()
         content = (body.get("content") or "").strip()
@@ -530,7 +530,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_decision(self, body: dict):
         """Approve/reject a pending decision — the inbox's buttons. The gate
         behavior applies the outcome at the next event boundary."""
+        from lab_pack.llm import reset_llm_run_counters
         from lab_pack.tools import approve_decision_fn
+
+        reset_llm_run_counters()
 
         rt = _get_rt()
         decision_id = body.get("decision_id")

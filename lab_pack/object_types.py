@@ -53,10 +53,10 @@ class Branch(BaseModel):
         description="Free-text statement of what this branch is trying to find out or produce.",
     )
     status: Literal[
-        "proposed", "scoped", "active", "interpreting", "decided", "archived"
+        "proposed", "scoped", "active", "paused", "interpreting", "decided", "archived"
     ] = Field(
         default="proposed",
-        description="Branch lifecycle status.",
+        description="Branch lifecycle status. 'paused' added by ADR-007.",
     )
     parent_branch_id: Optional[str] = Field(
         default=None,
