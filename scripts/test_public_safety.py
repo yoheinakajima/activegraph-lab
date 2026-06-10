@@ -26,6 +26,7 @@ import os
 SENTINELS = {
     "ANTHROPIC_API_KEY": "sk-ant-SENTINEL-vQ9zT3xK7w",
     "LAB_OPERATOR_TOKEN": "tok-SENTINEL-pL2mR8dN4c",
+    "LAB_MCP_TOKEN": "mcp-SENTINEL-qW7vJ3hF9e",
     "DATABASE_URL": "postgres://sentinel_user:pw-SENTINEL-aB5xY1@db.sentinel.internal:5432/lab",
 }
 
@@ -114,6 +115,27 @@ def _run() -> int:
             approve_decision_fn(g, pend[0].id, True, "audit pass")
             rt.run_until_idle()
 
+    # ── MCP surface (ADR-016): tool outputs join the audited corpus too ─────
+    import threading
+    from server import mcp as mcp_mod
+
+    def mcp_call(method, params=None):
+        _, resp = mcp_mod.handle_post(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                        "params": params or {}}).encode(),
+            get_rt=lambda: rt, lock=threading.Lock(),
+            run_on_worker=lambda fn: fn(rt), rate_limited=lambda: False)
+        return resp
+
+    mcp_outputs = [mcp_call("initialize", {"protocolVersion": "2025-06-18"})]
+    for name, args in (("get_status", {}), ("get_feed", {}),
+                       ("get_branch", {"branch_id": str(branch.id)}),
+                       ("get_pending_decisions", {}), ("list_posts", {}),
+                       ("list_seams", {}),
+                       ("send_chat", {"branch_id": str(branch.id),
+                                      "message": "audit: anything secret in here?"})):
+        mcp_outputs.append(mcp_call("tools/call", {"name": name, "arguments": args}))
+
     # ── the corpus: every event payload, every object, feed JSON, boot log ──
     corpus = {
         "events": [{"type": str(e.type), "actor": str(e.actor),
@@ -121,12 +143,17 @@ def _run() -> int:
         "objects": [{"id": str(o.id), "type": str(o.type), "data": o.data}
                     for o in g.all_objects()],
         "feed": _feed(rt),
+        "mcp": mcp_outputs,
         "boot_log": boot_log.getvalue(),
     }
     blob = json.dumps(corpus, default=str)
 
     print(f"== sentinel audit over {len(g.events)} events, "
-          f"{len(g.all_objects())} objects, the feed, and the boot log ==")
+          f"{len(g.all_objects())} objects, the feed, the MCP surface, "
+          "and the boot log ==")
+    chat_out = (mcp_outputs[-1].get("result") or {})
+    check(not chat_out.get("isError", True),
+          "MCP send_chat path exercised (reply produced, joins the corpus)")
     for name, sentinel in SENTINELS.items():
         check(sentinel not in blob, f"{name} sentinel absent from the public corpus")
     # DATABASE_URL fragments count too (host, user, password)

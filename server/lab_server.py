@@ -55,17 +55,33 @@ def _operator_token() -> str:
     return os.environ.get("LAB_OPERATOR_TOKEN", "").strip()
 
 
-def _check_bearer(headers) -> tuple[int, str]:
+def _mcp_token() -> str:
+    """ADR-016: a separate secret for /mcp, revocable independently. It never
+    grants inbox or pause authority, and the operator token never opens /mcp
+    (strict two-way separation)."""
+    return os.environ.get("LAB_MCP_TOKEN", "").strip()
+
+
+def _check_token(headers, token: str, unset_msg: str) -> tuple[int, str]:
     """Returns (0, '') if authorized; else (http_status, message)."""
-    token = _operator_token()
     if not token:
-        return 403, "read-only mode: LAB_OPERATOR_TOKEN is not set on the server"
+        return 403, unset_msg
     supplied = (headers.get("Authorization") or "").strip()
     if not supplied.startswith("Bearer ") or not supplied[7:].strip():
         return 401, "missing bearer token"
     if not hmac.compare_digest(supplied[7:].strip(), token):
         return 403, "invalid token"
     return 0, ""
+
+
+def _check_bearer(headers) -> tuple[int, str]:
+    return _check_token(headers, _operator_token(),
+                        "read-only mode: LAB_OPERATOR_TOKEN is not set on the server")
+
+
+def _check_mcp_bearer(headers) -> tuple[int, str]:
+    return _check_token(headers, _mcp_token(),
+                        "mcp disabled: LAB_MCP_TOKEN is not set on the server")
 
 
 def _rate_limited() -> bool:
@@ -470,7 +486,8 @@ def _narrate_created(g, obj_type: str, data: dict, obj_id: str,
     if obj_type == "evaluation" and meta.get("lab") == "task_outcome":
         return f"Work {data.get('judgment', '').replace('_', ' ')}: {_shorten(data.get('rationale') or '', 110)}"
     if obj_type == "comm_message" and data.get("channel") == "lab":
-        return f"{data.get('sender_ref', 'owner')} said: “{_shorten(data.get('content'), 130)}”"
+        via = (" (via MCP)" if (meta.get("source") == "operator_via_mcp") else "")
+        return f"{data.get('sender_ref', 'owner')}{via} said: “{_shorten(data.get('content'), 130)}”"
     if obj_type == "comm_response_candidate" and data.get("created_by_behavior") == "lab.answer":
         return f"Lab replied: “{_shorten(data.get('content'), 150)}”"
     if obj_type == "source" and data.get("kind") == "tool_result":
@@ -594,6 +611,37 @@ def _build_entries(g, timeline=None) -> list[dict]:
     return entries
 
 
+def _pending_decisions(g) -> list[dict]:
+    """The inbox projection: pending decisions with their evidence attached
+    inline. Shared by /lab/feed and the MCP get_pending_decisions tool."""
+    inbox = []
+    for d in g.objects(type="decision"):
+        if d.data.get("status") != "pending":
+            continue
+        evidence = []
+        for ref in d.data.get("evidence_refs") or []:
+            o = g.get_object(ref)
+            if o is not None:
+                evidence.append({
+                    "id": str(o.id),
+                    "type": str(o.type),
+                    "text": _shorten(o.data.get("text") or o.data.get("title")
+                                     or o.data.get("rationale") or "", 200),
+                })
+        subject = g.get_object(d.data.get("subject_ref"))
+        inbox.append({
+            "id": str(d.id),
+            "kind": d.data.get("kind"),
+            "rationale": d.data.get("rationale"),
+            "subject_ref": d.data.get("subject_ref"),
+            "subject_title": (subject.data.get("title") if subject is not None else None),
+            "branch_id": _branch_of_object(g, "decision", d.data, d.id),
+            "requested_at": (d.data.get("metadata") or {}).get("approval_requested_at"),
+            "evidence": evidence,
+        })
+    return inbox
+
+
 def _feed(rt, limit: int = 100) -> dict:
     """The notebook feed: lab events joined with their objects, one sentence
     each, grouped by branch, pending decisions pinned on top (the inbox).
@@ -622,31 +670,7 @@ def _feed(rt, limit: int = 100) -> dict:
     resolved.sort(key=lambda x: _event_index(x["id"].replace("#", "_")), reverse=True)
 
     # The inbox: pending decisions with their evidence attached inline.
-    inbox = []
-    for d in g.objects(type="decision"):
-        if d.data.get("status") != "pending":
-            continue
-        evidence = []
-        for ref in d.data.get("evidence_refs") or []:
-            o = g.get_object(ref)
-            if o is not None:
-                evidence.append({
-                    "id": str(o.id),
-                    "type": str(o.type),
-                    "text": _shorten(o.data.get("text") or o.data.get("title")
-                                     or o.data.get("rationale") or "", 200),
-                })
-        subject = g.get_object(d.data.get("subject_ref"))
-        inbox.append({
-            "id": str(d.id),
-            "kind": d.data.get("kind"),
-            "rationale": d.data.get("rationale"),
-            "subject_ref": d.data.get("subject_ref"),
-            "subject_title": (subject.data.get("title") if subject is not None else None),
-            "branch_id": _branch_of_object(g, "decision", d.data, d.id),
-            "requested_at": (d.data.get("metadata") or {}).get("approval_requested_at"),
-            "evidence": evidence,
-        })
+    inbox = _pending_decisions(g)
 
     branches = {str(b.id): {"branch": _object_to_dict(b), "entries": []}
                 for b in g.objects(type="branch")}
@@ -699,6 +723,42 @@ def _status_line() -> str:
         return ""
     return (f"{'paused' if s['paused'] else 'live'} · "
             f"${s['llm_cost_today']:.2f}/${s['llm_cost_cap']:.2f} today · ")
+
+
+# ─── the chat path ────────────────────────────────────────────────────────────
+
+
+def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
+    """The one chat code path: POST /chat and the MCP send_chat tool both land
+    here (ADR-016). Runs on the runtime worker. `source` tags the message's
+    metadata (e.g. operator_via_mcp) so the public log distinguishes the human
+    from their assistant; either way the sender IS the operator (2b: a valid
+    token is the operator — no anonymous write path, and the client does not
+    get to choose its identity)."""
+    from lab_pack.behaviors import _THREAD_TO_BRANCH
+    from lab_pack.llm import sync_daily_budget
+    from lab_pack.tools import send_branch_message_fn
+
+    sync_daily_budget(rt)  # 7b: authoritative used-today from the log
+    if rt.graph.get_object(branch_id) is None:
+        return None
+    events_before = len(rt.graph.events)
+    thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
+    thread_id, msg = send_branch_message_fn(
+        rt.graph, branch_id, content,
+        user_ref="operator", thread_id=thread_id, source=source,
+    )
+    rt.run_until_idle()
+    _save(rt)
+    cands = [c for c in rt.graph.objects(type="comm_response_candidate")
+             if c.data.get("message_id") == msg.id
+             and c.data.get("created_by_behavior") == "lab.answer"]
+    reply = cands[-1].data.get("content") if cands else "No reply produced."
+    horizon = (cands[-1].data.get("metadata") or {}).get("event_horizon") if cands else None
+    return {"content": reply, "thread_id": thread_id,
+            "branch_id": branch_id, "event_horizon": horizon,
+            "message_id": str(msg.id),
+            "created_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
@@ -823,6 +883,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"frames": [], "total": 0})
             elif path in ("/health", "/healthz"):
                 self._handle_healthz()
+            elif path == "/mcp":
+                # Streamable HTTP without an SSE channel: GET is declined,
+                # which the MCP spec permits (server-initiated messages are
+                # simply unavailable). Clients POST JSON-RPC instead.
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                body = json.dumps({"error": "POST JSON-RPC 2.0 messages to /mcp"}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self._send_error_json("Not found", 404)
         except Exception:
@@ -832,7 +903,41 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
+        raw = self.rfile.read(length) if length else b""
+        if path == "/mcp":
+            # ADR-016: MCP authorizes with LAB_MCP_TOKEN only — the operator
+            # token is refused here, and LAB_MCP_TOKEN is refused everywhere
+            # else (strict two-way separation). Parse errors are the MCP
+            # module's to render as JSON-RPC errors, so auth runs on raw bytes.
+            status, msg = _check_mcp_bearer(self.headers)
+            if status:
+                if status == 401:
+                    self.send_response(401)
+                    self.send_header("WWW-Authenticate", "Bearer")
+                    body_b = json.dumps({"error": msg}).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body_b)))
+                    self.end_headers()
+                    self.wfile.write(body_b)
+                else:
+                    self._send_error_json(msg, status)
+                return
+            try:
+                from server import mcp
+                http_status, payload = mcp.handle_post(
+                    raw, get_rt=_get_rt, lock=_lock,
+                    run_on_worker=_run_on_worker, rate_limited=_rate_limited)
+                if payload is None:  # notification accepted, no body
+                    self.send_response(http_status)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self._send_json(payload, http_status)
+            except Exception:
+                traceback.print_exc()  # details to stderr only (ADR-011)
+                self._send_error_json("internal error", 500)
+            return
+        body = json.loads(raw) if raw else {}
         try:
             # /reset exists only in dev — in prod it is a 404, no override.
             if path == "/reset":
@@ -1066,9 +1171,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat(self, body: dict):
         """Post a message into a branch's thread; reply comes from the lab's
         answer behavior, stamped with its event horizon."""
-        from lab_pack.behaviors import _THREAD_TO_BRANCH
         from lab_pack.llm import reset_llm_run_counters
-        from lab_pack.tools import send_branch_message_fn
 
         reset_llm_run_counters()  # A4: per-behavior budget is per run cycle
 
@@ -1079,29 +1182,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("content and branch_id are required", 400)
             return
 
-        def job(rt):
-            from lab_pack.llm import sync_daily_budget
-            sync_daily_budget(rt)  # 7b: authoritative used-today from the log
-            if rt.graph.get_object(branch_id) is None:
-                return None
-            thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
-            # 2b: a valid token IS the operator — no anonymous write path, and
-            # the client does not get to choose its identity.
-            thread_id, msg = send_branch_message_fn(
-                rt.graph, branch_id, content,
-                user_ref="operator", thread_id=thread_id,
-            )
-            rt.run_until_idle()
-            _save(rt)
-            cands = [c for c in rt.graph.objects(type="comm_response_candidate")
-                     if c.data.get("message_id") == msg.id
-                     and c.data.get("created_by_behavior") == "lab.answer"]
-            reply = cands[-1].data.get("content") if cands else "No reply produced."
-            horizon = (cands[-1].data.get("metadata") or {}).get("event_horizon") if cands else None
-            return {"content": reply, "thread_id": thread_id,
-                    "branch_id": branch_id, "event_horizon": horizon}
-
-        out = _run_on_worker(job)
+        out = _run_on_worker(lambda rt: _chat_job(rt, branch_id, content))
         if out is None:
             self._send_error_json(f"no such branch: {branch_id}", 404)
             return

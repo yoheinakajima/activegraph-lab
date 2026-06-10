@@ -135,13 +135,15 @@ def send_branch_message_fn(
     content: str,
     user_ref: str = "owner",
     thread_id: Optional[str] = None,
+    source: Optional[str] = None,
 ):
     """Post a user message into a branch's thread (channel='lab').
 
     Creates the comm_thread on first use (requires the communication pack) and
     links it to the branch via discusses. The message carries
     metadata.lab_branch_id so the answer behavior's view anchors on the branch.
-    Returns (thread_id, comm_message).
+    `source` tags metadata.source (ADR-016: operator_via_mcp marks chats the
+    operator's assistant sent on their behalf). Returns (thread_id, comm_message).
     """
     if thread_id is None:
         thread = graph.add_object("comm_thread", {
@@ -153,13 +155,16 @@ def send_branch_message_fn(
         })
         thread_id = thread.id
         link_thread_to_branch_fn(graph, thread_id, branch_id)
+    meta = {"lab_branch_id": branch_id, "thread_id_hint": thread_id}
+    if source:
+        meta["source"] = source
     msg = graph.add_object("comm_message", {
         "channel": "lab",
         "sender_ref": user_ref,
         "content": content,
         "direction": "inbound",
         "thread_id": thread_id,
-        "metadata": {"lab_branch_id": branch_id, "thread_id_hint": thread_id},
+        "metadata": meta,
     })
     return thread_id, msg
 
