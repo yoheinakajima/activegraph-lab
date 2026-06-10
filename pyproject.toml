@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "activegraph-lab"
+version = "0.1.0"
+description = "Self-hosted research agent that grows activegraph.ai's evidence base, built as a layered pack on activegraph-packs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    "activegraph[llm,postgres]==1.0.5.post2",
+    # Pinned per ADR-005. Bumping this SHA is a gated decision the lab
+    # records about itself. Local dev override (single line):
+    #   pip install -e ../activegraph-packs
+    "activegraph-packs @ git+https://github.com/yoheinakajima/activegraph-packs@da2bca777ef6dd7aa667595f550e8eea10f3dfb7",
+    "pydantic>=2.0",
+    "click>=8.1",
+    "anthropic>=0.34",
+    "openai>=1.40",
+    "pyyaml>=6.0",
+]
+
+[project.entry-points."activegraph.packs"]
+lab = "lab_pack:pack"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lab_pack*", "server*"]
+
+[tool.setuptools.package-data]
+"*" = [
+    "prompts/*.md",
+    "fixtures/*.yaml",
+    "README.md",
+    "CHANGELOG.md",
+]

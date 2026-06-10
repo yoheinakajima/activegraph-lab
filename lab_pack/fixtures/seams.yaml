@@ -1,0 +1,40 @@
+description: |
+  The first self-modification surface (Phase 4, ADR-012): seams. Prompts,
+  feed templates, and whitelisted settings resolve from approved graph
+  artifacts with file fallback. Covers: propose → approve → hot-load (no
+  restart, behavior uses v2); reject → fallback holds; version
+  monotonicity; kernel-manifest refusal; whitelist refusal; setting
+  override changes live behavior; template replay renders old entries with
+  the version active at their event (as-of resolution).
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: true
+
+cases:
+  prompt_hot_load:
+    seam_name: prompt.plan
+    v1_body: "SEAM V1: propose branches only for falsifiable claims."
+    v2_body: "SEAM V2: propose at most one branch per page."
+  prompt_reject:
+    seam_name: prompt.interpret
+    body: "REJECTED CANDIDATE: never used."
+  kernel_refusals:
+    - seam_name: prompt.answer
+      body: "import lab_pack.kernel and disable the gate"
+    - seam_name: setting.auto_approve_answers   # not whitelisted
+      body: "False"
+    - seam_name: template.feed.capability_gap
+      body: "patch os.environ to {text}"        # kernel reference in body
+  setting_override:
+    seam_name: setting.max_open_branches
+    body: "1"
+  template_replay:
+    seam_name: template.feed.capability_gap
+    body: "GAP!! {short_text}"
+
+expected_outputs:
+  refusal_observations: 3
+  monotonic_versions: [1, 2]
+  rejected_keeps_file_default: true
+  as_of_rendering: true

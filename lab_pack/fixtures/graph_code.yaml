@@ -1,0 +1,42 @@
+description: |
+  Graph code machinery (Phase 5, ADR-012) — built and proven, shipped dark.
+  Pipeline (each step an event): static checks → sandbox subprocess with
+  wall-clock timeout → declared-scope check → pending self_modify decision.
+  Approved drafts stay DORMANT unless LAB_ALLOW_GRAPH_CODE=1; loaded
+  behaviors tag every object they create with draft provenance. No live
+  graph code is promoted outside this fixture.
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+drafts:
+  passing:
+    name: echo_eval
+    subscriptions: [observation]
+    touches: [evaluation]
+    expect: pending_decision
+  kernel_import:
+    name: kernel_toucher
+    subscriptions: [observation]
+    touches: [evaluation]
+    expect: rejected
+    failed_step: static_checks
+  scope_violation:
+    name: scope_breaker
+    subscriptions: [observation]
+    touches: [evaluation]      # but the source creates a task
+    expect: rejected
+    failed_step: scope_check
+  timeout:
+    name: spinner
+    subscriptions: [observation]
+    touches: [evaluation]
+    timeout_seconds: 2
+    expect: rejected
+    failed_step: sandbox_run
+
+expected_outputs:
+  dormant_without_flag: true
+  loaded_and_tagged_with_flag: true
+  no_live_graph_code_after_fixture: true

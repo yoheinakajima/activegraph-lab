@@ -1,0 +1,150 @@
+/* activegraph-lab notebook feed — minimal, no design system (deliberate:
+   the Inspector stays the debugging view; this is the lab's own register). */
+
+:root {
+  --bg: #11130f;
+  --panel: #191c16;
+  --panel-2: #20241c;
+  --ink: #e6e4d8;
+  --dim: #8e9282;
+  --accent: #b8c98a;
+  --warn: #d9a05b;
+  --line: #2c3026;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 "Iowan Old Style", "Palatino", Georgia, serif;
+}
+header {
+  position: sticky; top: 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 14px 22px 10px;
+  z-index: 5;
+}
+#masthead .logo {
+  font-weight: 700; letter-spacing: .04em;
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 14px;
+  margin-right: 14px;
+}
+#mission-title { color: var(--dim); font-style: italic; }
+#meta { margin-top: 4px; font-size: 12px; color: var(--dim);
+        font-family: ui-monospace, Menlo, monospace; }
+#meta span { margin-right: 18px; }
+
+main { max-width: 760px; margin: 0 auto; padding: 18px 22px 80px; }
+
+h3.register {
+  font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--dim); border-bottom: 1px solid var(--line);
+  padding-bottom: 4px; margin: 26px 0 10px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+/* inbox — pinned gated decisions */
+.decision-card {
+  background: var(--panel-2); border: 1px solid var(--warn);
+  border-radius: 6px; padding: 12px 14px; margin: 10px 0;
+}
+.decision-card .kind {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: var(--warn); text-transform: uppercase; letter-spacing: .1em;
+}
+.decision-card .rationale { margin: 6px 0; }
+.decision-card .evidence { font-size: 13px; color: var(--dim); margin: 4px 0 8px; }
+.decision-card .evidence li { margin: 2px 0; }
+.decision-card button {
+  font: inherit; font-size: 13px; padding: 4px 14px; margin-right: 8px;
+  border-radius: 4px; border: 1px solid var(--line); cursor: pointer;
+  background: var(--panel); color: var(--ink);
+}
+.decision-card button.approve { border-color: var(--accent); color: var(--accent); }
+.decision-card button.reject  { border-color: #c97a6a; color: #c97a6a; }
+
+/* branch groups */
+.branch-group {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; margin: 12px 0; padding: 10px 14px;
+  cursor: pointer;
+}
+.branch-group:hover { border-color: var(--accent); }
+.branch-head { display: flex; align-items: baseline; gap: 10px; }
+.branch-head .title { font-weight: 700; }
+.chip {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  padding: 1px 8px; border-radius: 9px; border: 1px solid var(--line);
+  color: var(--dim);
+}
+.chip.active { color: var(--accent); border-color: var(--accent); }
+.chip.decided { color: #9ec0d8; border-color: #9ec0d8; }
+.chip.scoped, .chip.proposed { color: var(--warn); border-color: var(--warn); }
+.chip.paused { color: #c97a6a; border-color: #c97a6a; }
+
+.entry { padding: 4px 0; border-top: 1px dotted var(--line); }
+.entry:first-of-type { border-top: 0; }
+.entry .when {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  color: var(--dim); margin-right: 8px;
+}
+.entry.user .text { color: #d8c9a0; }
+.entry.lab .text  { color: var(--accent); }
+
+/* thread view */
+#thread-head { display: flex; gap: 14px; align-items: flex-start; margin: 14px 0; }
+#thread-head h2 { margin: 0; font-size: 20px; }
+#thread-sub { color: var(--dim); font-size: 13px; margin-top: 2px; }
+#back {
+  font: inherit; font-size: 13px; background: none; border: 1px solid var(--line);
+  color: var(--dim); border-radius: 4px; padding: 4px 10px; cursor: pointer;
+}
+#timeline { margin: 10px 0 20px; }
+#composer { display: flex; gap: 8px; position: sticky; bottom: 18px; }
+#composer input {
+  flex: 1; font: inherit; padding: 10px 12px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+}
+#composer button {
+  font: inherit; padding: 0 18px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--accent); background: none; color: var(--accent);
+}
+.empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+
+#error-banner {
+  display: none; background: #3a2420; color: #d9a05b;
+  padding: 8px 22px; font-size: 13px;
+  border-bottom: 1px solid #c97a6a;
+}
+.decision-error { color: #c97a6a; font-size: 13px; margin-left: 8px; }
+.draft-preview { margin: 4px 0 4px 18px; font-size: 13px; }
+.draft-preview a { color: var(--accent); }
+.draft-preview .snippet { color: var(--dim); font-style: italic; }
+
+#role { color: var(--warn); }
+table.seams { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.seams th, table.seams td {
+  text-align: left; padding: 5px 8px; border-bottom: 1px dotted var(--line);
+}
+table.seams th { color: var(--dim); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.src-graph { color: var(--accent); }
+.src-file { color: var(--dim); }
+.seams-blurb { color: var(--dim); font-size: 13px; }
+#thread-head-seams { display: flex; gap: 14px; align-items: center; margin: 14px 0; }
+#thread-head-seams h2 { margin: 0; font-size: 20px; }
+.observer-note { color: var(--dim); font-style: italic; font-size: 13px; }
+footer { max-width: 760px; margin: 30px auto; padding: 0 22px; }
+footer a { color: var(--dim); font-size: 12px; }
+
+.chip.kind-publish { color: var(--accent); border-color: var(--accent); }
+.chip.kind-self_modify { color: #d88fc2; border-color: #d88fc2; }
+.chip.kind-promote { color: #9ec0d8; border-color: #9ec0d8; }
+#load-older {
+  font: inherit; font-size: 13px; margin: 10px 0; padding: 4px 14px;
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  border-radius: 4px; cursor: pointer;
+}

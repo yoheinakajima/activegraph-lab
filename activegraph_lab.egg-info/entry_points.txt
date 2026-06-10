@@ -1,0 +1,2 @@
+[activegraph.packs]
+lab = lab_pack:pack

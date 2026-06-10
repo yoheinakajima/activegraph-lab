@@ -1,0 +1,43 @@
+description: |
+  Full branch lifecycle with both gate outcomes: two branches are activated,
+  their tasks dispatched and completed (a fixture stands in for the worker),
+  interpret turns the outcomes into evidence + pending promote decisions, and
+  the owner approves one and rejects the other.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""            # no crawl in this fixture
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false  # the lifecycle fixture simulates a reacting worker
+
+branches:
+  - key: approved_branch
+    title: Verify the replay claim
+    intent: Find evidence that replay rebuilds graph state deterministically.
+    completion:
+      result_summary: Replayed a 500-event log twice; identical graph state both times.
+      success: true
+    resolution: approve
+    expected_final_status: decided
+  - key: rejected_branch
+    title: Verify the no-orchestrator claim
+    intent: Find evidence that coordination is emergent rather than centrally scheduled.
+    completion:
+      result_summary: Behavior dispatch traced; inconclusive on scheduling internals.
+      success: true
+    resolution: reject
+    expected_final_status: archived
+
+expected_outputs:
+  tasks:
+    min_count: 2
+  task_outcome_evaluations:
+    min_count: 2
+  interpretation_observations:
+    min_count: 2
+  decisions:
+    count: 2
+    approval_requested: true   # gate stamped approval_requested_at on each
+    statuses: [approved, rejected]

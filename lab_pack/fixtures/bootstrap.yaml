@@ -1,0 +1,56 @@
+description: |
+  Branch zero, end to end, no network and no API key: a mission for a canned
+  snapshot of activegraph.ai is created → ingest crawls the snapshot through
+  tool_gateway → sources → site_claim observations → plan (mock LLM) proposes
+  branches with narrated reasoning.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  statement: >
+    Crawl the site, infer what the project claims, find the gaps between
+    claims and linked evidence, and propose branches that close them.
+  target_url: https://activegraph.ai
+
+settings:
+  crawl_max_depth: 2
+  crawl_page_cap: 10
+  max_claims_per_page: 3
+  max_open_branches: 6
+
+# Canned site snapshot — the fixture's network. Keys are the URLs the crawl
+# will request; pages link to each other with same-domain hrefs.
+pages:
+  https://activegraph.ai: |
+    <html><body>
+    <nav><a href="/docs">Docs</a> <a href="/runtime">Runtime</a></nav>
+    <p>ActiveGraph is an event-sourced agent runtime. Every mutation is
+    appended to an event log before it changes graph state, so any agent
+    decision can be replayed and audited.</p>
+    <p>Behaviors fire automatically when matching objects appear in the
+    graph, with no central orchestrator.</p>
+    </body></html>
+  https://activegraph.ai/docs: |
+    <html><body>
+    <a href="/runtime">Runtime</a>
+    <p>Packs compose through graph state, not function calls, which lets you
+    add or remove a pack without rewiring the rest of the system.</p>
+    <p>The Inspector UI is just a projection of the event log.</p>
+    </body></html>
+  https://activegraph.ai/runtime: |
+    <html><body>
+    <a href="/docs">Docs</a>
+    <p>The runtime supports deterministic forks anchored to committed events,
+    and replay rebuilds the graph without re-firing behaviors.</p>
+    <p>Tool calls are policy gated: the model proposes and the runtime
+    disposes.</p>
+    </body></html>
+
+expected_outputs:
+  sources:
+    min_count: 3            # one tool_result source per fetched page
+  site_claim_observations:
+    min_count: 3
+  proposed_branches:
+    min_count: 2
+    reasoning_required: true
+  crawl_progress_on_mission: true

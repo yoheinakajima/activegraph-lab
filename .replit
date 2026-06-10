@@ -1,0 +1,11 @@
+run = "python server/lab_server.py"
+
+[env]
+LAB_ENV = "prod"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["python", "server/lab_server.py"]
+deploymentTarget = "vm"

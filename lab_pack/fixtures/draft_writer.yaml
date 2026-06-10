@@ -1,0 +1,50 @@
+description: |
+  The writing capability: a finding-tagged observation triggers draft_writer,
+  which produces a blog_draft artifact (graph canonical + drafts/<slug>.md
+  mirror) and a pending publish decision. Approve path publishes the
+  artifact; reject path marks it rejected and prefixes the mirror file with
+  a REJECTED header (file stays on disk). Nothing publishes without an
+  approved decision.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+branch:
+  title: Verify the replay claim
+  intent: Find evidence that replay rebuilds graph state deterministically.
+  status_after_create: active
+
+findings:
+  - key: approved_draft
+    text: >
+      Finding: replaying a five-hundred-event log twice produced identical
+      graph state both times, confirming the replay determinism claim for
+      runtime 1.0.5.post2.
+    resolution: approve
+    expected_artifact_status: published
+  - key: rejected_draft
+    text: >
+      Finding: the crawl of the mission site was synthetic in this
+      environment because outbound fetches return 403; site claims rest on
+      a snapshot, not the live page.
+    resolution: reject
+    expected_artifact_status: rejected
+    expect_rejected_header: true
+
+expected_outputs:
+  blog_draft_artifacts:
+    count: 2
+    body_requirements:
+      footnotes: true          # every draft cites evidence ids as footnotes
+      provenance_block: true   # branch, evidence, event horizon, model
+      sections: ["What we tried", "What happened", "What it means", "What's next"]
+  publish_decisions:
+    count: 2
+  mirror_files:
+    count: 2                   # rejected file stays on disk
+  no_unapproved_publish: true  # gate invariant: draft/pending until approved

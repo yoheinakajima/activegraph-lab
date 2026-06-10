@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>activegraph-lab</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div id="masthead">
+    <span class="logo">activegraph-lab</span>
+    <span id="mission-title"></span>
+  </div>
+  <div id="meta">
+    <span id="crawl"></span>
+    <span id="llm"></span>
+    <span id="horizon"></span>
+    <span id="role"></span>
+  </div>
+</header>
+
+<main>
+  <!-- Feed view: notebook register, inbox pinned on top -->
+  <section id="feed-view">
+    <div id="inbox"></div>
+    <div id="branches"></div>
+    <div id="mission-log"></div>
+  </section>
+
+  <!-- Seams view: the self-modification surfaces, read-only (4f) -->
+  <section id="seams-view" hidden>
+    <div id="thread-head-seams">
+      <button id="seams-back">&larr; feed</button>
+      <h2>Seams</h2>
+    </div>
+    <p class="seams-blurb">Prompts, feed templates, and whitelisted settings
+      resolve from approved graph artifacts with file fallback (ADR-012).
+      Proposals queue in the inbox as <code>self_modify</code> decisions.</p>
+    <div id="seams-table"></div>
+    <div id="graph-code-table"></div>
+  </section>
+
+  <!-- Thread view: one branch, one scroll, chat input at the bottom -->
+  <section id="thread-view" hidden>
+    <div id="thread-head">
+      <button id="back">&larr; feed</button>
+      <div>
+        <h2 id="thread-title"></h2>
+        <div id="thread-sub"></div>
+      </div>
+    </div>
+    <div id="thread-inbox"></div>
+    <div id="timeline"></div>
+    <form id="composer">
+      <input id="message" type="text" autocomplete="off"
+             placeholder="Talk inside this branch… (try: pause this branch / resume / approve / reject)">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+</main>
+
+<footer>
+  <a id="auth-link" href="#"></a>
+  &nbsp;·&nbsp;
+  <a id="seams-link" href="#">seams</a>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
