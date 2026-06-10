@@ -1,0 +1,129 @@
+"""build_lab() — compose the lab from activegraph-packs + lab_pack.
+
+A bundle is a load order plus a factory with good defaults — not a pack,
+no ontology (packs-repo convention). build_lab() loads the upstream packs
+from the pinned activegraph-packs dependency, loads lab_pack, registers the
+web fetcher with tool_gateway, and creates the mission for
+https://activegraph.ai with the read_the_website seed branch.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from activegraph import Graph, Runtime
+
+from packs.core import pack as core_pack, CoreSettings
+from packs.tool_gateway import pack as tool_gateway_pack, ToolGatewaySettings
+from packs.secrets import pack as secrets_pack, SecretsSettings
+from packs.memory_gateway import pack as memory_gateway_pack, MemoryGatewaySettings
+from packs.agent_profile import pack as agent_profile_pack, AgentProfileSettings
+from packs.identity_auth import pack as identity_auth_pack, IdentitySettings
+from packs.communication import pack as communication_pack, CommunicationSettings
+from packs.chat import pack as chat_pack, ChatSettings
+from packs.research import pack as research_pack, ResearchSettings
+from packs.codebase import pack as codebase_pack, CodebaseSettings
+
+from . import pack as lab_pack
+from .settings import LabSettings
+from .tools import create_branch_fn, create_mission_fn, register_web_fetch
+
+MISSION_TITLE = "Grow activegraph.ai's evidence base"
+MISSION_STATEMENT = (
+    "Crawl activegraph.ai, infer what the project claims, find the gaps "
+    "between claims and linked evidence, propose branches that close them, "
+    "and gate everything that publishes or self-modifies."
+)
+MISSION_URL = "https://activegraph.ai"
+SEED_BRANCH_TITLE = "read_the_website"
+SEED_BRANCH_INTENT = (
+    "Read activegraph.ai end to end and turn every unevidenced claim into "
+    "a proposed branch with the gap recorded as evidence."
+)
+
+LAB_BUNDLE = [
+    core_pack,
+    tool_gateway_pack,
+    secrets_pack,
+    memory_gateway_pack,
+    agent_profile_pack,
+    identity_auth_pack,
+    communication_pack,
+    chat_pack,
+    research_pack,
+    codebase_pack,
+    lab_pack,
+]
+
+
+def build_lab(
+    *,
+    llm_provider: Any = None,
+    lab_settings: Optional[LabSettings] = None,
+    memory_backend_url: str = ":memory:",
+    persist_to: Optional[str] = None,
+    create_mission: bool = True,
+    fetch_handler: Any = None,
+    graph: Optional[Graph] = None,
+) -> Runtime:
+    """Create a Runtime with the full lab bundle loaded and branch zero seeded.
+
+    Args:
+        llm_provider: provider for the lab's and chat's llm_behaviors
+            (lab_pack.llm.select_lab_provider() picks one from the env).
+        lab_settings: override LabSettings.
+        memory_backend_url: memory_gateway backend (file path for durability).
+        persist_to: SQLite event-log path for Runtime persistence.
+        create_mission: seed the activegraph.ai mission + read_the_website
+            branch (skip when resuming from a persisted log).
+        fetch_handler: web fetch override (fixtures/canned pages); default is
+            the live urllib fetcher.
+        graph: pre-built Graph (defaults to a fresh one).
+    """
+    kwargs: dict[str, Any] = {}
+    if llm_provider is not None:
+        kwargs["llm_provider"] = llm_provider
+    if persist_to is not None:
+        kwargs["persist_to"] = persist_to
+
+    rt = Runtime(graph or Graph(), **kwargs)
+    load_lab_packs(rt, lab_settings=lab_settings, memory_backend_url=memory_backend_url)
+    register_web_fetch(fetch_handler)
+
+    if create_mission:
+        mission = create_mission_fn(
+            rt.graph, MISSION_TITLE, MISSION_STATEMENT, MISSION_URL
+        )
+        create_branch_fn(
+            rt.graph, mission.id, SEED_BRANCH_TITLE, SEED_BRANCH_INTENT,
+            status="active", authority="gated",
+        )
+    return rt
+
+
+def load_lab_packs(
+    rt: Runtime,
+    *,
+    lab_settings: Optional[LabSettings] = None,
+    memory_backend_url: str = ":memory:",
+) -> None:
+    """Load the bundle's packs onto an existing Runtime (also used on resume —
+    Runtime.load replays state without behaviors, so packs re-register here)."""
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(tool_gateway_pack, settings=ToolGatewaySettings())
+    rt.load_pack(secrets_pack, settings=SecretsSettings())
+    rt.load_pack(memory_gateway_pack, settings=MemoryGatewaySettings(backend_url=memory_backend_url))
+    rt.load_pack(agent_profile_pack, settings=AgentProfileSettings())
+    rt.load_pack(identity_auth_pack, settings=IdentitySettings())
+    rt.load_pack(communication_pack, settings=CommunicationSettings())
+    rt.load_pack(chat_pack, settings=ChatSettings(memory_backend_url=memory_backend_url))
+    rt.load_pack(research_pack, settings=ResearchSettings())
+    rt.load_pack(codebase_pack, settings=CodebaseSettings())
+    rt.load_pack(lab_pack, settings=lab_settings or LabSettings())
+
+
+if __name__ == "__main__":
+    rt = build_lab(create_mission=False)
+    print(f"Loaded {len(LAB_BUNDLE)} packs:")
+    for p in LAB_BUNDLE:
+        print(f"  - {p.name} v{p.version}")
