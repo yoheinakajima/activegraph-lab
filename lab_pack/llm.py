@@ -165,7 +165,7 @@ class LabMockProvider:
                 title=f"Lab note: {finding[:60].rstrip('. ')}",
                 slug=f"lab-note-{digest}",
                 body_markdown=(
-                    f"## What I tried\n\nI followed the mission's loop on this finding: "
+                    f"## What we tried\n\nI followed the mission's loop on this finding: "
                     f"{finding[:200]}{cites}\n\n"
                     f"## What happened\n\nThe runtime recorded the outcome as graph "
                     f"objects, linked below as footnotes.{cites}\n\n"
@@ -377,10 +377,25 @@ class LabProviderWrapper:
         try:
             resp = self._inner.complete(**kwargs)
         except Exception as exc:
+            # Native providers RAISE on schema-parse failures (the raw model
+            # text rides on payload_extras) — salvage from there before
+            # falling back to an inert output.
+            raw = (getattr(exc, "payload_extras", None) or {}).get("raw_text")
+            if raw and schema is not None:
+                salvaged = _salvage_parse(raw, schema)
+                if salvaged is not None:
+                    return LLMResponse(
+                        raw_text=raw, parsed=salvaged,
+                        input_tokens=0, output_tokens=0, cost_usd=Decimal("0"),
+                        latency_seconds=0.0,
+                        model=kwargs.get("model") or self.default_model,
+                        finish_reason="stop",
+                    )
             _LLM_STATE["anomalies"].append({
                 "kind": "parse", "behavior": behavior,
-                "detail": f"provider call failed: {type(exc).__name__}: {exc}",
-                "raw": None})
+                "detail": f"provider call failed: {type(exc).__name__}: "
+                          f"{str(exc).splitlines()[0][:200]}",
+                "raw": raw})
             return _canned(f"provider error: {type(exc).__name__}")
 
         if schema is not None and resp.parsed is None:

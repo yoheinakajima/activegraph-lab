@@ -42,7 +42,7 @@ expected_outputs:
     body_requirements:
       footnotes: true          # every draft cites evidence ids as footnotes
       provenance_block: true   # branch, evidence, event horizon, model
-      sections: ["What I tried", "What happened", "What it means", "What's next"]
+      sections: ["What we tried", "What happened", "What it means", "What's next"]
   publish_decisions:
     count: 2
   mirror_files:
