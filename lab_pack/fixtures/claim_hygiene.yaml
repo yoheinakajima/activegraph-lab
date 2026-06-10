@@ -1,0 +1,53 @@
+description: |
+  Claim extraction hygiene (Phase 2): the polluted real examples from the
+  live log — a raw fetch JSON envelope recorded as a "claim", nav link rows,
+  SVG path data — must produce ZERO site_claim observations, silently (the
+  cleanup is not an observation). A real prose page must still produce clean
+  claims, with HTML entities decoded and no markup or JSON fragments.
+
+mission:
+  title: Claim hygiene mission
+  statement: Crawl canned pages; only prose may become claims.
+  target_url: https://activegraph.ai
+
+settings:
+  crawl_max_depth: 0          # pollution pages are crawl-requested explicitly
+  crawl_page_cap: 10
+  max_claims_per_page: 5
+  max_open_branches: 8
+
+pages:
+  # The prose page: two real claims, one with an HTML entity to decode.
+  https://activegraph.ai: |
+    <html><body>
+    <nav><a href="/envelope">More</a> <a href="/chrome">Chrome</a></nav>
+    <p>ActiveGraph is an event-sourced agent runtime &amp; every mutation is
+    appended to an event log before it changes graph state.</p>
+    <p>Replay rebuilds the graph deterministically, so any agent decision can
+    be audited after the fact.</p>
+    </body></html>
+  # The live-log pollution, case 1: a truncated fetch envelope stored as page
+  # content — exactly the '{"url": "https://activegraph.ai", "status": 200…'
+  # shape that appeared as a claim. Not valid JSON (truncated), full of cue
+  # words and digits, and must yield nothing.
+  https://activegraph.ai/envelope: '{"url": "https://activegraph.ai", "status": 200, "content": "<html><head><meta charset=\"utf-8\"><title>ActiveGraph — event graphs, replay, audit</title></head><body><nav>'
+  # The live-log pollution, case 2: chrome only — nav link row, SVG path data
+  # (digits + periods, the old any-digit clause's favorite), cue-word footer.
+  https://activegraph.ai/chrome: |
+    <html><body>
+    <nav><a href="/">Home</a> <a href="/docs">Docs</a> <a href="/blog">Blog</a>
+    <a href="https://github.com/yoheinakajima/activegraph">GitHub</a></nav>
+    <svg viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+    <path d="M10 20 L30 40 C50 60, 70 80, 90 100 Z. M5 5 L115 115. Q12 14 16 18."/>
+    </svg>
+    <footer>&copy; 2026 ActiveGraph. Built on replay, audit, and event graphs
+    for every deterministic agent behavior pack. All rights reserved.</footer>
+    </body></html>
+
+expected_outputs:
+  prose_claims:
+    min_count: 2
+  polluted_claims:
+    count: 0
+  cleanup_observations:        # rejected candidates are dropped SILENTLY
+    count: 0

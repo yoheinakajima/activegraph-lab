@@ -32,6 +32,7 @@ from lab_pack.tools import (
     create_branch_fn,
     create_mission_fn,
     register_web_fetch,
+    request_crawl_fn,
     send_branch_message_fn,
 )
 
@@ -126,6 +127,68 @@ def run_bootstrap() -> bool:
     if exp.get("crawl_progress_on_mission"):
         c.that(bool(crawl.get("fetched")), "mission.metadata.crawl progress missing")
     return c.done("bootstrap")
+
+
+def run_claim_hygiene() -> bool:
+    spec = _load("claim_hygiene.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: claim_hygiene — pollution yields zero claims, prose yields clean ones")
+    print("=" * 64)
+
+    pages = spec["pages"]
+
+    def canned_fetch(url: str, **_kw) -> dict:
+        clean = url.rstrip("/")
+        for key, html in pages.items():
+            if key.rstrip("/") == clean:
+                return {"url": url, "status": 200, "content": html}
+        return {"url": url, "status": 404, "content": ""}
+
+    rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+    register_web_fetch(canned_fetch, overwrite=True)
+    g = rt.graph
+
+    m = spec["mission"]
+    mission = create_mission_fn(g, m["title"], m.get("statement", ""), m["target_url"])
+    rt.run_until_idle()
+    obs_before_pollution = len(g.objects(type="observation"))
+    request_crawl_fn(g, mission.id, "https://activegraph.ai/envelope")
+    request_crawl_fn(g, mission.id, "https://activegraph.ai/chrome")
+    rt.run_until_idle()
+
+    claims = _lab_obs(g, "site_claim")
+    by_url: dict[str, list[str]] = {}
+    for o in claims:
+        by_url.setdefault((o.data.get("metadata") or {}).get("url", "?"), []) \
+              .append(o.data.get("text") or "")
+    prose = by_url.get("https://activegraph.ai", [])
+    polluted = (by_url.get("https://activegraph.ai/envelope", [])
+                + by_url.get("https://activegraph.ai/chrome", []))
+    for u, texts in sorted(by_url.items()):
+        print(f"  {u}: {len(texts)} claim(s)")
+        for t in texts:
+            print(f"    “{t[:88]}”")
+
+    exp = spec["expected_outputs"]
+    c = Check()
+    c.that(len(prose) >= exp["prose_claims"]["min_count"],
+           f"expected >= {exp['prose_claims']['min_count']} prose claims, got {len(prose)}")
+    c.that(len(polluted) == exp["polluted_claims"]["count"],
+           f"envelope JSON + nav/SVG chrome must yield zero claims, got {len(polluted)}: "
+           f"{[t[:60] for t in polluted]}")
+    bad = [t for t in prose
+           if any(ch in t for ch in "<>{}") or t.lstrip().startswith(('{"', "{'"))]
+    c.that(not bad, f"clean claims contain markup/JSON fragments: {bad}")
+    c.that(any("&" in t and "&amp;" not in t for t in prose),
+           "HTML entities decoded in extracted claims (&amp; → &)")
+    # 2b: rejected candidates are dropped silently — the only observations the
+    # pollution pages may add are their site_claims (zero) — no cleanup noise.
+    new_obs = [o for o in g.objects(type="observation")[obs_before_pollution:]
+               if (o.data.get("metadata") or {}).get("lab")]
+    c.that(len(new_obs) == exp["cleanup_observations"]["count"],
+           f"rejected candidates must not become observations, got "
+           f"{[(o.data.get('metadata') or {}).get('lab') for o in new_obs]}")
+    return c.done("claim_hygiene")
 
 
 def run_branch_lifecycle() -> bool:
@@ -979,6 +1042,7 @@ def run_compat_regression() -> bool:
 def run_all() -> None:
     results = [
         run_bootstrap(),
+        run_claim_hygiene(),
         run_branch_lifecycle(),
         run_thread_equals_branch(),
         run_capability_gap(),
