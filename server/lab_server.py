@@ -84,6 +84,24 @@ def _check_mcp_bearer(headers) -> tuple[int, str]:
                         "mcp disabled: LAB_MCP_TOKEN is not set on the server")
 
 
+def _check_mcp_auth(headers, path: str) -> tuple[int, str]:
+    """/mcp authorizes via the bearer header; /mcp/<token> accepts the same
+    credential as a path segment with identical authority (ADR-016 amendment:
+    claude.ai's custom-connector UI cannot send a static header). The URL is
+    a credential: the supplied segment is never echoed, logged, or stored —
+    access logging is disabled (Handler.log_message) and error bodies carry
+    only a fixed message. Rotation = rotate LAB_MCP_TOKEN."""
+    if path == "/mcp":
+        return _check_mcp_bearer(headers)
+    token = _mcp_token()
+    if not token:
+        return 403, "mcp disabled: LAB_MCP_TOKEN is not set on the server"
+    supplied = path[len("/mcp/"):].strip("/")
+    if not supplied or not hmac.compare_digest(supplied, token):
+        return 401, "invalid token"
+    return 0, ""
+
+
 def _rate_limited() -> bool:
     import time
     now = time.monotonic()
@@ -883,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"frames": [], "total": 0})
             elif path in ("/health", "/healthz"):
                 self._handle_healthz()
-            elif path == "/mcp":
+            elif path == "/mcp" or path.startswith("/mcp/"):
                 # Streamable HTTP without an SSE channel: GET is declined,
                 # which the MCP spec permits (server-initiated messages are
                 # simply unavailable). Clients POST JSON-RPC instead.
@@ -904,12 +922,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
-        if path == "/mcp":
+        if path == "/mcp" or path.startswith("/mcp/"):
             # ADR-016: MCP authorizes with LAB_MCP_TOKEN only — the operator
             # token is refused here, and LAB_MCP_TOKEN is refused everywhere
-            # else (strict two-way separation). Parse errors are the MCP
+            # else (strict two-way separation). /mcp/<token> presents the same
+            # credential in the path (amendment). Parse errors are the MCP
             # module's to render as JSON-RPC errors, so auth runs on raw bytes.
-            status, msg = _check_mcp_bearer(self.headers)
+            status, msg = _check_mcp_auth(self.headers, path)
             if status:
                 if status == 401:
                     self.send_response(401)

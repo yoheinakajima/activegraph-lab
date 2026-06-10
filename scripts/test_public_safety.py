@@ -136,6 +136,48 @@ def _run() -> int:
                                       "message": "audit: anything secret in here?"})):
         mcp_outputs.append(mcp_call("tools/call", {"name": name, "arguments": args}))
 
+    # ── URL-token path (ADR-016 amendment): the token rides in the URL, so
+    # the HTTP surface around it joins the audit — responses, the wrong-token
+    # error path, and everything the server prints while handling them.
+    import urllib.error
+    import urllib.request
+    from http.server import HTTPServer
+    from server import lab_server
+
+    http_log = io.StringIO()
+    lab_server._rt = rt
+    lab_server._llm_info = {"mode": "mock", "provider": "mock", "model": None}
+    httpd = HTTPServer(("127.0.0.1", 0), lab_server.Handler)
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url_outputs = []
+    try:
+        with contextlib.redirect_stdout(http_log), contextlib.redirect_stderr(http_log):
+            for body in (
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18"}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "send_chat",
+                            "arguments": {"branch_id": str(branch.id),
+                                          "message": "url-token audit ping"}}},
+            ):
+                req = urllib.request.Request(
+                    f"{base}/mcp/{os.environ['LAB_MCP_TOKEN']}", method="POST",
+                    data=json.dumps(body).encode())
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    url_outputs.append(json.loads(r.read()))
+            req = urllib.request.Request(f"{base}/mcp/wrong-token-zz", method="POST",
+                                         data=b"{}")
+            try:
+                urllib.request.urlopen(req, timeout=10)
+            except urllib.error.HTTPError as e:
+                url_outputs.append({"status": e.code,
+                                    "body": (e.read() or b"").decode()})
+    finally:
+        httpd.shutdown()
+        lab_server._rt = None
+        lab_server._mutation_times.clear()
+
     # ── the corpus: every event payload, every object, feed JSON, boot log ──
     corpus = {
         "events": [{"type": str(e.type), "actor": str(e.actor),
@@ -144,6 +186,8 @@ def _run() -> int:
                     for o in g.all_objects()],
         "feed": _feed(rt),
         "mcp": mcp_outputs,
+        "mcp_url_path": url_outputs,
+        "http_log": http_log.getvalue(),
         "boot_log": boot_log.getvalue(),
     }
     blob = json.dumps(corpus, default=str)
@@ -154,6 +198,10 @@ def _run() -> int:
     chat_out = (mcp_outputs[-1].get("result") or {})
     check(not chat_out.get("isError", True),
           "MCP send_chat path exercised (reply produced, joins the corpus)")
+    check(len(url_outputs) == 3
+          and (url_outputs[0].get("result") or {}).get("protocolVersion")
+          and url_outputs[-1].get("status") == 401,
+          "URL-token path exercised over HTTP (initialize, send_chat, wrong-token 401)")
     for name, sentinel in SENTINELS.items():
         check(sentinel not in blob, f"{name} sentinel absent from the public corpus")
     # DATABASE_URL fragments count too (host, user, password)

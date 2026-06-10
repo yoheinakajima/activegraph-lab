@@ -32,7 +32,7 @@ needed in this environment anymore.
 | `/lab` | the open-workshop notebook (everything, live) |
 | `/healthz` | backend, events, paused, calls/cost vs caps |
 | `POST /lab/pause` / `POST /lab/resume` | operator token; global pause (ADR-015) |
-| `POST /mcp` | MCP server, streamable HTTP (ADR-016); `LAB_MCP_TOKEN` bearer; read tools + `send_chat`, never decisions or pause |
+| `POST /mcp` (or `/mcp/<LAB_MCP_TOKEN>` for clients that can't send headers, e.g. claude.ai connectors — the URL is then a credential) | MCP server, streamable HTTP (ADR-016); `LAB_MCP_TOKEN` bearer; read tools + `send_chat`, never decisions or pause |
 
 ## Run
 
