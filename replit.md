@@ -18,6 +18,10 @@ If uv is missing, first run: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 Do not "fix" a failed deploy by re-running the Replit installer — it
 rediscovers the segfault every time.
 
+Stock uv install works as of 0d35d34 — the activegraph-packs git pin is
+committed in `[tool.uv.sources]`, so no local pyproject patching is
+needed in this environment anymore.
+
 ## Surface map
 
 | Route | What |
@@ -28,6 +32,7 @@ rediscovers the segfault every time.
 | `/lab` | the open-workshop notebook (everything, live) |
 | `/healthz` | backend, events, paused, calls/cost vs caps |
 | `POST /lab/pause` / `POST /lab/resume` | operator token; global pause (ADR-015) |
+| `POST /mcp` | MCP server, streamable HTTP (ADR-016); `LAB_MCP_TOKEN` bearer; read tools + `send_chat`, never decisions or pause |
 
 ## Run
 
@@ -42,6 +47,7 @@ boot log).
 |---|---|
 | `ANTHROPIC_API_KEY` | live LLM behaviors (absent → deterministic mock mode) |
 | `LAB_OPERATOR_TOKEN` | bearer token for mutations; unset → read-only mode |
+| `LAB_MCP_TOKEN` | bearer token for `/mcp` (ADR-016) — a separate secret, revocable independently; permits MCP reads + `send_chat` but NEVER decisions or pause, and the operator token never opens `/mcp`; unset → MCP disabled |
 | `LAB_ENV` | `prod` (disables /reset; set by .replit) |
 | `DATABASE_URL` | added automatically by the Replit Postgres integration |
 
