@@ -275,6 +275,47 @@ def main() -> int:
         check(s == 200 and feed.get("entries"),
               "read tools are not rate limited")
 
+        print("== URL-token path (claude.ai connectors, ADR-016 amendment) ==")
+        def rpc_url(path_token: str, method: str, params: dict | None = None):
+            _RPC_ID[0] += 1
+            return http(base, f"/mcp/{path_token}", "POST",
+                        {"jsonrpc": "2.0", "id": _RPC_ID[0], "method": method,
+                         "params": params or {}}, token=None)
+
+        s, b = rpc_url(MCP_TOKEN, "initialize",
+                       {"protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": {"name": "test-url", "version": "0"}})
+        check(s == 200
+              and (b.get("result") or {}).get("protocolVersion") == "2025-06-18",
+              "initialize via /mcp/<token>, no header → 200 round-trip")
+        s, b = rpc_url(MCP_TOKEN, "tools/call",
+                       {"name": "get_status", "arguments": {}})
+        text = ((b.get("result") or {}).get("content") or [{}])[0].get("text", "{}")
+        check(s == 200 and json.loads(text).get("event_count", 0) > 0,
+              "read tool via URL token works")
+        s, b = rpc_url(MCP_TOKEN, "tools/call",
+                       {"name": "send_chat",
+                        "arguments": {"branch_id": seed_branch.id,
+                                      "message": "url-token check-in"}})
+        result = b.get("result") or {}
+        check(s == 200 and not result.get("isError"),
+              "send_chat via URL token — identical authority to the header path")
+        s, b = rpc_url("not-the-token", "initialize")
+        check(s == 401, f"wrong token in path → 401 ({s})")
+        check(MCP_TOKEN not in json.dumps(b) and "not-the-token" not in json.dumps(b),
+              "401 body never echoes any token")
+        os.environ.pop("LAB_MCP_TOKEN", None)
+        s, _ = rpc_url(MCP_TOKEN, "initialize")
+        check(s == 403, f"LAB_MCP_TOKEN unset → /mcp/<token> → 403 ({s})")
+        os.environ["LAB_MCP_TOKEN"] = MCP_TOKEN
+        s, _ = http(base, f"/lab/decision/{MCP_TOKEN}", "POST",
+                    {"decision_id": pub.id, "approved": True})
+        check(s == 404, f"URL token refused on /lab/decision (no such route, {s})")
+        s, _ = http(base, f"/lab/pause/{MCP_TOKEN}", "POST", {})
+        check(s == 404, f"URL token refused on /lab/pause (no such route, {s})")
+        s, _ = http(base, f"/mcp/{MCP_TOKEN}", "GET")
+        check(s == 405, f"GET /mcp/<token> → 405 like GET /mcp ({s})")
+
         print("== protocol edges ==")
         s, b = rpc(base, "no/such/method")
         check(s == 200 and (b.get("error") or {}).get("code") == -32601,
