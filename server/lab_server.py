@@ -572,6 +572,12 @@ def _feed(rt, limit: int = 100) -> dict:
     }
 
 
+def _status_line() -> str:
+    """Small status line for the blog footer (6c): live|paused · $today/$cap.
+    Filled in by Phase 6; empty when state is unavailable."""
+    return ""
+
+
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
 
 _UI_DIR = _REPO / "ui"
@@ -620,11 +626,50 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def _send_html(self, body: str, status: int = 200):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = urlparse(self.path).path
         qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
         try:
+            # ── the public blog (ADR-013): / is the front door ──────────────
             if path == "/":
+                from server import blog
+                rt = _get_rt()
+                with _lock:
+                    page = blog.index_page(rt.graph, status_line=_status_line())
+                self._send_html(page)
+            elif path.startswith("/posts/"):
+                from server import blog
+                rt = _get_rt()
+                slug = path[len("/posts/"):].strip("/")
+                with _lock:
+                    page = blog.post_page(rt.graph, slug, status_line=_status_line())
+                if page is None:
+                    self._send_html("<h1>404</h1><p>No such post.</p>", 404)
+                else:
+                    self._send_html(page)
+            elif path == "/feed.xml":
+                from server import blog
+                rt = _get_rt()
+                proto = self.headers.get("X-Forwarded-Proto", "http")
+                host = self.headers.get("Host", "localhost")
+                with _lock:
+                    body = blog.rss(rt.graph, f"{proto}://{host}").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            # ── the open workshop: the notebook UI lives at /lab ────────────
+            elif path in ("/lab", "/lab/"):
                 self._send_static("index.html")
             elif path in ("/app.js", "/style.css"):
                 self._send_static(path)

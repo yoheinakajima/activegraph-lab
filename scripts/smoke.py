@@ -207,6 +207,39 @@ def main() -> int:
         check(all((e.get("sentence") or "").strip() for e in all_entries),
               "no feed entry renders blank")
 
+        print("== blog SSR (ADR-013) ==")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as r:
+            home = r.read().decode()
+        check("Nothing is published yet" in home and "/lab" in home,
+              "pre-publish empty state explains the site and links to /lab")
+        from lab_pack.tools import approve_decision_fn
+        approve_decision_fn(g, pub_pending[0].id, True, "smoke: publish one post")
+        rt.run_until_idle()
+        published = [a for a in g.objects(type="artifact")
+                     if a.data.get("kind") == "blog_draft"
+                     and a.data.get("status") == "published"]
+        check(len(published) == 1, "approved publish decision published the artifact")
+        slug = (published[0].data.get("metadata") or {}).get("slug")
+        check(bool((published[0].data.get("metadata") or {}).get("published_at")),
+              "published artifact carries published_at")
+        check(any(str(e.type) == "artifact.published" for e in g.events),
+              "artifact.published event in the log")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as r:
+            home = r.read().decode()
+        check(f"/posts/{slug}" in home, "blog index lists the published post")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/posts/{slug}", timeout=10) as r:
+            post = r.read().decode()
+        check("Show the work" in post and "Evidence" in post,
+              "post page renders the provenance subgraph (Show the work)")
+        check("#branch=" in post, "post provenance links into the /lab thread view")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/feed.xml", timeout=10) as r:
+            feed_xml = r.read().decode()
+        check(f"/posts/{slug}" in feed_xml and "<rss" in feed_xml,
+              "RSS at /feed.xml lists the published post")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/lab", timeout=10) as r:
+            lab_html = r.read().decode()
+        check("app.js" in lab_html, "the notebook UI is served at /lab")
+
         # 2d: tokenless read succeeds (above); tokenless mutation must fail.
         import os as _os
         import urllib.error as _ue
