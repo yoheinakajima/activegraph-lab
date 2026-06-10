@@ -94,11 +94,55 @@ def build_lab(
         mission = create_mission_fn(
             rt.graph, MISSION_TITLE, MISSION_STATEMENT, MISSION_URL
         )
-        create_branch_fn(
+        seed = create_branch_fn(
             rt.graph, mission.id, SEED_BRANCH_TITLE, SEED_BRANCH_INTENT,
             status="active", authority="gated",
         )
+        _seed_upstream_friction(rt.graph, mission.id, seed.id)
     return rt
+
+
+def _seed_upstream_friction(graph, mission_id: str, branch_id: str) -> None:
+    """ADR-005: friction consuming activegraph-packs is evidence. Recorded as
+    an observation under the mission and a draft upstream-issue artifact —
+    never as a direct edit to the packs repo. The artifact stays draft:
+    publishing it is gated like everything else."""
+    obs = graph.add_object("observation", {
+        "text": (
+            "Upstream friction: the packs repo is split on add_relation argument "
+            "order — core/research/tool_gateway call it type-first while chat "
+            "follows the real (source, target, type) signature, so a composed "
+            "graph holds both encodings and view traversal only follows the "
+            "signature-order ones. The lab writes signature-order and decodes "
+            "both ('#' discriminator) in its feed."
+        ),
+        "confidence": 0.95,
+        "category": "risk",
+        "metadata": {"lab": "upstream_friction", "mission_id": mission_id,
+                     "subject": "activegraph-packs"},
+    })
+    graph.add_relation(branch_id, obs.id, "supported_by")
+    artifact = graph.add_object("artifact", {
+        "kind": "issue_draft",
+        "title": "activegraph-packs: unify add_relation call convention",
+        "content": (
+            "Proposed upstream issue (draft — publishing is gated):\n\n"
+            "Packs disagree on add_relation argument order. core, research and "
+            "tool_gateway pass the relation type first; chat passes (source, "
+            "target, type) per the Graph.add_relation signature. Relations "
+            "written type-first are invisible to view traversal and "
+            "get_relations, and the Inspector's serializer assumes the "
+            "type-first encoding, so mixed graphs decode inconsistently. "
+            "Suggest standardizing on the signature order and updating the "
+            "Inspector decode.\n\n"
+            "Evidence: " + obs.id
+        ),
+        "format": "markdown",
+        "status": "draft",
+        "observation_ids": [obs.id],
+        "metadata": {"lab": "upstream_issue", "repo": "activegraph-packs"},
+    })
+    graph.add_relation(branch_id, artifact.id, "produced")
 
 
 def load_lab_packs(
