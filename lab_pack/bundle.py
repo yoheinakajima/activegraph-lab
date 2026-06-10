@@ -199,6 +199,19 @@ def _seed_findings(graph, mission_id: str, branch_id: str, *,
             "that behaves like a designed safety feature.",
             [],
         ),
+        (
+            "Finding: the restricted BehaviorGraph exposes no relation "
+            "iteration, so the lab's old 'decided branch with >=2 evidence "
+            "emits a finding' path could NEVER fire from inside the gate "
+            "behavior — _branch_evidence_ids swallowed the AttributeError "
+            "and returned an empty list, silently. Only seeded findings ever "
+            "drove drafting. Discovered while wiring the ADR-014 research "
+            "threshold, which made the dead path load-bearing; fixed with a "
+            "registry fed by relation.created events and rebuilt from the "
+            "graph on resume. A try/except around a capability probe turned "
+            "a missing API into invisible policy.",
+            [],
+        ),
     ]
     for text, extra_refs in findings:
         f = graph.add_object("observation", {

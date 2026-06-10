@@ -22,6 +22,10 @@ The single lab pack per ADR-003/004: three object types, six behaviors (ingest, 
 
 Branch zero runs against https://activegraph.ai with a real LLM provider and real fetches through tool_gateway, producing a gap list as observation objects that replays cleanly from the log.
 
+## Milestone 5: public surface, editorial policy, operator controls — done
+
+ADR-013..015: the blog at `/` (SSR from the graph, provenance on every post, RSS), the open workshop at `/lab`, the digest/research editorial discipline with seam-tunable thresholds, the global pause and the daily cost ceiling rebuilt from the log.
+
 ## Deferred
 
 - Tool synthesis
@@ -29,6 +33,5 @@ Branch zero runs against https://activegraph.ai with a real LLM provider and rea
 - Memory compilation
 - Branch scoring
 - Multi-worker scheduling
-- Public site
 - Upstream the lab pack or its conventions to activegraph-packs if it proves general
 - Consume packs from PyPI once published

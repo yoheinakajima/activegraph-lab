@@ -2,6 +2,10 @@
 
 The UI is a projection of the event log — no state of its own (CONTRACT.md). Built fresh in `ui/`; the upstream Inspector is the separate debugging view (point it at the lab runtime — see README).
 
+## Two surfaces (ADR-013)
+
+The blog is the front door: `/` lists published posts (server-rendered from graph artifacts, never the drafts/ mirror), `/posts/<slug>` renders one post plus its "Show the work" provenance subgraph, `/feed.xml` is RSS. The notebook is the open workshop at `/lab`: ALL branches (open expanded; proposed/decided/archived collapsed), the inbox with resolved decisions in a collapsed history, a filter row (branch status, event kind, decision kind), and `#branch=<id>` deep links that post provenance points into. Published drafts in the feed cross-link their `/posts/<slug>` page. Both surfaces show the operator status line (`live|paused · $today/$cap`); the pause toggle renders in operator mode only (ADR-015).
+
 ## Thread = branch
 
 One relation, not a new layer (ADR-004): a communication-pack `comm_thread` `discusses` a lab `branch`. Chatting in a thread is chatting inside the branch; the lab's `answer` behavior replies from graph state.

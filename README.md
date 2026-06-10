@@ -7,14 +7,33 @@ Built as a layered pack on [activegraph-packs](https://github.com/yoheinakajima/
 ## Layout
 
 ```
-lab_pack/    the lab as one pack: mission/branch/decision + six behaviors
+lab_pack/    the lab as one pack: mission/branch/decision + eight behaviors
   bundle.py  build_lab() — composes upstream packs + lab_pack, seeds branch zero
   fixtures/  deterministic scenarios, no API key, no network
-server/      thin HTTP server: /lab/feed /chat /lab/decision /graph /trace /reset
-ui/          the notebook feed (vanilla JS, served by the server at /)
+server/      thin HTTP server + the public blog (server/blog.py, SSR)
+ui/          the notebook feed (vanilla JS, served by the server at /lab)
 docs/        CONTRACT, ARCHITECTURE, INTERFACE, DECISIONS, ROADMAP
 data/        SQLite event log + memory store (created at first run)
 ```
+
+## Surface map (ADR-013)
+
+| Route | What |
+|---|---|
+| `/` | the public blog — published posts, server-rendered from the graph, newest first |
+| `/posts/<slug>` | one post + "Show the work": branch, evidence, chat, the publish decision, prior drafts |
+| `/feed.xml` | RSS 2.0, published posts only |
+| `/lab` | the open workshop: every branch (incl. proposed/decided/archived), every chat, every decision, filter row, deep links via `#branch=<id>` |
+| `/healthz` | backend, event count, pending decisions, paused, LLM calls/cost vs caps |
+
+## Operator controls (ADR-015)
+
+All mutations need `Authorization: Bearer $LAB_OPERATOR_TOKEN`.
+
+- `POST /lab/pause` / `POST /lab/resume` — global pause, persisted as `lab.paused`/`lab.resumed` events and rebuilt from the log at boot. While paused every LLM behavior except `answer` idles (one behavior-skipped observation per behavior per episode); the operator can always talk to the lab.
+- Daily cost ceiling: `setting.daily_cost_cap_usd` (default $5.00, seam-eligible) over activegraph's native `cost_usd` accounting on `llm.responded` events — restart-proof, like the daily call cap.
+- Editorial policy thresholds (`digest_min_findings`, `research_min_evidence`, `max_drafts_pending`) are seam settings: tuning them is self-modification through the gate (ADR-014).
+- The UI shows `live|paused · $today/$cap` in the `/lab` header and the blog footer; the pause toggle appears in operator mode only.
 
 ## Quickstart (zsh, single lines)
 
@@ -36,10 +55,10 @@ Start the lab (mock LLM unless OPENAI_API_KEY / ANTHROPIC_API_KEY is set):
 python server/lab_server.py
 ```
 
-Open the notebook feed:
+Open the blog (front door) and the notebook (open workshop):
 
 ```sh
-open http://localhost:7799/
+open http://localhost:7799/ http://localhost:7799/lab
 ```
 
 Local-dev override for the packs dependency (instead of the pinned SHA):
