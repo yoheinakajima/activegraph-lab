@@ -6,7 +6,7 @@ License: Apache-2.0
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Requires-Dist: activegraph[llm]==1.0.5.post2
+Requires-Dist: activegraph[llm,postgres]==1.0.5.post2
 Requires-Dist: activegraph-packs @ git+https://github.com/yoheinakajima/activegraph-packs@da2bca777ef6dd7aa667595f550e8eea10f3dfb7
 Requires-Dist: pydantic>=2.0
 Requires-Dist: click>=8.1
@@ -16,3 +16,95 @@ Requires-Dist: pyyaml>=6.0
 Dynamic: license-file
 
 # activegraph-lab
+
+Self-hosted research agent built on [ActiveGraph](https://activegraph.ai) (event-sourced agent runtime). One agent, one mission: grow activegraph.ai's evidence base. One seed branch: `read_the_website`. The agent crawls the site, infers project claims, finds gaps, proposes branches, dispatches work, drafts artifacts, and requests approval before anything publishes or self-modifies. The UI is a notebook feed; each branch is a thread you can talk inside.
+
+Built as a layered pack on [activegraph-packs](https://github.com/yoheinakajima/activegraph-packs) (consumed as a pinned git dependency — ADR-005). Governing docs: start at [CLAUDE.md](CLAUDE.md) and [docs/CONTRACT.md](docs/CONTRACT.md).
+
+## Layout
+
+```
+lab_pack/    the lab as one pack: mission/branch/decision + six behaviors
+  bundle.py  build_lab() — composes upstream packs + lab_pack, seeds branch zero
+  fixtures/  deterministic scenarios, no API key, no network
+server/      thin HTTP server: /lab/feed /chat /lab/decision /graph /trace /reset
+ui/          the notebook feed (vanilla JS, served by the server at /)
+docs/        CONTRACT, ARCHITECTURE, INTERFACE, DECISIONS, ROADMAP
+data/        SQLite event log + memory store (created at first run)
+```
+
+## Quickstart (zsh, single lines)
+
+Install:
+
+```sh
+pip install -e .
+```
+
+Run the fixture suite (no API key, no network):
+
+```sh
+python lab_pack/fixtures/run_fixtures.py
+```
+
+Start the lab (mock LLM unless OPENAI_API_KEY / ANTHROPIC_API_KEY is set):
+
+```sh
+python server/lab_server.py
+```
+
+Open the notebook feed:
+
+```sh
+open http://localhost:7799/
+```
+
+Local-dev override for the packs dependency (instead of the pinned SHA):
+
+```sh
+pip install -e ../activegraph-packs
+```
+
+## Debugging view
+
+The upstream Inspector remains the debugging view — point it at the lab runtime (the lab serves the Inspector's `/graph`, `/trace`, `/summary`, `/packs` endpoints):
+
+```sh
+cd ../activegraph-packs && ACTIVEGRAPH_PORT=7799 pnpm dev
+```
+
+## Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `LAB_PORT` | `7799` | server port |
+| `ACTIVEGRAPH_DB` | `data/lab.sqlite` | event-log store (resumed on restart) |
+| `ACTIVEGRAPH_MEMORY_DB` | `data/lab_memory.sqlite` | memory_gateway backend |
+| `LAB_LLM_PROVIDER` | auto | `openai` / `anthropic` / `mock` |
+| `LAB_LLM_MODEL` | provider default | model override |
+
+## Deploy (Replit, single lines)
+
+- Push this repo to GitHub: `git push origin main`
+- Import to Replit: create a Repl from the GitHub repo (the `.replit` run command is checked in)
+- Add the Postgres integration (sets `DATABASE_URL` automatically)
+- Generate the operator token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+- Set Secrets: `ANTHROPIC_API_KEY`, `LAB_OPERATOR_TOKEN` (from above), `LAB_ENV=prod` — leave `LAB_ALLOW_GRAPH_CODE` unset (ADR-012)
+- Run. First boot seeds the mission (`mode=fresh`); redeploys resume (`mode=resumed`).
+
+Verification (replace `$URL` and `$TOK`):
+
+- Public read OK: `curl -s $URL/lab/feed | head -c 200`
+- Backend is Postgres: `curl -s $URL/healthz | grep -o '"backend": "[a-z]*"'`
+- Tokenless mutation refused: `curl -s -o /dev/null -w "%{http_code}\n" -X POST $URL/chat -d '{}'` → `401`
+- Tokened mutation OK: `curl -s -X POST $URL/chat -H "Authorization: Bearer $TOK" -d '{"branch_id":"branch#2","content":"hello"}' | head -c 200`
+- Restart the Repl, then: `curl -s $URL/healthz` → `event_count` ≥ before, boot log shows `mode=resumed`
+- Postgres round-trip (scratch DB): `DATABASE_URL=... python scripts/test_postgres.py`
+
+## Test suite (all keyless, all deterministic)
+
+- Fixtures: `python lab_pack/fixtures/run_fixtures.py`
+- Smoke (regression bar): `python scripts/smoke.py`
+- Auth: `python scripts/test_auth.py`
+- Public-safety sentinel audit: `python scripts/test_public_safety.py`
+- UI render (jsdom, static fallback): `python scripts/check_ui.py`

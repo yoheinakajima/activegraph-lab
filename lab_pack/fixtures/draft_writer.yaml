@@ -38,13 +38,13 @@ findings:
 
 expected_outputs:
   blog_draft_artifacts:
-    count: 2
+    count: 3                   # approve + reject + the slug-collision case
     body_requirements:
       footnotes: true          # every draft cites evidence ids as footnotes
       provenance_block: true   # branch, evidence, event horizon, model
       sections: ["What we tried", "What happened", "What it means", "What's next"]
   publish_decisions:
-    count: 2
+    count: 3
   mirror_files:
-    count: 2                   # rejected file stays on disk
+    count: 3                   # rejected file stays on disk
   no_unapproved_publish: true  # gate invariant: draft/pending until approved

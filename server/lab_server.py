@@ -128,6 +128,8 @@ def _rebuild_lab_registries(rt) -> None:
         if meta.get("lab") == "blog_draft":
             if meta.get("slug"):
                 lb._SLUGS.add(meta["slug"])
+                if a.data.get("status") == "published":
+                    lb._PUBLISHED_SLUGS.add(meta["slug"])
             if meta.get("finding_id"):
                 lb._DRAFTED_OBS.add(meta["finding_id"])
             if meta.get("lab_branch_id"):

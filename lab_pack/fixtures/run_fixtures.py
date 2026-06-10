@@ -342,8 +342,64 @@ def run_draft_writer() -> bool:
         if fspec.get("expect_rejected_header"):
             c.that(path.read_text().startswith("REJECTED"),
                    f"{fspec['key']}: rejected mirror lacks REJECTED header")
-        results[fspec["key"]] = {"artifact": artifact, "status": final, "slug": slug}
+        results[fspec["key"]] = {"artifact": artifact, "status": final, "slug": slug,
+                                 "decision": decision}
         print(f"  {fspec['key']}: draft → decision {fspec['resolution']} → {final} ({slug}.md)")
+
+    # ── Phase 1 (ADR-013): the publishing last mile ─────────────────────────
+    import lab_pack.behaviors as lb
+
+    def published_events_for(artifact_id):
+        return [e for e in g.events if str(e.type) == "artifact.published"
+                and e.payload.get("artifact_id") == artifact_id]
+
+    approved = results.get("approved_draft")
+    rejected = results.get("rejected_draft")
+    if approved:
+        a = g.get_object(approved["artifact"].id)
+        meta = a.data.get("metadata") or {}
+        first_published_at = meta.get("published_at")
+        c.that(bool(first_published_at),
+               "approved publish stamps metadata.published_at")
+        c.that(len(published_events_for(a.id)) == 1,
+               "approve emits exactly one artifact.published event")
+        # Re-approval idempotent: even if the gate's applied-decision dedup is
+        # lost (registry cleared = simulated restart), an already-published
+        # artifact keeps its timestamp and no second event is emitted.
+        lb._APPLIED_DECISIONS.discard(approved["decision"].id)
+        approve_decision_fn(g, approved["decision"].id, True, "fixture: re-approve")
+        rt.run_until_idle()
+        a = g.get_object(approved["artifact"].id)
+        c.that((a.data.get("metadata") or {}).get("published_at") == first_published_at
+               and len(published_events_for(a.id)) == 1,
+               "re-approval is idempotent (published_at kept, one event)")
+    if rejected:
+        c.that(not published_events_for(rejected["artifact"].id),
+               "reject emits no artifact.published event")
+
+    # Slug uniqueness at publish time (1b): a colliding published slug from a
+    # prior run gets a numeric suffix on this publish.
+    f3 = g.add_object("observation", {
+        "text": "Finding: slug collisions at publish time are suffixed, not fatal.",
+        "confidence": 0.9, "category": "fact",
+        "metadata": {"lab": "finding", "finding": True,
+                     "lab_branch_id": branch.id, "evidence_refs": []},
+    })
+    rt.run_until_idle()
+    a3 = next((x for x in g.objects(type="artifact")
+               if (x.data.get("metadata") or {}).get("finding_id") == f3.id), None)
+    c.that(a3 is not None, "collision case: draft created")
+    if a3 is not None:
+        draft_slug = (a3.data.get("metadata") or {}).get("slug")
+        lb._PUBLISHED_SLUGS.add(draft_slug)  # simulate an earlier published post
+        d3 = next(d for d in g.objects(type="decision")
+                  if d.data.get("subject_ref") == a3.id and d.data.get("status") == "pending")
+        approve_decision_fn(g, d3.id, True, "fixture: collision approve")
+        rt.run_until_idle()
+        got = (g.get_object(a3.id).data.get("metadata") or {}).get("slug")
+        c.that(got == f"{draft_slug}-2",
+               f"publish-time slug collision suffixed ({draft_slug} → {got})")
+        print(f"  slug_collision: {draft_slug} → {got}")
 
     exp = spec["expected_outputs"]
     drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]

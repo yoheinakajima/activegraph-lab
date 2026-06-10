@@ -87,6 +87,7 @@ _THREAD_TO_BRANCH: dict[str, str] = {}
 _DRAFTED_OBS: set[str] = set()
 _FINDING_EMITTED: set[str] = set()
 _SLUGS: set[str] = set()
+_PUBLISHED_SLUGS: set[str] = set()
 
 
 def clear_lab_registry() -> None:
@@ -106,6 +107,7 @@ def clear_lab_registry() -> None:
     _DRAFTED_OBS.clear()
     _FINDING_EMITTED.clear()
     _SLUGS.clear()
+    _PUBLISHED_SLUGS.clear()
     clear_seam_cache()
     # Seam hot-loads mutate live behavior descriptions; restore file defaults
     # so fixture runs are isolated from each other.
@@ -120,6 +122,28 @@ def clear_lab_registry() -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def emit_lab_event(graph, event_type: str, payload: dict) -> None:
+    """Append a lab marker event (artifact.published, lab.paused, lab.resumed —
+    ADR-013/015). Marker events carry no graph-state projection; the lab's own
+    projections read them back from the log. Works with both graph flavors:
+    BehaviorGraph.emit(type, payload) inside behaviors, Event construction on
+    a plain Graph (server paths)."""
+    emit = getattr(graph, "emit", None)
+    if emit is None:
+        return
+    try:
+        emit(event_type, dict(payload))
+        return
+    except TypeError:
+        pass  # plain Graph: emit(Event)
+    try:
+        from activegraph.core.event import Event
+        emit(Event(id=graph.ids.event(), type=event_type, payload=dict(payload),
+                   actor="lab", timestamp=graph.clock.now()))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- text helpers
@@ -722,6 +746,44 @@ def _mark_draft_rejected(graph, artifact_id: str, settings: LabSettings) -> None
         pass
 
 
+def _publish_artifact(graph, artifact_id: str, decision_id: str) -> None:
+    """The publishing last mile (Phase 1, ADR-013): an approved publish
+    decision patches the artifact to status=published with a published_at
+    stamp and appends an artifact.published marker event. Idempotent — an
+    already-published artifact keeps its original timestamp and slug, and no
+    second event is emitted. Slug uniqueness is enforced HERE, at publish
+    time: a collision with an already-published slug gets a numeric suffix
+    (registry-backed; rebuilt from the graph on resume)."""
+    artifact = graph.get_object(artifact_id)
+    if artifact is None:
+        return
+    meta = dict(artifact.data.get("metadata") or {})
+    if artifact.data.get("status") == "published":
+        if meta.get("slug"):
+            _PUBLISHED_SLUGS.add(meta["slug"])
+        return
+    slug = meta.get("slug") or "post"
+    base, n = slug, 2
+    while slug in _PUBLISHED_SLUGS:
+        slug = f"{base}-{n}"
+        n += 1
+    _PUBLISHED_SLUGS.add(slug)
+    published_at = _now()
+    meta["slug"] = slug
+    meta["published_at"] = published_at
+    try:
+        graph.patch_object(artifact_id, {"status": "published", "metadata": meta})
+    except Exception:
+        return
+    emit_lab_event(graph, "artifact.published", {
+        "artifact_id": artifact_id,
+        "slug": slug,
+        "title": artifact.data.get("title"),
+        "published_at": published_at,
+        "decision_id": decision_id,
+    })
+
+
 def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) -> None:
     if decision_id in _APPLIED_DECISIONS:
         return
@@ -748,10 +810,7 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
     elif kind == "publish" and subject:
         if status == "approved":
             _APPROVED_PUBLISH.add(subject)
-            try:
-                graph.patch_object(subject, {"status": "published"})
-            except Exception:
-                pass
+            _publish_artifact(graph, subject, decision_id)
         else:
             try:
                 graph.patch_object(subject, {"status": "rejected"})
