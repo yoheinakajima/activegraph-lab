@@ -1,0 +1,34 @@
+description: |
+  Thread = branch (ADR-004): a chat message posted into a thread that
+  discusses a branch gets an answer stamped with its event horizon; a second
+  message saying "pause this branch" gets both a reply AND the status
+  mutation — steering takes effect at event boundaries.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+branch:
+  title: Verify the replay claim
+  intent: Find evidence that replay rebuilds graph state deterministically.
+  status_after_create: active
+
+messages:
+  - content: What is this branch doing right now?
+    expect_reply: true
+    expect_stamp: true        # "— as of event N"
+  - content: please pause this branch
+    expect_reply: true
+    expect_stamp: true
+    expect_mutation:
+      status: scoped          # OPEN: no 'paused' enum value; pause = scoped + flag
+      paused_flag: true
+
+expected_outputs:
+  response_candidates:
+    count: 2
+  discusses_relation: true

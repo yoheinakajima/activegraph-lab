@@ -10,7 +10,7 @@ The lab is one layered pack (`lab_pack/`) on the activegraph-packs core pack, co
 
 Three lab types: `mission` (title, statement, target_url, status), `branch` (title, intent, status, parent_branch_id, fork_event_id, authority), `decision` (subject_ref, kind, status, rationale, evidence_refs). All other nouns are core types. Relations: mission `has_branch` branch, branch `forked_from` branch, branch `produced` artifact, branch `supported_by` observation/evaluation, branch `dispatched` task, thread `discusses` branch (only when communication is loaded).
 
-Relation call convention: this repo writes relations type-first — `graph.add_relation(<type>, <subject_id>, <object_id>)` — matching the core pack and the Inspector's decoding, NOT the `Graph.add_relation(source, target, type)` signature. The packs repo itself is split on this (chat uses the signature order); recorded as upstream friction per ADR-005.
+Relation call convention: this repo writes relations per the actual `Graph.add_relation(source_id, target_id, type)` signature (as the chat pack does), because runtime view traversal and relation queries match on the real source/target fields. The packs repo is split: core/research/tool_gateway write type-first, which the Inspector decodes by assuming inversion. A composed graph therefore contains both encodings; the lab's feed serializer discriminates per relation (object ids contain `#`, relation type names never do). Recorded as upstream friction per ADR-005.
 
 ## Behaviors
 

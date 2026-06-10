@@ -1,0 +1,25 @@
+description: |
+  Emergent dispatch with nobody home (ADR-006): a branch is activated, work
+  writes a routed core task, no loaded pack reacts within one event boundary,
+  and the lab records the capability gap as an observation — a gap is
+  evidence, not an error.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: true
+
+branch:
+  title: Run deep research on the replay claim
+  intent: Deep research task that no loaded pack can execute yet.
+
+expected_outputs:
+  tasks:
+    count: 1
+    final_status: blocked
+  capability_gap_observations:
+    count: 1
+    linked_to_branch: true
