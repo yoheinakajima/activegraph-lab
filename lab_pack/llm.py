@@ -232,29 +232,90 @@ _LLM_STATE: dict[str, Any] = {
     "budget_recorded": False,
     "daily_used": 0,          # authoritative via sync_daily_budget(rt)
     "daily_recorded": False,
+    "daily_cost": Decimal("0"),   # today's spend, from llm.responded events
+    "daily_cost_recorded": False,
+    "cost_cap_override": None,    # approved setting.daily_cost_cap_usd seam
+    "paused": False,              # ADR-015; rebuilt from lab.paused/resumed
+    "pause_skipped": set(),       # behaviors skipped THIS pause episode
     "last_model": None,
 }
 
 
 def sync_daily_budget(rt) -> int:
-    """7b: set the authoritative used-today count from llm.requested events in
-    the log (UTC date match). The log IS the persistence — restart-safe, and
-    the UTC reset falls out of only counting today's events."""
+    """7b + ADR-015: rebuild the operator-control state from the log — the
+    log IS the persistence, so all of this survives restarts.
+
+    - used-today count from llm.requested events (UTC date match; blocked
+      attempts are logged BEFORE the provider runs, so they count too)
+    - cost-today from the cost_usd activegraph stamps on llm.responded
+    - paused from the last lab.paused / lab.resumed marker event
+    - the seam-approved daily cost cap override, if any
+    """
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    used = sum(1 for e in rt.graph.events
-               if str(e.type) == "llm.requested"
-               and str(getattr(e, "timestamp", "") or "").startswith(today))
+    used = 0
+    cost = Decimal("0")
+    paused = _LLM_STATE["paused"]
+    saw_marker = False
+    for e in rt.graph.events:
+        t = str(e.type)
+        ts = str(getattr(e, "timestamp", "") or "")
+        if t == "llm.requested" and ts.startswith(today):
+            used += 1
+        elif t == "llm.responded" and ts.startswith(today):
+            try:
+                cost += Decimal(str(e.payload.get("cost_usd") or "0"))
+            except Exception:
+                pass
+        elif t == "lab.paused":
+            paused, saw_marker = True, True
+        elif t == "lab.resumed":
+            paused, saw_marker = False, True
     _LLM_STATE["daily_used"] = used
+    _LLM_STATE["daily_cost"] = cost
+    if saw_marker and paused != _LLM_STATE["paused"]:
+        _LLM_STATE["paused"] = paused
+        _LLM_STATE["pause_skipped"] = set()
+    elif saw_marker:
+        _LLM_STATE["paused"] = paused
     if used == 0:
         _LLM_STATE["daily_recorded"] = False  # new UTC day → can warn again
+        _LLM_STATE["daily_cost_recorded"] = False
+    try:
+        from .seams import resolve
+        version, body = resolve(rt.graph, "setting.daily_cost_cap_usd", None)
+        _LLM_STATE["cost_cap_override"] = (
+            float(str(body).strip()) if version and body is not None else None)
+    except Exception:
+        pass
     return used
+
+
+def lab_paused() -> bool:
+    return bool(_LLM_STATE["paused"])
+
+
+def set_lab_paused(graph, paused: bool, *, by: str = "operator") -> None:
+    """Flip the global pause (ADR-015): append the marker event (the durable
+    bit) and update in-process state. Restart-proof by construction —
+    sync_daily_budget rebuilds from the markers at boot."""
+    from .behaviors import emit_lab_event
+    emit_lab_event(graph, "lab.paused" if paused else "lab.resumed",
+                   {"by": by})
+    _LLM_STATE["paused"] = paused
+    _LLM_STATE["pause_skipped"] = set()  # new episode either way
+
+
+def daily_cost_today() -> Decimal:
+    return _LLM_STATE["daily_cost"]
 
 
 def reset_llm_session() -> None:
     _LLM_STATE.update(total=0, by_behavior={}, anomalies=[],
                       budget_recorded=False, daily_used=0,
-                      daily_recorded=False, last_model=None)
+                      daily_recorded=False, daily_cost=Decimal("0"),
+                      daily_cost_recorded=False, cost_cap_override=None,
+                      paused=False, pause_skipped=set(), last_model=None)
 
 
 def reset_llm_run_counters() -> None:
@@ -276,15 +337,25 @@ def consume_llm_anomalies(graph) -> list[str]:
     recorded = []
     while _LLM_STATE["anomalies"]:
         a = _LLM_STATE["anomalies"].pop(0)
-        if a["kind"] == "budget":
-            daily = "daily cap" in a["detail"]
-            flag = "daily_recorded" if daily else "budget_recorded"
+        if a["kind"] == "paused":
+            # ADR-015: one behavior-skipped observation per behavior per
+            # pause episode (queue-side dedup) — never one per event.
+            text = (f"Behavior skipped while paused: "
+                    f"{a['behavior'] or 'an LLM behavior'} would have fired but "
+                    "the lab is paused (operator control). It will fire again "
+                    "on its next trigger after resume.")
+            lab_kind = "behavior_skipped"
+        elif a["kind"] == "budget":
+            daily_cost = "daily cost cap" in a["detail"]
+            daily = (not daily_cost) and "daily cap" in a["detail"]
+            flag = ("daily_cost_recorded" if daily_cost
+                    else "daily_recorded" if daily else "budget_recorded")
             if _LLM_STATE[flag]:
                 continue
             _LLM_STATE[flag] = True
             text = (f"LLM budget exhausted: {a['detail']}. The lab stops making "
                     "model calls cleanly; "
-                    + ("idle until the UTC day resets." if daily
+                    + ("idle until the UTC day resets." if (daily or daily_cost)
                        else "queued work resumes next session."))
             lab_kind = "llm_budget"
         else:
@@ -372,14 +443,21 @@ class LabProviderWrapper:
     """
 
     def __init__(self, inner: Any, *, max_total: int = 60, max_per_behavior: int = 5,
-                 max_daily: int = 200,
+                 max_daily: int = 200, max_daily_cost_usd: float = 5.0,
                  prompt_bodies: Optional[dict[str, str]] = None) -> None:
         self._inner = inner
         self._max_total = max_total
         self._max_per_behavior = max_per_behavior
         self._max_daily = max_daily
+        self._max_daily_cost = max_daily_cost_usd
         self._prompts = prompt_bodies or {}
         self.default_model = getattr(inner, "default_model", "unknown")
+
+    def effective_cost_cap(self) -> float:
+        """ADR-015: the seam-approved override wins, else the settings value.
+        Tuning the ceiling is self-modification through the gate."""
+        override = _LLM_STATE.get("cost_cap_override")
+        return float(override) if override is not None else self._max_daily_cost
 
     def _behavior_for(self, system: str) -> Optional[str]:
         for name, body in self._prompts.items():
@@ -402,12 +480,32 @@ class LabProviderWrapper:
                 finish_reason="stop",
             )
 
+        # ADR-015: while paused, every LLM behavior except answer idles. The
+        # skip anomaly is queued once per behavior per pause episode — the
+        # next lab handler records it as a behavior-skipped observation.
+        if _LLM_STATE["paused"] and behavior != "answer":
+            key = behavior or "?"
+            if key not in _LLM_STATE["pause_skipped"]:
+                _LLM_STATE["pause_skipped"].add(key)
+                _LLM_STATE["anomalies"].append({
+                    "kind": "paused", "behavior": behavior,
+                    "detail": "lab is paused (operator control)", "raw": None})
+            return _canned("lab paused")
         if _LLM_STATE["daily_used"] >= self._max_daily:
             _LLM_STATE["anomalies"].append({
                 "kind": "budget", "behavior": behavior,
                 "detail": f"daily cap {self._max_daily} reached (UTC reset)",
                 "raw": None})
             return _canned("llm budget exhausted (daily cap)")
+        cost_cap = self.effective_cost_cap()
+        if float(_LLM_STATE["daily_cost"]) >= cost_cap:
+            _LLM_STATE["anomalies"].append({
+                "kind": "budget", "behavior": behavior,
+                "detail": (f"daily cost cap ${cost_cap:.2f} reached "
+                           f"(${float(_LLM_STATE['daily_cost']):.2f} spent today, "
+                           "UTC reset)"),
+                "raw": None})
+            return _canned("llm budget exhausted (daily cost cap)")
         if _LLM_STATE["total"] >= self._max_total:
             _LLM_STATE["anomalies"].append({
                 "kind": "budget", "behavior": behavior,
@@ -428,6 +526,10 @@ class LabProviderWrapper:
 
         try:
             resp = self._inner.complete(**kwargs)
+            try:  # ADR-015: native cost accounting, mirrored for the ceiling
+                _LLM_STATE["daily_cost"] += Decimal(str(resp.cost_usd or 0))
+            except Exception:
+                pass
         except Exception as exc:
             # Native providers RAISE on schema-parse failures (the raw model
             # text rides on payload_extras) — salvage from there before
@@ -540,6 +642,7 @@ def select_lab_provider(
         max_total=getattr(settings, "max_total_llm_calls_per_session", 60),
         max_per_behavior=getattr(settings, "max_llm_calls_per_behavior_run", 5),
         max_daily=getattr(settings, "max_llm_calls_per_day", 200),
+        max_daily_cost_usd=getattr(settings, "daily_cost_cap_usd", 5.0),
         prompt_bodies=_lab_prompt_bodies(),
     )
     return wrapped, {"mode": "live", "provider": chosen, "model": inst.default_model}

@@ -131,6 +131,17 @@ class LabSettings(BaseModel):
             "exhaustion: one observation, then idle until the UTC date turns."
         ),
     )
+    daily_cost_cap_usd: float = Field(
+        default=5.0,
+        ge=0.0,
+        description=(
+            "Daily LLM cost ceiling in USD, UTC reset (ADR-015). Spend is "
+            "rebuilt from the cost_usd activegraph stamps on llm.responded "
+            "events — restart-proof. Blocked-by-cost attempts log like "
+            "blocked-by-count. Seam-eligible: tuning the ceiling is "
+            "self-modification through the gate."
+        ),
+    )
     max_total_llm_calls_per_session: int = Field(
         default=60,
         ge=1,

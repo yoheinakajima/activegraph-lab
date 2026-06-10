@@ -192,6 +192,21 @@ function render() {
   $("llm").textContent = `llm: ${FEED.llm.mode}${FEED.llm.model ? " · " + FEED.llm.model : ""}`;
   $("horizon").textContent = `as of ${FEED.as_of_event || "—"}`;
 
+  /* 6c: live|paused · $today/$cap, pause toggle for the operator only. */
+  const st = FEED.status || {};
+  $("labstatus").textContent =
+    `${st.paused ? "paused" : "live"} · $${(st.llm_cost_today || 0).toFixed(2)}` +
+    `/$${(st.llm_cost_cap || 0).toFixed(2)}`;
+  $("labstatus").style.color = st.paused ? "var(--warn)" : "";
+  const toggle = $("pause-toggle");
+  toggle.hidden = !isOperator();
+  toggle.textContent = st.paused ? "resume the lab" : "pause the lab";
+  toggle.onclick = async () => {
+    try { await mutate(st.paused ? "/lab/resume" : "/lab/pause", {}); }
+    catch (e) { LAST_ERROR = `Could not ${st.paused ? "resume" : "pause"} — ${e.message}.`; }
+    refresh();
+  };
+
   renderAuth();
   $("composer").style.display = isOperator() ? "" : "none";
   if (VIEW.mode === "feed") renderFeed();

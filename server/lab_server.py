@@ -659,6 +659,7 @@ def _feed(rt, limit: int = 100) -> dict:
     return {
         "as_of_event": str(g.events[-1].id) if g.events else None,
         "llm": _llm_info,
+        "status": _operator_status(),
         "mission": missions[0] if missions else None,
         "inbox": inbox,
         "resolved": resolved,
@@ -673,10 +674,31 @@ def _feed(rt, limit: int = 100) -> dict:
     }
 
 
+def _operator_status() -> dict:
+    """ADR-015 status: paused, calls today/cap, cost today/cap. In-process
+    state is authoritative between syncs; all of it rebuilds from the log."""
+    from lab_pack.llm import _LLM_STATE
+    from lab_pack.settings import LabSettings
+    defaults = LabSettings()
+    cap = _LLM_STATE.get("cost_cap_override")
+    return {
+        "paused": bool(_LLM_STATE.get("paused")),
+        "llm_calls_today": int(_LLM_STATE.get("daily_used") or 0),
+        "llm_calls_cap": defaults.max_llm_calls_per_day,
+        "llm_cost_today": round(float(_LLM_STATE.get("daily_cost") or 0), 4),
+        "llm_cost_cap": float(cap if cap is not None else defaults.daily_cost_cap_usd),
+    }
+
+
 def _status_line() -> str:
-    """Small status line for the blog footer (6c): live|paused · $today/$cap.
-    Filled in by Phase 6; empty when state is unavailable."""
-    return ""
+    """Small status line for the blog footer and /lab header (6c):
+    live|paused · $today/$cap."""
+    try:
+        s = _operator_status()
+    except Exception:
+        return ""
+    return (f"{'paused' if s['paused'] else 'live'} · "
+            f"${s['llm_cost_today']:.2f}/${s['llm_cost_cap']:.2f} today · ")
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
@@ -819,7 +841,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_error_json("Not found", 404)
                 return
-            if path in ("/chat", "/lab/decision"):
+            if path in ("/chat", "/lab/decision", "/lab/pause", "/lab/resume"):
                 status, msg = _check_bearer(self.headers)
                 if status:
                     if status == 401:
@@ -840,6 +862,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif path == "/lab/decision":
                 self._handle_decision(body)
+            elif path in ("/lab/pause", "/lab/resume"):
+                self._handle_pause(path == "/lab/pause")
             else:
                 self._send_error_json("Not found", 404)
         except Exception as e:
@@ -944,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
             "uptime_seconds": int(time.monotonic() - _BOOT_TIME) if _BOOT_TIME else 0,
             "read_only": not _operator_token(),
             "llm": _llm_info,
+            **_operator_status(),  # 6c: paused, calls today/cap, cost today/cap
         })
 
     # ── GET /lab/draft?slug= ────────────────────────────────────────────────
@@ -1123,6 +1148,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(out[2], out[1])
             return
         self._send_json(out[1])
+
+    # ── POST /lab/pause, /lab/resume (ADR-015) ──────────────────────────────
+
+    def _handle_pause(self, paused: bool):
+        """Flip the global pause: a lab.paused/lab.resumed marker event is the
+        durable state (rebuilt from the log at boot, like the daily cap)."""
+        from lab_pack.llm import lab_paused, set_lab_paused
+        _get_rt()
+
+        def job(rt):
+            if lab_paused() == paused:
+                return {"paused": paused, "changed": False}
+            set_lab_paused(rt.graph, paused, by="operator")
+            _save(rt)
+            return {"paused": paused, "changed": True}
+
+        self._send_json(_run_on_worker(job))
 
     # ── POST /reset ─────────────────────────────────────────────────────────
 

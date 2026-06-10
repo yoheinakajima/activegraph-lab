@@ -586,6 +586,111 @@ def run_editorial() -> bool:
     return c.done("editorial")
 
 
+def run_operator_controls() -> bool:
+    spec = _load("operator_controls.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: operator_controls — pause/resume + daily cost ceiling (ADR-015)")
+    print("=" * 64)
+
+    from lab_pack.behaviors import emit_lab_event
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, _lab_prompt_bodies,
+                              lab_paused, reset_llm_session, set_lab_paused,
+                              sync_daily_budget)
+
+    clear_lab_registry()
+    reset_llm_session()
+    cap = float(spec["cost_cap_usd"])
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=10, max_daily=200,
+                                 max_daily_cost_usd=cap,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt = Runtime(Graph(), llm_provider=wrapper)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Control branch", "talk here",
+                              status="active")
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def add_claim(i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+        rt.run_until_idle()
+
+    def proposed():
+        return [b for b in g.objects(type="branch") if b.data.get("status") == "proposed"]
+
+    def plan_skips():
+        return [o for o in _lab_obs(g, "behavior_skipped")
+                if (o.data.get("metadata") or {}).get("behavior") == "plan"]
+
+    # ── pause: marker event + LLM behaviors idle, ONE skip obs ──────────────
+    set_lab_paused(g, True)
+    c.that(str(g.events[-1].type) == "lab.paused" and lab_paused(),
+           "pause appends a lab.paused marker event")
+    add_claim(1)
+    add_claim(2)
+    c.that(len(proposed()) == 0, "paused → plan does not propose branches")
+    c.that(len(plan_skips()) == exp["paused_plan_skips"],
+           f"one behavior-skipped observation per behavior per episode, "
+           f"not per event ({len(plan_skips())} for 2 triggers)")
+
+    # ── answer stays live while paused ──────────────────────────────────────
+    _, msg = send_branch_message_fn(g, branch.id, "are you alive in there?")
+    rt.run_until_idle()
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "as of event" in (cands[0].data.get("content") or ""),
+           "answer still fires while paused (the operator can always talk)")
+    print(f"  paused: 2 plan triggers → 0 branches, {len(plan_skips())} skip obs; "
+          "answer replied")
+
+    # ── restart-proof: pause state rebuilds from the log ────────────────────
+    saved_anomalies = list(_LLM_STATE["anomalies"])
+    reset_llm_session()  # simulate a process restart
+    sync_daily_budget(rt)
+    c.that(lab_paused(), "paused state rebuilt from the log after restart")
+    _LLM_STATE["anomalies"] = saved_anomalies
+
+    # ── resume: behaviors fire again ────────────────────────────────────────
+    set_lab_paused(g, False)
+    c.that(str(g.events[-1].type) == "lab.resumed" and not lab_paused(),
+           "resume appends a lab.resumed marker event")
+    add_claim(3)
+    c.that(len(proposed()) == exp["resumed_branches"],
+           f"resumed → plan proposes again ({len(proposed())})")
+    print(f"  resumed: claim → {len(proposed())} proposed branch")
+
+    # ── daily cost ceiling: native cost accounting, restart-proof ──────────
+    emit_lab_event(g, "llm.responded", {"cost_usd": spec["synthetic_spend"],
+                                        "model": "fixture", "behavior": "fixture"})
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           f"cost rebuilt from llm.responded events "
+           f"(${float(_LLM_STATE['daily_cost']):.2f} >= ${cap:.2f})")
+    n_before = len(proposed())
+    add_claim(4)
+    blocked = [o for o in _lab_obs(g, "llm_budget")
+               if "cost cap" in (o.data.get("text") or "")]
+    c.that(len(proposed()) == n_before, "cost cap reached → plan blocked")
+    c.that(len(blocked) == exp["cost_blocked_observations"],
+           f"blocked-by-cost recorded once ({len(blocked)})")
+    reset_llm_session()  # simulate another restart
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           "cost ceiling is restart-proof: bouncing the process cannot reset it")
+    print(f"  cost: ${float(_LLM_STATE['daily_cost']):.2f} spent >= ${cap:.2f} cap "
+          f"→ blocked, {len(blocked)} observation, survives restart")
+    return c.done("operator_controls")
+
+
 def run_seams() -> bool:
     spec = _load("seams.yaml")
     print("\n" + "=" * 64)
@@ -879,6 +984,7 @@ def run_all() -> None:
         run_capability_gap(),
         run_draft_writer(),
         run_editorial(),
+        run_operator_controls(),
         run_seams(),
         run_graph_code(),
         run_compat_regression(),

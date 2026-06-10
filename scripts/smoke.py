@@ -250,18 +250,29 @@ def main() -> int:
             lab_html = r.read().decode()
         check("app.js" in lab_html, "the notebook UI is served at /lab")
 
+        print("== operator controls (ADR-015) ==")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as r:
+            hz = json.loads(r.read())
+        check({"paused", "llm_calls_today", "llm_calls_cap",
+               "llm_cost_today", "llm_cost_cap"} <= set(hz),
+              "healthz reports paused + calls/cost against caps")
+        check(feed.get("status", {}).get("paused") is False,
+              "feed status block present (UI status line source)")
+
         # 2d: tokenless read succeeds (above); tokenless mutation must fail.
         import os as _os
         import urllib.error as _ue
         _os.environ.pop("LAB_OPERATOR_TOKEN", None)
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/chat", method="POST",
-            data=json.dumps({"branch_id": target.id, "content": "x"}).encode())
-        try:
-            urllib.request.urlopen(req, timeout=10)
-            check(False, "tokenless mutation must not succeed")
-        except _ue.HTTPError as e:
-            check(e.code in (401, 403), f"tokenless mutation refused ({e.code})")
+        for mpath, mbody in (("/chat", {"branch_id": target.id, "content": "x"}),
+                             ("/lab/pause", {})):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}{mpath}", method="POST",
+                data=json.dumps(mbody).encode())
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                check(False, f"tokenless mutation must not succeed ({mpath})")
+            except _ue.HTTPError as e:
+                check(e.code in (401, 403), f"tokenless mutation refused ({mpath}: {e.code})")
     finally:
         httpd.shutdown()
         lab_server._rt = None

@@ -165,3 +165,10 @@ details.branch-section > summary, details.history > summary {
 }
 .resolved-decision { font-size: 13px; color: var(--dim); }
 .resolved-decision .text { margin-left: 6px; }
+
+/* 6c: operator controls */
+#pause-toggle {
+  font: inherit; font-size: 12px; font-family: ui-monospace, Menlo, monospace;
+  background: none; border: 1px solid var(--warn); color: var(--warn);
+  border-radius: 4px; padding: 1px 10px; cursor: pointer;
+}
