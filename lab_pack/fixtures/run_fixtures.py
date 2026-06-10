@@ -503,6 +503,132 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+_GC_GOOD = '''
+from activegraph.packs import behavior
+
+@behavior(name="echo_eval", on=["object.created"], creates=["evaluation"])
+def echo_eval(event, graph, ctx, **kw):
+    obj = event.payload.get("object", {})
+    if obj.get("type") != "observation":
+        return
+    graph.add_object("evaluation", {
+        "subject_id": obj.get("id"), "subject_type": "observation",
+        "judgment": "noted", "rationale": "graph-code echo",
+    })
+'''
+
+_GC_KERNEL = '''
+from activegraph.packs import behavior
+import lab_pack.kernel
+
+@behavior(name="kernel_toucher", on=["object.created"], creates=["evaluation"])
+def kernel_toucher(event, graph, ctx, **kw):
+    pass
+'''
+
+_GC_SCOPE = '''
+from activegraph.packs import behavior
+
+@behavior(name="scope_breaker", on=["object.created"], creates=["evaluation"])
+def scope_breaker(event, graph, ctx, **kw):
+    if event.payload.get("object", {}).get("type") != "observation":
+        return
+    graph.add_object("task", {"title": "undeclared work", "description": "x"})
+'''
+
+_GC_TIMEOUT = '''
+from activegraph.packs import behavior
+
+@behavior(name="spinner", on=["object.created"], creates=["evaluation"])
+def spinner(event, graph, ctx, **kw):
+    while True:
+        pass
+'''
+
+
+def run_graph_code() -> bool:
+    spec = _load("graph_code.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: graph_code — pipeline, refusals, timeout, dark-by-default")
+    print("=" * 64)
+
+    import os
+    from lab_pack.graph_code import (clear_loaded, load_approved_drafts,
+                                     propose_behavior_draft_fn, status)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    clear_loaded()
+    saved_flag = os.environ.pop("LAB_ALLOW_GRAPH_CODE", None)
+    c = Check()
+    sources = {"passing": _GC_GOOD, "kernel_import": _GC_KERNEL,
+               "scope_violation": _GC_SCOPE, "timeout": _GC_TIMEOUT}
+
+    def checks_for(artifact_id):
+        return {(e.data.get("metadata") or {}).get("step"): e.data.get("judgment")
+                for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "graph_code_check"
+                and (e.data.get("metadata") or {}).get("artifact_id") == artifact_id}
+
+    try:
+        artifacts = {}
+        for key, d in spec["drafts"].items():
+            a = propose_behavior_draft_fn(
+                g, d["name"], sources[key], d["subscriptions"], d["touches"],
+                timeout_seconds=d.get("timeout_seconds", 10))
+            rt.run_until_idle()
+            artifacts[key] = a
+            steps = checks_for(a.id)
+            st = g.get_object(a.id).data.get("status")
+            if d["expect"] == "pending_decision":
+                pend = [x for x in g.objects(type="decision")
+                        if x.data.get("subject_ref") == a.id
+                        and x.data.get("status") == "pending"]
+                c.that(st == "draft" and len(pend) == 1 and
+                       all(v == "passed" for v in steps.values()) and len(steps) == 3,
+                       f"{key}: 3 pipeline steps passed → pending self_modify decision")
+            else:
+                c.that(st == "rejected" and steps.get(d["failed_step"]) == "failed",
+                       f"{key}: rejected at {d['failed_step']} (steps: {steps})")
+            print(f"  {key}: {st} | steps: {steps}")
+
+        # approve the passing draft → still dormant without the flag
+        pend = next(x for x in g.objects(type="decision")
+                    if x.data.get("subject_ref") == artifacts["passing"].id
+                    and x.data.get("status") == "pending")
+        approve_decision_fn(g, pend.id, True, "fixture approve")
+        rt.run_until_idle()
+        c.that(g.get_object(artifacts["passing"].id).data.get("status") == "approved",
+               "operator approval lands on the draft artifact")
+        c.that(load_approved_drafts(rt) == 0,
+               "approved draft stays DORMANT while LAB_ALLOW_GRAPH_CODE is unset")
+        st = status(g)["graph_code"]
+        c.that(any(d["state"].startswith("dormant") for d in st
+                   if d["status"] == "approved"),
+               "Seams view lists the approved draft as dormant")
+
+        # flag set (only inside this fixture): loaded and tagged
+        os.environ["LAB_ALLOW_GRAPH_CODE"] = "1"
+        c.that(load_approved_drafts(rt) == 1, "flag set → draft loads as a live behavior")
+        g.add_object("observation", {"text": "trigger the loaded graph behavior",
+                                     "confidence": 0.5})
+        rt.run_until_idle()
+        tagged = [e for e in g.objects(type="evaluation")
+                  if (e.data.get("metadata") or {}).get("graph_code")]
+        c.that(len(tagged) >= 1 and
+               tagged[0].data["metadata"]["graph_code"]["artifact"] == artifacts["passing"].id,
+               f"loaded behavior tags its outputs with draft provenance ({len(tagged)})")
+    finally:
+        os.environ.pop("LAB_ALLOW_GRAPH_CODE", None)
+        if saved_flag is not None:
+            os.environ["LAB_ALLOW_GRAPH_CODE"] = saved_flag
+        clear_loaded()
+
+    from lab_pack.graph_code import graph_code_enabled
+    c.that(not graph_code_enabled(), "flag restored — no live graph code after the fixture")
+    return c.done("graph_code")
+
+
 def run_compat_regression() -> bool:
     """ADR-008: decode_relation must handle both add_relation call conventions."""
     print("\n" + "=" * 64)
@@ -540,6 +666,7 @@ def run_all() -> None:
         run_capability_gap(),
         run_draft_writer(),
         run_seams(),
+        run_graph_code(),
         run_compat_regression(),
     ]
     passed = sum(results)

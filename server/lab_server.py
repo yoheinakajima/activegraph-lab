@@ -176,6 +176,11 @@ def _build_runtime():
         )
         rt.run_until_idle()
         rt.save_state()
+    from lab_pack import graph_code
+    n_gc = graph_code.load_approved_drafts(rt)  # 0 unless LAB_ALLOW_GRAPH_CODE=1
+    if n_gc:
+        print(f"[lab_server] graph code: {n_gc} approved draft(s) LOADED "
+              "(LAB_ALLOW_GRAPH_CODE=1)", flush=True)
     pending = sum(1 for d in rt.graph.objects(type="decision")
                   if d.data.get("status") == "pending")
     print(f"[lab_server] boot: mode={mode} backend={storage.backend()} "
@@ -608,10 +613,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_seams(self):
         """The Seams view (read-only): every self-modification surface, its
         active version, source (file|graph), and pending proposals."""
-        from lab_pack import seams
+        from lab_pack import graph_code, seams
         rt = _get_rt()
         with _lock:
             status = seams.seam_status(rt.graph)
+            status.update(graph_code.status(rt.graph))
         self._send_json(status)
 
     # ── GET /healthz ────────────────────────────────────────────────────────
