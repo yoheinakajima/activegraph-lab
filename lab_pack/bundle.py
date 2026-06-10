@@ -181,6 +181,24 @@ def _seed_findings(graph, mission_id: str, branch_id: str, *,
             "first external consumer of the packs conventions.",
             [],
         ),
+        (
+            "Finding: the runtime's restricted BehaviorGraph (no collection "
+            "scans inside behaviors) forced the seam loader to resolve "
+            "cache-only in behavior context — and that constraint turned out "
+            "to be a security property: the cache is populated exclusively by "
+            "gate-driven hot_load and boot-time apply_approved, so a seam "
+            "cannot become active on any path that bypasses the gate.",
+            [],
+        ),
+        (
+            "Finding: the runtime logs llm.requested BEFORE the provider "
+            "executes, so budget-blocked attempts are in the event log too. "
+            "Rebuilding the daily LLM cap from the log therefore counts "
+            "blocked attempts — the cap survives restarts and cannot be "
+            "reset by bouncing the process. An accident of event ordering "
+            "that behaves like a designed safety feature.",
+            [],
+        ),
     ]
     for text, extra_refs in findings:
         f = graph.add_object("observation", {

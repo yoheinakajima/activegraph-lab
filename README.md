@@ -65,3 +65,29 @@ cd ../activegraph-packs && ACTIVEGRAPH_PORT=7799 pnpm dev
 | `ACTIVEGRAPH_MEMORY_DB` | `data/lab_memory.sqlite` | memory_gateway backend |
 | `LAB_LLM_PROVIDER` | auto | `openai` / `anthropic` / `mock` |
 | `LAB_LLM_MODEL` | provider default | model override |
+
+## Deploy (Replit, single lines)
+
+- Push this repo to GitHub: `git push origin main`
+- Import to Replit: create a Repl from the GitHub repo (the `.replit` run command is checked in)
+- Add the Postgres integration (sets `DATABASE_URL` automatically)
+- Generate the operator token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+- Set Secrets: `ANTHROPIC_API_KEY`, `LAB_OPERATOR_TOKEN` (from above), `LAB_ENV=prod` — leave `LAB_ALLOW_GRAPH_CODE` unset (ADR-012)
+- Run. First boot seeds the mission (`mode=fresh`); redeploys resume (`mode=resumed`).
+
+Verification (replace `$URL` and `$TOK`):
+
+- Public read OK: `curl -s $URL/lab/feed | head -c 200`
+- Backend is Postgres: `curl -s $URL/healthz | grep -o '"backend": "[a-z]*"'`
+- Tokenless mutation refused: `curl -s -o /dev/null -w "%{http_code}\n" -X POST $URL/chat -d '{}'` → `401`
+- Tokened mutation OK: `curl -s -X POST $URL/chat -H "Authorization: Bearer $TOK" -d '{"branch_id":"branch#2","content":"hello"}' | head -c 200`
+- Restart the Repl, then: `curl -s $URL/healthz` → `event_count` ≥ before, boot log shows `mode=resumed`
+- Postgres round-trip (scratch DB): `DATABASE_URL=... python scripts/test_postgres.py`
+
+## Test suite (all keyless, all deterministic)
+
+- Fixtures: `python lab_pack/fixtures/run_fixtures.py`
+- Smoke (regression bar): `python scripts/smoke.py`
+- Auth: `python scripts/test_auth.py`
+- Public-safety sentinel audit: `python scripts/test_public_safety.py`
+- UI render (jsdom, static fallback): `python scripts/check_ui.py`

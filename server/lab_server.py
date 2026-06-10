@@ -181,8 +181,11 @@ def _build_runtime():
     if n_gc:
         print(f"[lab_server] graph code: {n_gc} approved draft(s) LOADED "
               "(LAB_ALLOW_GRAPH_CODE=1)", flush=True)
+    from lab_pack.llm import sync_daily_budget
+    used_today = sync_daily_budget(rt)
     pending = sum(1 for d in rt.graph.objects(type="decision")
                   if d.data.get("status") == "pending")
+    print(f"[lab_server] llm daily budget: {used_today} used today (UTC)", flush=True)
     print(f"[lab_server] boot: mode={mode} backend={storage.backend()} "
           f"events={len(rt.graph.events)} pending_decisions={pending}", flush=True)
     return rt
@@ -904,6 +907,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         def job(rt):
+            from lab_pack.llm import sync_daily_budget
+            sync_daily_budget(rt)  # 7b: authoritative used-today from the log
             if rt.graph.get_object(branch_id) is None:
                 return None
             thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
@@ -945,6 +950,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("decision_id is required", 400)
             return
         def job(rt):
+            from lab_pack.llm import sync_daily_budget
+            sync_daily_budget(rt)
             d = rt.graph.get_object(decision_id)
             if d is None or str(d.type) != "decision":
                 return ("error", 404, f"no such decision: {decision_id}")

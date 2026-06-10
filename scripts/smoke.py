@@ -162,6 +162,31 @@ def main() -> int:
     check(len(budget_obs) == 1, "budget exhaustion recorded exactly once, run stopped cleanly")
     reset_llm_session()
 
+    print("== daily cap (7b) ==")
+    from lab_pack.llm import _LLM_STATE, sync_daily_budget
+    daily = LabProviderWrapper(LabMockProvider(), max_daily=0,
+                               prompt_bodies=_lab_prompt_bodies())
+    g3 = Graph()
+    rt3 = Runtime(g3, llm_provider=daily)
+    rt3.load_pack(core_pack, settings=CoreSettings())
+    rt3.load_pack(lab_pack_obj, settings=LabSettings(crawl_enabled=False))
+    g3.add_object("observation", {
+        "text": "Daily-capped claim: replay is deterministic in this runtime.",
+        "confidence": 0.7, "category": "fact",
+        "metadata": {"lab": "site_claim", "mission_id": None},
+    })
+    rt3.run_until_idle()
+    daily_obs = [o for o in g3.objects(type="observation")
+                 if (o.data.get("metadata") or {}).get("lab") == "llm_budget"]
+    check(len(daily_obs) == 1 and "daily cap" in daily_obs[0].data.get("text", ""),
+          "daily cap exhaustion recorded; lab idles until UTC reset")
+    # The runtime logs llm.requested BEFORE the provider runs, so even a
+    # budget-blocked attempt is in the log — the cap survives restarts and
+    # cannot be reset by bouncing the process.
+    check(sync_daily_budget(rt3) >= 1,
+          f"daily count rebuilt from the log incl. blocked attempts ({_LLM_STATE['daily_used']})")
+    reset_llm_session()
+
     print("== feed endpoint coherence ==")
     lab_server._rt = rt           # no persistence in smoke → thread-safe to serve
     lab_server._llm_info = {"mode": "mock", "provider": "mock", "model": None}

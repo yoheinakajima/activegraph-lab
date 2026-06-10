@@ -209,13 +209,31 @@ _LLM_STATE: dict[str, Any] = {
     "by_behavior": {},
     "anomalies": [],          # queued {"kind", "behavior", "detail", "raw"}
     "budget_recorded": False,
+    "daily_used": 0,          # authoritative via sync_daily_budget(rt)
+    "daily_recorded": False,
     "last_model": None,
 }
 
 
+def sync_daily_budget(rt) -> int:
+    """7b: set the authoritative used-today count from llm.requested events in
+    the log (UTC date match). The log IS the persistence — restart-safe, and
+    the UTC reset falls out of only counting today's events."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    used = sum(1 for e in rt.graph.events
+               if str(e.type) == "llm.requested"
+               and str(getattr(e, "timestamp", "") or "").startswith(today))
+    _LLM_STATE["daily_used"] = used
+    if used == 0:
+        _LLM_STATE["daily_recorded"] = False  # new UTC day → can warn again
+    return used
+
+
 def reset_llm_session() -> None:
     _LLM_STATE.update(total=0, by_behavior={}, anomalies=[],
-                      budget_recorded=False, last_model=None)
+                      budget_recorded=False, daily_used=0,
+                      daily_recorded=False, last_model=None)
 
 
 def reset_llm_run_counters() -> None:
@@ -238,11 +256,15 @@ def consume_llm_anomalies(graph) -> list[str]:
     while _LLM_STATE["anomalies"]:
         a = _LLM_STATE["anomalies"].pop(0)
         if a["kind"] == "budget":
-            if _LLM_STATE["budget_recorded"]:
+            daily = "daily cap" in a["detail"]
+            flag = "daily_recorded" if daily else "budget_recorded"
+            if _LLM_STATE[flag]:
                 continue
-            _LLM_STATE["budget_recorded"] = True
+            _LLM_STATE[flag] = True
             text = (f"LLM budget exhausted: {a['detail']}. The lab stops making "
-                    "model calls cleanly; queued work resumes next session.")
+                    "model calls cleanly; "
+                    + ("idle until the UTC day resets." if daily
+                       else "queued work resumes next session."))
             lab_kind = "llm_budget"
         else:
             text = (f"LLM output parse failure in {a['behavior'] or 'unknown behavior'}: "
@@ -329,10 +351,12 @@ class LabProviderWrapper:
     """
 
     def __init__(self, inner: Any, *, max_total: int = 60, max_per_behavior: int = 5,
+                 max_daily: int = 200,
                  prompt_bodies: Optional[dict[str, str]] = None) -> None:
         self._inner = inner
         self._max_total = max_total
         self._max_per_behavior = max_per_behavior
+        self._max_daily = max_daily
         self._prompts = prompt_bodies or {}
         self.default_model = getattr(inner, "default_model", "unknown")
 
@@ -357,6 +381,12 @@ class LabProviderWrapper:
                 finish_reason="stop",
             )
 
+        if _LLM_STATE["daily_used"] >= self._max_daily:
+            _LLM_STATE["anomalies"].append({
+                "kind": "budget", "behavior": behavior,
+                "detail": f"daily cap {self._max_daily} reached (UTC reset)",
+                "raw": None})
+            return _canned("llm budget exhausted (daily cap)")
         if _LLM_STATE["total"] >= self._max_total:
             _LLM_STATE["anomalies"].append({
                 "kind": "budget", "behavior": behavior,
@@ -371,6 +401,7 @@ class LabProviderWrapper:
             return _canned("llm budget exhausted (per-behavior cap)")
 
         _LLM_STATE["total"] += 1
+        _LLM_STATE["daily_used"] += 1
         _LLM_STATE["by_behavior"][behavior or "?"] = used + 1
         _LLM_STATE["last_model"] = kwargs.get("model") or self.default_model
 
@@ -487,6 +518,7 @@ def select_lab_provider(
         inst,
         max_total=getattr(settings, "max_total_llm_calls_per_session", 60),
         max_per_behavior=getattr(settings, "max_llm_calls_per_behavior_run", 5),
+        max_daily=getattr(settings, "max_llm_calls_per_day", 200),
         prompt_bodies=_lab_prompt_bodies(),
     )
     return wrapped, {"mode": "live", "provider": chosen, "model": inst.default_model}

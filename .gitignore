@@ -3,3 +3,4 @@ __pycache__/
 data/
 nohup.out
 node_modules/
+.env

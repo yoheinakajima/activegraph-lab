@@ -92,6 +92,15 @@ class LabSettings(BaseModel):
             "reset_llm_run_counters(), called by the server/runner per drain)."
         ),
     )
+    max_llm_calls_per_day: int = Field(
+        default=200,
+        ge=1,
+        description=(
+            "Daily LLM call cap, UTC reset. Counted from llm.requested events "
+            "in the log (persisted by construction; restart-safe). On "
+            "exhaustion: one observation, then idle until the UTC date turns."
+        ),
+    )
     max_total_llm_calls_per_session: int = Field(
         default=60,
         ge=1,

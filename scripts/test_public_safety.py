@@ -87,7 +87,7 @@ def _run() -> int:
         # IMPORTANT: persist_to=None — the sentinel DATABASE_URL points
         # nowhere; backend() still reads it, which is exactly what we audit.
         rt = build_lab(
-            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=4,
+            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=6,
                                             prompt_bodies=_lab_prompt_bodies()),
             lab_settings=LabSettings(drafts_dir=tempfile.mkdtemp()),
             fetch_handler=fetch)
