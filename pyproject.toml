@@ -12,16 +12,24 @@ license = { text = "Apache-2.0" }
 
 dependencies = [
     "activegraph[llm,postgres]==1.0.5.post2",
-    # Pinned per ADR-005. Bumping this SHA is a gated decision the lab
-    # records about itself. Local dev override (single line):
-    #   pip install -e ../activegraph-packs
-    "activegraph-packs @ git+https://github.com/yoheinakajima/activegraph-packs@da2bca777ef6dd7aa667595f550e8eea10f3dfb7",
+    # Git source + SHA pin live in [tool.uv.sources] below (ADR-005: bumping
+    # the pin is a gated decision the lab records about itself). Install with
+    # uv (`uv pip install -e .`) — plain pip cannot resolve this bare name.
+    # Local dev override (single line): pip install -e ../activegraph-packs
+    "activegraph-packs",
     "pydantic>=2.0",
     "click>=8.1",
     "anthropic>=0.34",
     "openai>=1.40",
     "pyyaml>=6.0",
 ]
+
+# Replit's package layer rejects direct-URL requirements in [project.dependencies]
+# ("name @ git+..."), which used to force re-applying this table by hand in every
+# Replit environment. Committed here so a stock `uv pip install -e .` works
+# everywhere with zero local patching; uv's pip interface honors this table.
+[tool.uv.sources]
+activegraph-packs = { git = "https://github.com/yoheinakajima/activegraph-packs", rev = "da2bca777ef6dd7aa667595f550e8eea10f3dfb7" }
 
 [project.entry-points."activegraph.packs"]
 lab = "lab_pack:pack"
