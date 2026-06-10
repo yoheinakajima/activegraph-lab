@@ -277,7 +277,9 @@ def run_thread_equals_branch() -> bool:
     c = Check()
     thread_id = None
     for mspec in spec["messages"]:
-        thread_id, msg = send_branch_message_fn(g, branch.id, mspec["content"], thread_id=thread_id)
+        thread_id, msg = send_branch_message_fn(g, branch.id, mspec["content"],
+                                                thread_id=thread_id,
+                                                source=mspec.get("source"))
         rt.run_until_idle()
         cands = [x for x in g.objects(type="comm_response_candidate")
                  if x.data.get("message_id") == msg.id]

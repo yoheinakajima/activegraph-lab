@@ -4,6 +4,10 @@ description: |
   message saying "pause this branch" gets both a reply AND the status
   mutation — steering takes effect at event boundaries.
 
+  Also locks the ADR-016 invariant: the answer fires on operator AUTHORITY,
+  never on the literal metadata.source tag — operator, operator_via_mcp,
+  and any future operator_via_* surface all draw a reply.
+
 mission:
   title: Grow activegraph.ai's evidence base
   target_url: ""
@@ -31,8 +35,20 @@ messages:
     expect_stamp: true
     expect_mutation:
       status: active
+  - content: status check from the operator's own session
+    source: operator
+    expect_reply: true
+    expect_stamp: true
+  - content: status check from the operator's assistant over MCP
+    source: operator_via_mcp
+    expect_reply: true
+    expect_stamp: true
+  - content: status check from a hypothetical future operator surface
+    source: operator_via_email
+    expect_reply: true
+    expect_stamp: true
 
 expected_outputs:
   response_candidates:
-    count: 3
+    count: 6
   discusses_relation: true

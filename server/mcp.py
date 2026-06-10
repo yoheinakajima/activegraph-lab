@@ -103,8 +103,11 @@ TOOLS: list[dict] = [
         "name": "send_chat",
         "description": "Post a message into a branch's thread WITH OPERATOR "
                        "AUTHORITY. The message is public and tagged "
-                       "source=operator_via_mcp. Returns the lab's reply, its "
-                       "event-horizon stamp, and the event ids created.",
+                       "source=operator_via_mcp. Returns status=ok with the "
+                       "lab's reply, its event-horizon stamp, and the event "
+                       "ids created — or status=reply_pending with the "
+                       "message event ids when the message landed but the "
+                       "reply missed the bounded wait (poll get_branch).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -292,9 +295,16 @@ def _tool_failure(msg_id: Any, message: str) -> dict:
                                 "isError": True})
 
 
+# Bounded wait for the reply phase. The answer behavior's own LLM call is
+# capped at 60s; past this the message is still committed and the reply, if
+# it lands, is visible via get_branch — so the tool reports partial success
+# instead of a generic error.
+REPLY_WAIT_SECONDS = 60
+
+
 def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     from lab_pack.llm import reset_llm_run_counters
-    from server.lab_server import _chat_job
+    from server.lab_server import _chat_collect_reply, _chat_post_message
     branch_id = (args.get("branch_id") or "").strip()
     message = (args.get("message") or "").strip()
     if not branch_id or not message:
@@ -308,17 +318,42 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     if status == "archived":
         return _tool_failure(msg_id, f"branch {branch_id} is archived (not chat-able)")
     reset_llm_run_counters()
-    out = run_on_worker(
-        lambda rt: _chat_job(rt, branch_id, message, source="operator_via_mcp"))
-    if out is None:
+    posted = run_on_worker(
+        lambda rt: _chat_post_message(rt, branch_id, message,
+                                      source="operator_via_mcp"))
+    if posted is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
+    # The message is committed from here on: whatever happens to the reply
+    # phase, the tool result must say so (never a generic error).
+    try:
+        reply = run_on_worker(
+            lambda rt: _chat_collect_reply(rt, posted["message_id"]),
+            REPLY_WAIT_SECONDS)
+    except Exception:
+        import traceback
+        traceback.print_exc()  # details to stderr only (ADR-011)
+        reply = None
+    if reply is None:
+        return _tool_result(msg_id, {
+            "status": "reply_pending",
+            "detail": ("message delivered (event ids below); the reply has "
+                       "not landed within the bounded wait — poll get_branch "
+                       f"for {branch_id} to read it when it arrives"),
+            "branch_id": posted["branch_id"],
+            "thread_id": posted["thread_id"],
+            "message_id": posted["message_id"],
+            "message_event_ids": posted["message_event_ids"],
+        })
     return _tool_result(msg_id, {
-        "reply": out["content"],
-        "event_horizon": out.get("event_horizon"),
-        "branch_id": out["branch_id"],
-        "thread_id": out["thread_id"],
-        "message_id": out.get("message_id"),
-        "created_event_ids": out.get("created_event_ids") or [],
+        "status": "ok",
+        "reply": reply["content"],
+        "event_horizon": reply.get("event_horizon"),
+        "branch_id": posted["branch_id"],
+        "thread_id": posted["thread_id"],
+        "message_id": posted["message_id"],
+        "message_event_ids": posted["message_event_ids"],
+        "created_event_ids": posted["message_event_ids"]
+        + (reply.get("reply_event_ids") or []),
     })
 
 

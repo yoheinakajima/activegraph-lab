@@ -243,9 +243,12 @@ def main() -> int:
         s, _, out = call_tool(base, "send_chat",
                               {"branch_id": seed_branch.id,
                                "message": "what is the state of this branch?"})
-        check(s == 200 and out.get("reply") and "as of event" in out["reply"],
-              "send_chat returns the stamped reply")
+        check(s == 200 and out.get("status") == "ok"
+              and out.get("reply") and "as of event" in out["reply"],
+              "send_chat returns status=ok with the stamped reply")
         check(out.get("event_horizon") is not None, "event horizon returned")
+        check(len(out.get("message_event_ids", [])) >= 1,
+              f"message event ids returned ({len(out.get('message_event_ids', []))})")
         check(len(out.get("created_event_ids", [])) >= 1,
               f"created event ids returned ({len(out.get('created_event_ids', []))})")
         msg = rt.graph.get_object(out["message_id"])
@@ -254,6 +257,13 @@ def main() -> int:
               "comm_message tagged source=operator_via_mcp in the public log")
         check(msg is not None and msg.data.get("sender_ref") == "operator",
               "sender is the operator (no client-chosen identity)")
+        # ADR-016 invariant: the source tag is provenance, never an answer
+        # predicate — the via-MCP message drew exactly one lab.answer reply.
+        mcp_cands = [c for c in rt.graph.objects(type="comm_response_candidate")
+                     if str(c.data.get("message_id")) == str(out["message_id"])
+                     and c.data.get("created_by_behavior") == "lab.answer"]
+        check(len(mcp_cands) == 1,
+              f"operator_via_mcp message answered exactly once ({len(mcp_cands)})")
         s, _, br = call_tool(base, "get_branch", {"branch_id": seed_branch.id})
         check(any("(via MCP)" in e["sentence"] for e in br.get("entries", [])),
               "branch timeline interleaves the MCP chat, marked (via MCP)")
@@ -261,6 +271,43 @@ def main() -> int:
                               {"branch_id": "branch#999", "message": "hi"})
         check(isinstance(err, str) and "no such branch" in err,
               "send_chat validates the branch exists")
+
+        print("== send_chat reply timeout → structured partial, not a generic error ==")
+        # Simulate a stuck worker for the reply phase only: the bounded wait
+        # is the one call that passes an explicit timeout, so key on that.
+        real_row = lab_server._run_on_worker
+        def stuck_reply(fn, timeout=180):
+            if timeout != 180:
+                raise TimeoutError("simulated: runtime worker did not finish in time")
+            return real_row(fn, timeout)
+        lab_server._run_on_worker = stuck_reply
+        try:
+            s, _, out = call_tool(base, "send_chat",
+                                  {"branch_id": seed_branch.id,
+                                   "message": "does the timeout path stay structured?"})
+        finally:
+            lab_server._run_on_worker = real_row
+        check(s == 200 and isinstance(out, dict)
+              and out.get("status") == "reply_pending",
+              f"timed-out reply → structured partial success ({out.get('status') if isinstance(out, dict) else out})")
+        check(len(out.get("message_event_ids", [])) >= 1,
+              "partial carries the committed message event ids")
+        check("get_branch" in (out.get("detail") or ""),
+              "partial tells the caller to poll get_branch")
+        pending_msg_id = out.get("message_id")
+        check(rt.graph.get_object(pending_msg_id) is not None,
+              "the message itself DID land in the log")
+        # Drain the runtime (the worker finishing late) — the reply arrives,
+        # exactly once: re-triggering must not double-fire the answer.
+        rt.run_until_idle()
+        late = [c for c in rt.graph.objects(type="comm_response_candidate")
+                if str(c.data.get("message_id")) == str(pending_msg_id)
+                and c.data.get("created_by_behavior") == "lab.answer"]
+        check(len(late) == 1,
+              f"late reply lands exactly once after the drain ({len(late)})")
+        s, _, br = call_tool(base, "get_branch", {"branch_id": seed_branch.id})
+        check(any("timeout path" in e["sentence"] for e in br.get("entries", [])),
+              "get_branch shows the pending message (the advertised poll path)")
 
         print("== rate limiter shared with the rest of the server ==")
         import time
