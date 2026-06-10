@@ -146,6 +146,52 @@ def _seed_upstream_friction(graph, mission_id: str, branch_id: str) -> None:
         "metadata": {"lab": "upstream_issue", "repo": "activegraph-packs"},
     })
     graph.add_relation(branch_id, artifact.id, "produced")
+    _seed_findings(graph, mission_id, branch_id, friction_obs_id=obs.id,
+                   issue_artifact_id=artifact.id)
+
+
+def _seed_findings(graph, mission_id: str, branch_id: str, *,
+                   friction_obs_id: str, issue_artifact_id: str) -> None:
+    """B3: the build already produced three findings worth writing up.
+    Tagging them metadata.finding=true makes them draft_writer fuel — each
+    yields a blog_draft artifact + a pending publish decision (gated)."""
+    findings = [
+        (
+            "Finding: the activegraph-packs repo is split on add_relation "
+            "argument order — core/research/tool_gateway write the relation "
+            "type into the `source` field while chat follows the real "
+            "(source, target, type) signature. View traversal only follows "
+            "signature-order relations, so the encodings are not equivalent. "
+            "The lab writes signature-order and decodes both (ADR-008).",
+            [friction_obs_id, issue_artifact_id],
+        ),
+        (
+            "Finding: emergent work dispatch hit a real capability gap — at "
+            "pin da2bca77, no research or codebase pack behavior reacts to "
+            "core task objects; only team_ops watches tasks. Every lab "
+            "dispatch therefore records a capability-gap observation, which "
+            "is the honest state of the worker ecosystem, not an error.",
+            [],
+        ),
+        (
+            "Finding: cross-repo entry-point discovery works — pip-installing "
+            "activegraph-packs from a pinned git SHA exposes all 17 packs via "
+            "activegraph.packs discover()/load_by_name, and this lab's own "
+            "pack registers the same way from a separate repo. The lab is the "
+            "first external consumer of the packs conventions.",
+            [],
+        ),
+    ]
+    for text, extra_refs in findings:
+        f = graph.add_object("observation", {
+            "text": text,
+            "confidence": 0.9,
+            "category": "fact",
+            "metadata": {"lab": "finding", "finding": True,
+                         "lab_branch_id": branch_id, "mission_id": mission_id,
+                         "evidence_refs": extra_refs},
+        })
+        graph.add_relation(branch_id, f.id, "supported_by")
 
 
 def load_lab_packs(

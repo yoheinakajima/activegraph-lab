@@ -283,6 +283,96 @@ def run_capability_gap() -> bool:
     return c.done("capability_gap")
 
 
+def run_draft_writer() -> bool:
+    spec = _load("draft_writer.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: draft_writer — finding → draft + pending decision → approve AND reject")
+    print("=" * 64)
+
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="lab-drafts-"))
+    settings = dict(spec.get("settings") or {})
+    settings["drafts_dir"] = str(tmp)
+
+    clear_lab_registry()
+    rt = Runtime(Graph(), llm_provider=LabMockProvider())
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    g = rt.graph
+
+    m = spec["mission"]
+    mission = create_mission_fn(g, m["title"], target_url=m.get("target_url", ""))
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"],
+                              status=bspec.get("status_after_create", "active"))
+    rt.run_until_idle()
+
+    c = Check()
+    results: dict[str, dict] = {}
+    for fspec in spec["findings"]:
+        f = g.add_object("observation", {
+            "text": fspec["text"], "confidence": 0.9, "category": "fact",
+            "metadata": {"lab": "finding", "finding": True,
+                         "lab_branch_id": branch.id, "evidence_refs": []},
+        })
+        g.add_relation(branch.id, f.id, "supported_by")
+        rt.run_until_idle()
+        artifact = next((a for a in g.objects(type="artifact")
+                         if (a.data.get("metadata") or {}).get("finding_id") == f.id), None)
+        c.that(artifact is not None, f"{fspec['key']}: no blog_draft artifact created")
+        if artifact is None:
+            continue
+        c.that(artifact.data.get("status") == "draft",
+               f"{fspec['key']}: artifact not gated as draft pre-decision")
+        decision = next((d for d in g.objects(type="decision")
+                         if d.data.get("subject_ref") == artifact.id
+                         and d.data.get("status") == "pending"), None)
+        c.that(decision is not None, f"{fspec['key']}: no pending publish decision")
+        if decision is None:
+            continue
+        approve_decision_fn(g, decision.id, fspec["resolution"] == "approve",
+                            f"fixture: {fspec['resolution']}")
+        rt.run_until_idle()
+        final = g.get_object(artifact.id).data.get("status")
+        c.that(final == fspec["expected_artifact_status"],
+               f"{fspec['key']}: expected {fspec['expected_artifact_status']}, got {final}")
+        slug = (artifact.data.get("metadata") or {}).get("slug")
+        path = tmp / f"{slug}.md"
+        c.that(path.exists(), f"{fspec['key']}: mirror file missing")
+        if fspec.get("expect_rejected_header"):
+            c.that(path.read_text().startswith("REJECTED"),
+                   f"{fspec['key']}: rejected mirror lacks REJECTED header")
+        results[fspec["key"]] = {"artifact": artifact, "status": final, "slug": slug}
+        print(f"  {fspec['key']}: draft → decision {fspec['resolution']} → {final} ({slug}.md)")
+
+    exp = spec["expected_outputs"]
+    drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
+    c.that(len(drafts) == exp["blog_draft_artifacts"]["count"],
+           f"expected {exp['blog_draft_artifacts']['count']} drafts, got {len(drafts)}")
+    body_req = exp["blog_draft_artifacts"]["body_requirements"]
+    for a in drafts:
+        body = a.data.get("content") or ""
+        if body_req.get("footnotes"):
+            c.that("[^" in body, f"draft {a.id} has no footnotes")
+        if body_req.get("provenance_block"):
+            c.that("*Provenance:*" in body and "as of event" in body,
+                   f"draft {a.id} missing provenance block")
+        for section in body_req.get("sections", []):
+            c.that(section in body, f"draft {a.id} missing section '{section}'")
+    pubs = [d for d in g.objects(type="decision") if d.data.get("kind") == "publish"]
+    c.that(len(pubs) == exp["publish_decisions"]["count"],
+           f"expected {exp['publish_decisions']['count']} publish decisions, got {len(pubs)}")
+    files = list(tmp.glob("*.md"))
+    c.that(len(files) == exp["mirror_files"]["count"],
+           f"expected {exp['mirror_files']['count']} mirror files, got {len(files)}")
+    if exp.get("no_unapproved_publish"):
+        bad = [a.id for a in drafts if a.data.get("status") == "published"
+               and not any(d.data.get("subject_ref") == a.id and d.data.get("status") == "approved"
+                           for d in pubs)]
+        c.that(not bad, f"artifacts published without approved decision: {bad}")
+    return c.done("draft_writer")
+
+
 def run_compat_regression() -> bool:
     """ADR-008: decode_relation must handle both add_relation call conventions."""
     print("\n" + "=" * 64)
@@ -318,6 +408,7 @@ def run_all() -> None:
         run_branch_lifecycle(),
         run_thread_equals_branch(),
         run_capability_gap(),
+        run_draft_writer(),
         run_compat_regression(),
     ]
     passed = sum(results)

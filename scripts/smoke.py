@@ -122,6 +122,21 @@ def main() -> int:
     check(len(cands) == 1 and "as of event" in cands[0].data.get("content", ""),
           "stamped answer produced")
 
+    print("== draft_writer: seeded findings -> drafts + gated publish decisions ==")
+    drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
+    pub_pending = [d for d in g.objects(type="decision")
+                   if d.data.get("kind") == "publish" and d.data.get("status") == "pending"]
+    check(len(drafts) >= 3, f"blog drafts from seeded findings ({len(drafts)})")
+    check(all(a.data.get("status") == "draft" for a in drafts),
+          "every draft is gated (status=draft, nothing published)")
+    check(len(pub_pending) >= 3, f"publish decisions pending ({len(pub_pending)})")
+    check(all("[^" in (a.data.get("content") or "") for a in drafts),
+          "every draft carries evidence footnotes")
+    check(all("*Provenance:*" in (a.data.get("content") or "") for a in drafts),
+          "every draft carries a provenance block")
+    files = list(Path(settings.drafts_dir).glob("*.md"))
+    check(len(files) >= 3, f"drafts mirrored to disk ({len(files)})")
+
     main_run_llm_calls = llm_usage()["total"]
 
     print("== budget-exhausted path ==")

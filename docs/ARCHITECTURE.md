@@ -14,13 +14,14 @@ Relation call convention: this repo writes relations per the actual `Graph.add_r
 
 ## Behaviors
 
-Six small reactive behaviors, no orchestrator:
+Seven small reactive behaviors, no orchestrator:
 
 - `ingest` — on mission.created or source-request events: fetch target_url and same-domain links through tool_gateway (registering a `fetch_url` capability if absent), create core sources, then observations for extracted claims. Depth ≤ 2, page cap ≤ 30, a progress event per page.
 - `plan` — llm_behavior. On new observations under a mission: identify weakly evidenced claims, create proposed branch objects. Reasoning is narrated in the event payload, never scored by formula.
 - `work` — on branch.status → active: create core tasks with routing tags. If no pack reacts within a bounded window, record the capability gap as an observation — a gap is evidence, not an error.
 - `interpret` — llm_behavior. On task completion/failure under a lab branch: write a summary observation, link evidence, set the branch to decided or propose follow-ups.
-- `gate` — on decision.created (pending): emit an approval-request event. Nothing publishes or self-modifies without an approved decision. No exceptions, including fixtures.
+- `gate` — on decision.created (pending): emit an approval-request event. Nothing publishes or self-modifies without an approved decision. No exceptions, including fixtures. When an approved promote decision lands on a branch with ≥2 evidence objects, gate also emits a finding observation — draft_writer's trigger.
+- `draft_writer` — llm_behavior. On finding-tagged observations: write a core artifact (kind=blog_draft, markdown with evidence footnotes, claims-coverage review note, provenance block), mirror it to drafts/<slug>.md (graph copy canonical), and open a pending publish decision. OPEN: spec asked rejected drafts to become status `archived`, but the core artifact enum has no such value and core is not ours to change (ADR-005) — rejected drafts map to `rejected` plus a REJECTED header on the mirror file.
 - `answer` — llm_behavior, active only when communication is loaded. On message intents in threads that discuss a branch: answer from current graph state, stamp the event horizon, include provenance refs. Steering messages also write the corresponding object mutation.
 
 ## Event taxonomy

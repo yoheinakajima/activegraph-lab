@@ -76,8 +76,15 @@ decision.created (pending)
 decision → approved/rejected (owner, via API/UI/steering)
   → gate
       promote: branch → decided / archived
-      publish: artifact → published / rejected
+        decided with ≥2 evidence → observation(finding)   ← draft_writer fuel
+      publish: artifact → published / rejected (+ REJECTED header on mirror)
       artifact published without approval → reverted + violation observation
+
+observation.created (metadata.finding=true)
+  → draft_writer (llm)
+      creates artifact(blog_draft: footnoted markdown + coverage review note
+        + provenance block), mirrored to drafts/<slug>.md (graph canonical)
+      creates decision(publish, pending) — the gate does the rest
 
 comm_message.created (channel=lab, inbound)
   → answer (llm)

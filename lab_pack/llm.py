@@ -62,6 +62,24 @@ class AnswerReply(BaseModel):
     reply: str = Field(description="The reply to the user's message, grounded in graph state.")
 
 
+class BlogDraft(BaseModel):
+    """Structured output for the draft_writer behavior."""
+
+    title: str = Field(description="Post title, plain and specific. No hype.")
+    slug: str = Field(
+        default="",
+        description="URL slug (lowercase, hyphens). Derived from the title if empty.",
+    )
+    body_markdown: str = Field(
+        description=(
+            "The post body in markdown, 400-900 words, per the draft contract: "
+            "every factual claim cites evidence by object/event id as a "
+            "footnote; structure = what we tried / what happened / what it "
+            "means / what's next; first person singular; failures are findings."
+        ),
+    )
+
+
 # ---------------------------------------------------------------- mock provider
 
 
@@ -69,7 +87,7 @@ def _extract_field(messages: list, field: str) -> str:
     """Pull a JSON string field (e.g. the triggering observation's text) out of
     the serialized prompt. Best-effort; used only to make mock output distinct."""
     blob = " ".join(str(getattr(m, "content", m)) for m in messages)
-    found = re.findall(r'"%s":\s*"([^"]{10,200}?)"' % field, blob)
+    found = re.findall(r'"%s":\s*"([^"]{10,600}?)"' % field, blob)
     return found[-1] if found else ""
 
 
@@ -130,6 +148,31 @@ class LabMockProvider:
                     "from current graph state for the branch this thread discusses"
                     + (f", in response to: '{asked[:120]}'" if asked else "")
                     + ". Set OPENAI_API_KEY or ANTHROPIC_API_KEY for live answers."
+                ),
+            )
+        elif name == "BlogDraft":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            refs = re.findall(r"\b(?:observation|evaluation|task|branch)#\d+", blob)
+            seen: list[str] = []
+            for r_ in refs:
+                if r_ not in seen:
+                    seen.append(r_)
+            ev = seen[:3] or [f"evidence-{digest}"]
+            finding = _extract_field(messages, "text") or f"a finding ({digest})"
+            footnotes = "\n".join(f"[^{i+1}]: {e}" for i, e in enumerate(ev))
+            cites = "".join(f"[^{i+1}]" for i in range(len(ev)))
+            parsed = BlogDraft(
+                title=f"Lab note: {finding[:60].rstrip('. ')}",
+                slug=f"lab-note-{digest}",
+                body_markdown=(
+                    f"## What I tried\n\nI followed the mission's loop on this finding: "
+                    f"{finding[:200]}{cites}\n\n"
+                    f"## What happened\n\nThe runtime recorded the outcome as graph "
+                    f"objects, linked below as footnotes.{cites}\n\n"
+                    f"## What it means\n\nThe evidence base grew by exactly what the "
+                    f"footnoted objects assert — no more.{cites}\n\n"
+                    f"## What's next\n\nA follow-up branch can deepen any footnote "
+                    f"that looks thin. [mock draft {digest}]\n\n{footnotes}\n"
                 ),
             )
         else:

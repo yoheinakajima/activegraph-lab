@@ -100,6 +100,15 @@ def _rebuild_lab_registries(rt) -> None:
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
             lb._EVALUATED.add(meta["task_id"])
+    for a in g.objects(type="artifact"):
+        meta = a.data.get("metadata") or {}
+        if meta.get("lab") == "blog_draft":
+            if meta.get("slug"):
+                lb._SLUGS.add(meta["slug"])
+            if meta.get("finding_id"):
+                lb._DRAFTED_OBS.add(meta["finding_id"])
+            if meta.get("lab_branch_id"):
+                lb._FINDING_EMITTED.add(meta["lab_branch_id"])
     for r in g.relations():
         rel_type, src, tgt = _decode_relation(r)
         if rel_type == "discusses":
@@ -202,8 +211,30 @@ def _branch_of_object(g, obj_type: str, data: dict, obj_id: str) -> Optional[str
     return None
 
 
+# One-sentence templates per lab observation kind (C2). Anything lab-tagged
+# but unmatched falls through to the generic template — nothing renders blank.
+_OBS_TEMPLATES = {
+    "site_claim":       lambda d, m: f"Noticed a claim on {m.get('url')}: “{_shorten(d.get('text'), 120)}”",
+    "capability_gap":   lambda d, m: _shorten(d.get("text"), 160),
+    "interpretation":   lambda d, m: f"Interpreted the results: {_shorten(d.get('text'), 130)}",
+    "gate_violation":   lambda d, m: _shorten(d.get("text"), 160),
+    "fetch_failure":    lambda d, m: (f"Couldn't fetch {m.get('url')} "
+                                      f"(status {m.get('status')}) — recorded as evidence."),
+    "stall":            lambda d, m: _shorten(d.get("text"), 160),
+    "llm_budget":       lambda d, m: f"LLM budget exhausted — stopping model calls cleanly. {_shorten(d.get('text'), 90)}",
+    "llm_parse_failure": lambda d, m: (f"Model output didn't parse in "
+                                       f"{m.get('behavior') or 'a behavior'} — salvaged what I could, raw output kept."),
+    "finding":          lambda d, m: f"Logged a finding: “{_shorten(d.get('text'), 140)}”",
+    "upstream_friction": lambda d, m: f"Recorded upstream friction: “{_shorten(d.get('text'), 130)}”",
+    "draft_mirror_failure": lambda d, m: _shorten(d.get("text"), 140),
+    "synthetic_crawl":  lambda d, m: _shorten(d.get("text"), 160),
+}
+
+
 def _narrate_created(g, obj_type: str, data: dict, obj_id: str) -> Optional[str]:
-    """One human sentence per event, template-based (LLM narration deferred)."""
+    """One human sentence per event, template-based (LLM narration deferred).
+    Every lab-emitted event type has a template; lab-tagged objects with an
+    unknown kind hit the fallback so nothing renders blank."""
     meta = data.get("metadata") or {}
     if obj_type == "mission":
         return f"Mission started: {data.get('title')} — target {data.get('target_url')}."
@@ -214,15 +245,16 @@ def _narrate_created(g, obj_type: str, data: dict, obj_id: str) -> Optional[str]
         return (f"Approval requested ({data.get('kind')}): {_shorten(data.get('rationale') or '', 110)}")
     if obj_type == "observation":
         kind = meta.get("lab")
-        if kind == "site_claim":
-            return f"Noticed a claim on {meta.get('url')}: “{_shorten(data.get('text'), 120)}”"
-        if kind == "capability_gap":
-            return _shorten(data.get("text"), 160)
-        if kind == "interpretation":
-            return f"Interpreted the results: {_shorten(data.get('text'), 130)}"
-        if kind == "gate_violation":
-            return _shorten(data.get("text"), 160)
+        if kind in _OBS_TEMPLATES:
+            return _OBS_TEMPLATES[kind](data, meta)
+        if kind:  # lab-tagged but unknown — fallback, never blank
+            return f"Recorded {kind.replace('_', ' ')}: “{_shorten(data.get('text'), 130)}”"
         return None  # generic core observations stay off the feed
+    if obj_type == "artifact" and meta.get("lab") == "blog_draft":
+        return (f"Drafted a blog post: “{data.get('title')}” ({meta.get('slug')}.md) "
+                "— publish approval pending.")
+    if obj_type == "artifact" and meta.get("lab") == "upstream_issue":
+        return f"Drafted an upstream issue: “{data.get('title')}” (publishing gated)."
     if obj_type == "task" and meta.get("lab_branch_id"):
         routing = meta.get("routing") or {}
         return (f"Dispatched work: “{data.get('title')}” "
@@ -237,6 +269,8 @@ def _narrate_created(g, obj_type: str, data: dict, obj_id: str) -> Optional[str]
         cap = (data.get("metadata") or {}).get("capability")
         if cap == "fetch_url":
             return "Fetched a page from the mission site."
+    if obj_type == "source" and data.get("kind") == "crawl_request":
+        return f"Crawl requested for {data.get('url') or data.get('content')}."
     return None
 
 
@@ -249,6 +283,11 @@ def _narrate_patch(g, obj, diff: dict) -> Optional[str]:
     if obj.type == "task" and status.get("new") in ("done", "rejected", "blocked"):
         word = {"done": "completed", "rejected": "failed", "blocked": "blocked"}[status["new"]]
         return f"Task “{obj.data.get('title')}” {word}."
+    if obj.type == "artifact" and status.get("new") in ("published", "rejected", "proposed"):
+        word = {"published": "published (decision approved)",
+                "rejected": "rejected — file kept for the record",
+                "proposed": "reverted to proposed (gate)"}[status["new"]]
+        return f"Draft “{obj.data.get('title')}” {word}."
     if obj.type == "mission" and "metadata" in diff:
         crawl = (obj.data.get("metadata") or {}).get("crawl") or {}
         if crawl:
@@ -279,12 +318,25 @@ def _feed(rt) -> dict:
                 sentence = _narrate_patch(g, obj, e.payload.get("diff") or {})
                 branch_id = _branch_of_object(g, str(obj.type), obj.data, str(obj.id))
         if sentence:
-            entries.append({
+            entry = {
                 "event_id": str(e.id),
                 "timestamp": str(e.timestamp) if e.timestamp else None,
                 "branch_id": branch_id,
                 "sentence": sentence,
-            })
+            }
+            # B4: blog drafts carry a preview snippet + link into the thread view.
+            if e.type == "object.created":
+                obj = e.payload.get("object", {}) or {}
+                data = obj.get("data", {}) or {}
+                if (data.get("metadata") or {}).get("lab") == "blog_draft":
+                    body = data.get("content") or ""
+                    entry["artifact"] = {
+                        "id": obj.get("id"),
+                        "slug": (data.get("metadata") or {}).get("slug"),
+                        "title": data.get("title"),
+                        "preview": _shorten(body.split("##", 1)[-1], 220),
+                    }
+            entries.append(entry)
 
     # The inbox: pending decisions with their evidence attached inline.
     inbox = []
@@ -390,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
                     rt = _get_rt_unlocked()
                     check_stalls(rt)  # A5: stalled work is released, never hangs silently
                     self._send_json(_feed(rt))
+            elif path == "/lab/draft":
+                self._handle_draft(qs)
             elif path == "/graph":
                 self._handle_graph()
             elif path == "/trace":
@@ -422,6 +476,31 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             self._send_error_json(str(e), 500)
+
+    # ── GET /lab/draft?slug= ────────────────────────────────────────────────
+
+    def _handle_draft(self, qs: dict):
+        """Serve a blog_draft artifact's markdown. The graph copy is canonical
+        (the drafts/ file is a mirror), so this reads from the graph."""
+        rt = _get_rt()
+        slug = qs.get("slug")
+        if not slug:
+            self._send_error_json("slug is required", 400)
+            return
+        with _lock:
+            match = next((a for a in rt.graph.objects(type="artifact")
+                          if (a.data.get("metadata") or {}).get("slug") == slug), None)
+            if match is None:
+                self._send_error_json(f"no draft with slug: {slug}", 404)
+                return
+            body = (match.data.get("content") or "").encode()
+            status = match.data.get("status")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("X-Draft-Status", str(status))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # ── GET /graph ──────────────────────────────────────────────────────────
 

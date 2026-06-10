@@ -54,10 +54,12 @@ from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
 from .llm import (
     AnswerReply,
+    BlogDraft,
     InterpretSummary,
     PlanProposal,
     consume_llm_anomalies,
     is_inert,
+    llm_usage,
 )
 from .settings import LabSettings
 
@@ -77,6 +79,9 @@ _PENDING_BY_SUBJECT: dict[str, str] = {}
 _APPLIED_DECISIONS: set[str] = set()
 _APPROVED_PUBLISH: set[str] = set()
 _THREAD_TO_BRANCH: dict[str, str] = {}
+_DRAFTED_OBS: set[str] = set()
+_FINDING_EMITTED: set[str] = set()
+_SLUGS: set[str] = set()
 
 
 def clear_lab_registry() -> None:
@@ -93,6 +98,9 @@ def clear_lab_registry() -> None:
     _APPLIED_DECISIONS.clear()
     _APPROVED_PUBLISH.clear()
     _THREAD_TO_BRANCH.clear()
+    _DRAFTED_OBS.clear()
+    _FINDING_EMITTED.clear()
+    _SLUGS.clear()
 
 
 def _now() -> str:
@@ -625,7 +633,71 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
 # ---------------------------------------------------------------- gate
 
 
-def _apply_decision(graph, decision_id: str, data: dict) -> None:
+def _branch_evidence_ids(graph, branch_id: str) -> list[str]:
+    """Evidence objects linked supported_by to a branch (ADR-008 decode)."""
+    from .compat import decode_relation
+    out = []
+    try:
+        for r in graph.relations():
+            rel_type, src, tgt = decode_relation(r)
+            if rel_type == "supported_by" and src == branch_id:
+                out.append(tgt)
+    except Exception:
+        pass
+    return out
+
+
+def _emit_branch_finding(graph, branch_id: str, decision_id: str, rationale: str) -> None:
+    """A decided branch with >=2 evidence objects is a finding — draft_writer's
+    trigger. Emitting it here keeps draft_writer on a single trigger path
+    (observation.created with metadata.finding) instead of also pattern-matching
+    branch patches, which would fire its LLM call on every patch event."""
+    if branch_id in _FINDING_EMITTED:
+        return
+    evidence = _branch_evidence_ids(graph, branch_id)
+    if len(evidence) < 2:
+        return
+    _FINDING_EMITTED.add(branch_id)
+    branch = graph.get_object(branch_id)
+    title = branch.data.get("title") if branch else branch_id
+    obs = graph.add_object("observation", {
+        "text": (f"Finding: branch '{title}' decided. {rationale[:300]}"),
+        "confidence": 0.9,
+        "category": "fact",
+        "metadata": {"lab": "finding", "finding": True,
+                     "lab_branch_id": branch_id,
+                     "decision_id": decision_id,
+                     "evidence_refs": evidence},
+    })
+    graph.add_relation(branch_id, obs.id, "supported_by")
+
+
+def _mirror_path(settings: LabSettings, slug: str) -> Path:
+    return Path(settings.drafts_dir) / f"{slug}.md"
+
+
+def _mark_draft_rejected(graph, artifact_id: str, settings: LabSettings) -> None:
+    """Rejected drafts keep their mirror file, prefixed with a REJECTED header.
+    OPEN (docs/ARCHITECTURE.md): spec wanted artifact status 'archived', but the
+    core artifact enum has no such value and core is not ours to change
+    (ADR-005) — 'rejected' is the conservative mapping."""
+    artifact = graph.get_object(artifact_id)
+    if artifact is None:
+        return
+    slug = (artifact.data.get("metadata") or {}).get("slug")
+    if not slug:
+        return
+    try:
+        path = _mirror_path(settings, slug)
+        if path.exists():
+            body = path.read_text()
+            if not body.startswith("REJECTED"):
+                path.write_text(f"REJECTED — publish decision rejected; kept for the record.\n\n{body}")
+    except OSError:
+        pass
+
+
+def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) -> None:
     if decision_id in _APPLIED_DECISIONS:
         return
     _APPLIED_DECISIONS.add(decision_id)
@@ -646,6 +718,8 @@ def _apply_decision(graph, decision_id: str, data: dict) -> None:
             })
         except Exception:
             pass
+        if status == "approved":
+            _emit_branch_finding(graph, subject, decision_id, data.get("rationale") or "")
     elif kind == "publish" and subject:
         if status == "approved":
             _APPROVED_PUBLISH.add(subject)
@@ -658,6 +732,7 @@ def _apply_decision(graph, decision_id: str, data: dict) -> None:
                 graph.patch_object(subject, {"status": "rejected"})
             except Exception:
                 pass
+            _mark_draft_rejected(graph, subject, settings)
     # schema_change / dependency_pin / other: the record itself is the outcome;
     # humans act on it outside the runtime (e.g. bump the pin in pyproject).
 
@@ -703,7 +778,7 @@ def gate(event, graph, ctx, *, settings: LabSettings):
     if obj.type == "decision":
         new_status = (diff.get("status") or {}).get("new")
         if new_status in ("approved", "rejected"):
-            _apply_decision(graph, target, obj.data)
+            _apply_decision(graph, target, obj.data, settings)
         return
 
     if obj.type == "artifact":
@@ -722,6 +797,164 @@ def _revert_unapproved_publish(graph, artifact_id: str) -> None:
         "confidence": 1.0,
         "category": "risk",
         "metadata": {"lab": "gate_violation", "artifact_id": artifact_id},
+    })
+
+
+# ---------------------------------------------------------------- draft_writer
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "draft").lower()).strip("-")[:60] or "draft"
+    base, n = slug, 2
+    while slug in _SLUGS:
+        slug = f"{base}-{n}"
+        n += 1
+    _SLUGS.add(slug)
+    return slug
+
+
+_FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
+
+
+def _coverage_review(body: str) -> Optional[str]:
+    """Claims-coverage check (draft contract): any substantive paragraph with
+    zero evidence refs gets flagged in a review note — never silently accepted."""
+    flagged = []
+    for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
+        if not para or para.startswith("#") or para.startswith("[^"):
+            continue
+        if len(para) < 80:
+            continue  # headings, transitions — not claims
+        if not _FOOTNOTE_RE.search(para):
+            flagged.append(i + 1)
+    if not flagged:
+        return None
+    return (
+        "\n\n> **Review note (claims coverage):** paragraph(s) "
+        + ", ".join(map(str, flagged))
+        + " carry no evidence footnotes. Verify or cut before approving."
+    )
+
+
+@llm_behavior(
+    name="draft_writer",
+    on=["object.created"],
+    where={"object.type": "observation", "object.data.metadata.finding": True},
+    description=_PROMPTS["draft_writer"],
+    output_schema=BlogDraft,
+    model=None,
+    view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
+    creates=["artifact", "decision"],
+    temperature=0.4,
+    max_tokens=4096,
+    tools=[],
+)
+def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
+    """Turn a finding into a blog post draft + a gated publish decision.
+
+    On: object.created (observation, metadata.finding=true). Branch-decided
+    findings arrive on this same trigger because gate emits a finding
+    observation when an approved promote decision lands on a branch with >=2
+    evidence objects (see _emit_branch_finding).
+
+    Creates: artifact (kind=blog_draft, status=draft, mirrored to
+    drafts/<slug>.md — the graph copy is canonical) + produced relation +
+    decision (kind=publish, status=pending). The gate does the rest: NOTHING
+    publishes without an approved decision.
+
+    Post-generation: claims-coverage check appends a review note for any
+    paragraph without evidence footnotes; a provenance block (branch,
+    evidence, event horizon, model, crawl mode) is always appended.
+    """
+    consume_llm_anomalies(graph)
+    obj = event.payload.get("object", {})
+    obs_id = obj.get("id")
+    data = obj.get("data", {})
+    meta = data.get("metadata") or {}
+
+    if not obs_id or obs_id in _DRAFTED_OBS:
+        return
+    _DRAFTED_OBS.add(obs_id)
+
+    if out is None or is_inert(getattr(out, "title", None)):
+        return
+    body = (getattr(out, "body_markdown", None) or "").strip()
+    if not body:
+        return
+
+    branch_id = meta.get("lab_branch_id")
+    evidence = list(meta.get("evidence_refs") or [])
+    if obs_id not in evidence:
+        evidence.append(obs_id)
+    evidence += [s for s in (data.get("source_ids") or []) if s not in evidence]
+
+    title = (out.title or "Untitled lab note").strip()
+    slug = _slugify(out.slug or title)
+
+    review = _coverage_review(body)
+    if review:
+        body += review
+
+    mission_meta = {}
+    mission = None
+    if branch_id:
+        b = graph.get_object(branch_id)
+        if b is not None and b.data.get("mission_id"):
+            mission = graph.get_object(b.data["mission_id"])
+    if mission is None:
+        missions = [m for m in [graph.get_object(meta.get("mission_id"))] if m] \
+            if meta.get("mission_id") else []
+        mission = missions[0] if missions else None
+    if mission is not None:
+        mission_meta = mission.data.get("metadata") or {}
+
+    crawl_mode = mission_meta.get("crawl_mode", "live")
+    model = llm_usage().get("last_model") or "mock"
+    provenance = (
+        "\n\n---\n"
+        "*Provenance:* "
+        f"branch `{branch_id or 'mission-level'}` · "
+        f"evidence {', '.join(f'`{e}`' for e in evidence)} · "
+        f"as of event `{event.id}` · "
+        f"model `{model}` · "
+        f"crawl `{crawl_mode}`"
+        + ("\n\n*Note: this run crawled a synthetic snapshot, not the live "
+           "site — treat site claims accordingly.*" if crawl_mode == "synthetic" else "")
+    )
+    content = f"# {title}\n\n{body}{provenance}\n"
+
+    artifact = graph.add_object("artifact", {
+        "kind": "blog_draft",
+        "title": title,
+        "content": content,
+        "format": "markdown",
+        "status": "draft",
+        "observation_ids": evidence,
+        "metadata": {"lab": "blog_draft", "slug": slug,
+                     "lab_branch_id": branch_id, "finding_id": obs_id},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, artifact.id, "produced")
+
+    # Mirror for easy reading; failure is recorded, never fatal.
+    try:
+        path = _mirror_path(settings, slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    except OSError as exc:
+        graph.add_object("observation", {
+            "text": f"Draft mirror write failed for {slug}: {exc}",
+            "confidence": 1.0, "category": "risk",
+            "metadata": {"lab": "draft_mirror_failure", "artifact_id": artifact.id},
+        })
+
+    graph.add_object("decision", {
+        "subject_ref": artifact.id,
+        "kind": "publish",
+        "status": "pending",
+        "rationale": f"Publish blog draft '{title}' ({slug}.md).",
+        "evidence_refs": evidence,
+        "metadata": {"requested_by": "lab.draft_writer", "lab_branch_id": branch_id},
     })
 
 
@@ -846,4 +1079,4 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
 
 
 # Registration order is execution order within an event batch.
-BEHAVIORS = [ingest, plan, work, interpret, gate, answer]
+BEHAVIORS = [ingest, plan, work, interpret, gate, draft_writer, answer]
