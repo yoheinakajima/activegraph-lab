@@ -1,0 +1,26 @@
+description: |
+  Operator controls (ADR-015, Phase 6): a global pause and a daily cost
+  ceiling, both persisted as marker events and rebuilt from the log.
+  Paused: every LLM behavior except answer idles, recording ONE
+  behavior-skipped observation per behavior per pause episode (never one
+  per event); the operator can still talk to the lab. Resume: behaviors
+  fire again. Cost cap: spend is summed from the cost_usd on llm.responded
+  events, so blocked-by-cost is restart-proof — bouncing the process cannot
+  reset the meter.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+cost_cap_usd: 2.00
+synthetic_spend: "9.50"
+
+expected_outputs:
+  paused_plan_skips: 1        # one observation for two skipped triggers
+  paused_answer_replies: true
+  resumed_branches: 1
+  cost_blocked_observations: 1

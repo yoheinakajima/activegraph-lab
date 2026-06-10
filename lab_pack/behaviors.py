@@ -87,6 +87,17 @@ _THREAD_TO_BRANCH: dict[str, str] = {}
 _DRAFTED_OBS: set[str] = set()
 _FINDING_EMITTED: set[str] = set()
 _SLUGS: set[str] = set()
+_PUBLISHED_SLUGS: set[str] = set()
+# Editorial machinery (ADR-014): the finding queue and its bookkeeping.
+_QUEUED_FINDINGS: dict[str, dict] = {}   # finding obs id → provenance context (5a)
+_COVERED_FINDINGS: set[str] = set()      # findings a draft request already covers
+_RESEARCH_REQUESTED: set[str] = set()    # branch ids with a research request
+_DECIDED_THIN: list[str] = []            # decided branches below the evidence bar
+_PENDING_PUBLISH: set[str] = set()       # pending publish decision ids (cap)
+_IDLE_LOGGED: dict[str, bool] = {"capped": False}  # one idle obs per cap episode
+_BRANCH_EVIDENCE: dict[str, list[str]] = {}  # branch id → supported_by targets
+# (BehaviorGraph has no relation iteration, so evidence counting inside
+# behaviors goes through this registry, fed by relation.created events.)
 
 
 def clear_lab_registry() -> None:
@@ -106,6 +117,15 @@ def clear_lab_registry() -> None:
     _DRAFTED_OBS.clear()
     _FINDING_EMITTED.clear()
     _SLUGS.clear()
+    _PUBLISHED_SLUGS.clear()
+    _QUEUED_FINDINGS.clear()
+    _COVERED_FINDINGS.clear()
+    _OBS_PROVENANCE.clear()
+    _BRANCH_EVIDENCE.clear()
+    _RESEARCH_REQUESTED.clear()
+    _DECIDED_THIN.clear()
+    _PENDING_PUBLISH.clear()
+    _IDLE_LOGGED["capped"] = False
     clear_seam_cache()
     # Seam hot-loads mutate live behavior descriptions; restore file defaults
     # so fixture runs are isolated from each other.
@@ -120,6 +140,28 @@ def clear_lab_registry() -> None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def emit_lab_event(graph, event_type: str, payload: dict) -> None:
+    """Append a lab marker event (artifact.published, lab.paused, lab.resumed —
+    ADR-013/015). Marker events carry no graph-state projection; the lab's own
+    projections read them back from the log. Works with both graph flavors:
+    BehaviorGraph.emit(type, payload) inside behaviors, Event construction on
+    a plain Graph (server paths)."""
+    emit = getattr(graph, "emit", None)
+    if emit is None:
+        return
+    try:
+        emit(event_type, dict(payload))
+        return
+    except TypeError:
+        pass  # plain Graph: emit(Event)
+    try:
+        from activegraph.core.event import Event
+        emit(Event(id=graph.ids.event(), type=event_type, payload=dict(payload),
+                   actor="lab", timestamp=graph.clock.now()))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- text helpers
@@ -655,46 +697,255 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
             graph.add_relation(child.id, branch_id, "forked_from")
 
 
+# ---------------------------------------------------------------- digest
+# Editorial machinery (ADR-014): findings accumulate, drafts are requested.
+# A draft_request observation is the ONLY trigger draft_writer reacts to;
+# its data carries the code-injected context the model drafts from — the
+# classification guidance (4a) and per-item provenance (5a) live HERE, in
+# prompt-assembly code, never in prompt prose.
+
+_CLASSIFICATION_GUIDANCE = (
+    "Classification guidance: post_kind is 'note' for a small post covering "
+    "one finding or a digest of accumulated findings; 'research' for a "
+    "multi-evidence or multi-branch synthesis from decided branches; 'build' "
+    "for a post about constructing the lab itself (runtime, gates, seams, "
+    "deploys)."
+)
+
+_OBS_PROVENANCE: dict[str, dict] = {}  # obs id → provenance context (5a)
+
+
+def _observation_provenance(graph, obs_id: str, data: dict, event) -> dict:
+    """5a: per-item context injected into every draft request — originating
+    branch title, when and by what behavior the observation was created, and
+    whether it was seeded or arose from live work. Captured at creation time:
+    the triggering event IS the observation's object.created event, so actor
+    and timestamp are right there (behaviors cannot scan the log)."""
+    meta = data.get("metadata") or {}
+    branch_id = meta.get("lab_branch_id")
+    branch = graph.get_object(branch_id) if branch_id else None
+    actor = str(getattr(event, "actor", None) or "system")
+    origin = ("seeded" if actor == "system"
+              else f"live work by the {actor} behavior")
+    return {
+        "finding_id": obs_id,
+        "text": (data.get("text") or "")[:500],
+        "branch_id": branch_id,
+        "branch_title": (branch.data.get("title") if branch is not None else None),
+        "created_at": str(getattr(event, "timestamp", "") or ""),
+        "created_by": actor,
+        "origin": origin,
+        "evidence_refs": list(meta.get("evidence_refs") or []),
+    }
+
+
+def _item_context(graph, ref: str) -> dict:
+    """Provenance context for a draft-request item, registry first, graph
+    fallback for objects that predate provenance tracking."""
+    ctx = _OBS_PROVENANCE.get(ref)
+    if ctx:
+        return ctx
+    o = graph.get_object(ref)
+    text = ""
+    if o is not None:
+        text = (o.data.get("text") or o.data.get("title")
+                or o.data.get("rationale") or "")[:300]
+    return {"finding_id": ref, "text": text,
+            "origin": "unknown (predates provenance tracking)"}
+
+
+def _drafting_capped(graph, settings: LabSettings, *, operator: bool) -> bool:
+    """4c: when the inbox already holds max_drafts_pending publish decisions,
+    automatic drafting idles and records ONE observation per cap episode.
+    Operator-requested drafts bypass the cap (explicit attention, ADR-014)."""
+    if operator:
+        return False
+    cap = effective_setting(graph, settings, "max_drafts_pending")
+    if len(_PENDING_PUBLISH) < cap:
+        _IDLE_LOGGED["capped"] = False
+        return False
+    if not _IDLE_LOGGED["capped"]:
+        _IDLE_LOGGED["capped"] = True
+        graph.add_object("observation", {
+            "text": (f"Drafting idles: {len(_PENDING_PUBLISH)} publish decisions "
+                     f"already pending (cap {cap}). The operator's attention is "
+                     "also a budget — findings stay queued until the inbox drains."),
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "drafting_idle",
+                         "pending_publish": len(_PENDING_PUBLISH), "cap": cap},
+        })
+    return True
+
+
+def _request_draft(graph, *, post_kind_hint: str, item_ids: list[str],
+                   requested_by: str, branch_id: Optional[str] = None,
+                   mission_id: Optional[str] = None, rationale: str = ""):
+    """Create the draft_request observation draft_writer triggers on. Its
+    data is the assembled draft context: classification guidance (4a) and
+    per-item provenance (5a) — the model can no longer not know where a
+    finding came from."""
+    contexts = [_item_context(graph, i) for i in item_ids]
+    evidence: list[str] = []
+    for c in contexts:
+        for r in [c.get("finding_id")] + list(c.get("evidence_refs") or []):
+            if r and r not in evidence:
+                evidence.append(r)
+    req = graph.add_object("observation", {
+        "text": (f"Draft request ({post_kind_hint}): write one {post_kind_hint} "
+                 f"post covering {len(item_ids)} item(s). {rationale} "
+                 + _CLASSIFICATION_GUIDANCE),
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "draft_request", "draft_request": True,
+                     "post_kind_hint": post_kind_hint,
+                     "finding_ids": list(item_ids),
+                     "evidence_refs": evidence,
+                     "findings_context": contexts,
+                     "lab_branch_id": branch_id,
+                     "mission_id": mission_id,
+                     "requested_by": requested_by},
+    })
+    for i in item_ids:
+        _COVERED_FINDINGS.add(i)
+        graph.add_relation(req.id, i, "covers")
+    return req
+
+
+@behavior(
+    name="digest",
+    on=["object.created", "relation.created"],
+    creates=["observation"],
+)
+def digest(event, graph, ctx, *, settings: LabSettings):
+    """Queue findings; request ONE combined note when enough accumulate.
+
+    On: object.created (observation). Every lab observation's provenance is
+    captured here (actor + timestamp from its own creation event — 5a).
+    A finding-tagged observation is QUEUED (a queued_finding relation plus
+    the registry), never drafted directly. When unpublished queued findings
+    reach setting.digest_min_findings, one note-kind draft_request covers
+    them all — unless the pending-publish cap idles drafting (4c).
+        relation.created (supported_by) — feeds the branch-evidence registry
+    the research threshold counts against (BehaviorGraph cannot iterate
+    relations; rebuilt from the graph on resume).
+    """
+    if event.type == "relation.created":
+        from .compat import decode_relation
+        rel = event.payload.get("relation") or {}
+        try:
+            rtype, src, tgt = decode_relation(rel)
+        except Exception:
+            return
+        if rtype == "supported_by":
+            bucket = _BRANCH_EVIDENCE.setdefault(src, [])
+            if tgt not in bucket:
+                bucket.append(tgt)
+        return
+
+    obj = event.payload.get("object", {})
+    if obj.get("type") != "observation":
+        return
+    obs_id = obj.get("id")
+    data = obj.get("data", {})
+    meta = data.get("metadata") or {}
+    if not obs_id or obs_id in _OBS_PROVENANCE:
+        return
+    if meta.get("lab"):
+        _OBS_PROVENANCE[obs_id] = _observation_provenance(graph, obs_id, data, event)
+    if not meta.get("finding"):
+        return
+    _QUEUED_FINDINGS[obs_id] = _OBS_PROVENANCE.get(obs_id) or {"finding_id": obs_id}
+    mission_id = meta.get("mission_id")
+    if mission_id:
+        graph.add_relation(mission_id, obs_id, "queued_finding")
+    queued = [f for f in _QUEUED_FINDINGS if f not in _COVERED_FINDINGS]
+    if len(queued) < effective_setting(graph, settings, "digest_min_findings"):
+        return
+    if _drafting_capped(graph, settings, operator=False):
+        return
+    # If every queued finding came from one branch, the digest belongs to it
+    # (post provenance then links the thread); mixed origins stay mission-level.
+    branch_ids = {(_QUEUED_FINDINGS.get(f) or {}).get("branch_id") for f in queued}
+    sole_branch = branch_ids.pop() if len(branch_ids) == 1 else None
+    _request_draft(
+        graph, post_kind_hint="note", item_ids=queued,
+        requested_by="lab.digest", branch_id=sole_branch, mission_id=mission_id,
+        rationale=f"{len(queued)} unpublished findings have accumulated.",
+    )
+
+
 # ---------------------------------------------------------------- gate
 
 
 def _branch_evidence_ids(graph, branch_id: str) -> list[str]:
-    """Evidence objects linked supported_by to a branch (ADR-008 decode)."""
+    """Evidence objects linked supported_by to a branch (ADR-008 decode).
+    Inside behaviors the graph is a restricted BehaviorGraph with no relation
+    iteration — there the registry (fed by relation.created events, rebuilt
+    on resume) is the source."""
     from .compat import decode_relation
-    out = []
-    try:
-        for r in graph.relations():
-            rel_type, src, tgt = decode_relation(r)
-            if rel_type == "supported_by" and src == branch_id:
-                out.append(tgt)
-    except Exception:
-        pass
-    return out
+    if hasattr(graph, "relations"):
+        out = []
+        try:
+            for r in graph.relations():
+                rel_type, src, tgt = decode_relation(r)
+                if rel_type == "supported_by" and src == branch_id:
+                    out.append(tgt)
+            return out
+        except Exception:
+            pass
+    return list(_BRANCH_EVIDENCE.get(branch_id, []))
 
 
-def _emit_branch_finding(graph, branch_id: str, decision_id: str, rationale: str) -> None:
-    """A decided branch with >=2 evidence objects is a finding — draft_writer's
-    trigger. Emitting it here keeps draft_writer on a single trigger path
-    (observation.created with metadata.finding) instead of also pattern-matching
-    branch patches, which would fire its LLM call on every patch event."""
-    if branch_id in _FINDING_EMITTED:
+def _maybe_research_request(graph, branch_id: str, decision_id: str,
+                            rationale: str, settings: LabSettings) -> None:
+    """4b: research/build drafts are earned, not automatic. A branch reaching
+    decided with >= research_min_evidence linked evidence objects gets ONE
+    research draft_request; a thinner decided branch waits until >=2 decided
+    branches can be synthesized with combined evidence over the same bar.
+    Replaces the old fire-per-finding path."""
+    if branch_id in _RESEARCH_REQUESTED:
         return
+    min_ev = effective_setting(graph, settings, "research_min_evidence")
     evidence = _branch_evidence_ids(graph, branch_id)
-    if len(evidence) < 2:
-        return
-    _FINDING_EMITTED.add(branch_id)
     branch = graph.get_object(branch_id)
     title = branch.data.get("title") if branch else branch_id
-    obs = graph.add_object("observation", {
-        "text": (f"Finding: branch '{title}' decided. {rationale[:300]}"),
-        "confidence": 0.9,
-        "category": "fact",
-        "metadata": {"lab": "finding", "finding": True,
-                     "lab_branch_id": branch_id,
-                     "decision_id": decision_id,
-                     "evidence_refs": evidence},
-    })
-    graph.add_relation(branch_id, obs.id, "supported_by")
+    mission_id = branch.data.get("mission_id") if branch else None
+
+    if len(evidence) >= min_ev:
+        if _drafting_capped(graph, settings, operator=False):
+            return
+        _RESEARCH_REQUESTED.add(branch_id)
+        _request_draft(
+            graph, post_kind_hint="research", item_ids=evidence,
+            requested_by="lab.gate", branch_id=branch_id, mission_id=mission_id,
+            rationale=(f"Branch '{title}' reached decided with "
+                       f"{len(evidence)} evidence objects. {rationale[:200]}"),
+        )
+        return
+
+    # Thin decided branch: hold for synthesis across >=2 decided branches.
+    if branch_id not in _DECIDED_THIN:
+        _DECIDED_THIN.append(branch_id)
+    if len(_DECIDED_THIN) < 2:
+        return
+    combined: list[str] = []
+    for b in _DECIDED_THIN:
+        combined += [e for e in _branch_evidence_ids(graph, b) if e not in combined]
+    if len(combined) < min_ev:
+        return
+    if _drafting_capped(graph, settings, operator=False):
+        return
+    group = list(_DECIDED_THIN)
+    _DECIDED_THIN.clear()
+    for b in group:
+        _RESEARCH_REQUESTED.add(b)
+    _request_draft(
+        graph, post_kind_hint="research", item_ids=combined,
+        requested_by="lab.gate", branch_id=branch_id, mission_id=mission_id,
+        rationale=(f"Synthesis across {len(group)} decided branches with "
+                   f"{len(combined)} combined evidence objects."),
+    )
 
 
 def _mirror_path(settings: LabSettings, slug: str) -> Path:
@@ -722,6 +973,44 @@ def _mark_draft_rejected(graph, artifact_id: str, settings: LabSettings) -> None
         pass
 
 
+def _publish_artifact(graph, artifact_id: str, decision_id: str) -> None:
+    """The publishing last mile (Phase 1, ADR-013): an approved publish
+    decision patches the artifact to status=published with a published_at
+    stamp and appends an artifact.published marker event. Idempotent — an
+    already-published artifact keeps its original timestamp and slug, and no
+    second event is emitted. Slug uniqueness is enforced HERE, at publish
+    time: a collision with an already-published slug gets a numeric suffix
+    (registry-backed; rebuilt from the graph on resume)."""
+    artifact = graph.get_object(artifact_id)
+    if artifact is None:
+        return
+    meta = dict(artifact.data.get("metadata") or {})
+    if artifact.data.get("status") == "published":
+        if meta.get("slug"):
+            _PUBLISHED_SLUGS.add(meta["slug"])
+        return
+    slug = meta.get("slug") or "post"
+    base, n = slug, 2
+    while slug in _PUBLISHED_SLUGS:
+        slug = f"{base}-{n}"
+        n += 1
+    _PUBLISHED_SLUGS.add(slug)
+    published_at = _now()
+    meta["slug"] = slug
+    meta["published_at"] = published_at
+    try:
+        graph.patch_object(artifact_id, {"status": "published", "metadata": meta})
+    except Exception:
+        return
+    emit_lab_event(graph, "artifact.published", {
+        "artifact_id": artifact_id,
+        "slug": slug,
+        "title": artifact.data.get("title"),
+        "published_at": published_at,
+        "decision_id": decision_id,
+    })
+
+
 def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) -> None:
     if decision_id in _APPLIED_DECISIONS:
         return
@@ -744,14 +1033,13 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
         except Exception:
             pass
         if status == "approved":
-            _emit_branch_finding(graph, subject, decision_id, data.get("rationale") or "")
+            _maybe_research_request(graph, subject, decision_id,
+                                    data.get("rationale") or "", settings)
     elif kind == "publish" and subject:
+        _PENDING_PUBLISH.discard(decision_id)
         if status == "approved":
             _APPROVED_PUBLISH.add(subject)
-            try:
-                graph.patch_object(subject, {"status": "published"})
-            except Exception:
-                pass
+            _publish_artifact(graph, subject, decision_id)
         else:
             try:
                 graph.patch_object(subject, {"status": "rejected"})
@@ -805,6 +1093,8 @@ def gate(event, graph, ctx, *, settings: LabSettings):
         if obj.get("type") == "decision" and data.get("status") == "pending":
             decision_id = obj.get("id")
             _PENDING_BY_SUBJECT[data.get("subject_ref", "")] = decision_id
+            if data.get("kind") == "publish":
+                _PENDING_PUBLISH.add(decision_id)  # the drafting cap's counter
             meta = dict(data.get("metadata") or {})
             meta["approval_requested_at"] = _now()
             graph.patch_object(decision_id, {"metadata": meta})
@@ -861,31 +1151,59 @@ def _slugify(text: str) -> str:
 
 _FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
 
+# 5b: first-person process claims — "I was reading…", "during my review…",
+# "I examined…" — are narrative about HOW the lab worked. Without an evidence
+# ref to a matching event they are invention: the lab's findings were often
+# seeded or produced by other behaviors, and the model must not imply
+# firsthand process it never performed.
+_PROCESS_CLAIM_RE = re.compile(
+    r"\bI was (?:reading|reviewing|examining|looking|browsing|crawling|digging)\b"
+    r"|\bduring my (?:review|reading|examination|investigation|crawl|research)\b"
+    r"|\bI (?:examined|reviewed|inspected|read through|sat down|dug into|"
+    r"went through|looked over|combed through)\b",
+    re.I)
+
 
 def _coverage_review(body: str) -> Optional[str]:
     """Claims-coverage check (draft contract): any substantive paragraph with
-    zero evidence refs gets flagged in a review note — never silently accepted."""
+    zero evidence refs gets flagged in a review note — never silently
+    accepted. Extension (5b): first-person process claims without a footnote
+    are flagged separately as possible invented narrative."""
     flagged = []
+    process_flagged = []
     for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
         if not para or para.startswith("#") or para.startswith("[^"):
             continue
+        has_footnote = bool(_FOOTNOTE_RE.search(para))
+        if _PROCESS_CLAIM_RE.search(para) and not has_footnote:
+            process_flagged.append(i + 1)
         if len(para) < 80:
             continue  # headings, transitions — not claims
-        if not _FOOTNOTE_RE.search(para):
+        if not has_footnote:
             flagged.append(i + 1)
-    if not flagged:
+    notes = []
+    if flagged:
+        notes.append(
+            "> **Review note (claims coverage):** paragraph(s) "
+            + ", ".join(map(str, flagged))
+            + " carry no evidence footnotes. Verify or cut before approving.")
+    if process_flagged:
+        notes.append(
+            "> **Review note (process claims):** paragraph(s) "
+            + ", ".join(map(str, process_flagged))
+            + " make first-person process claims (“I was reading…”, "
+            "“during my review…”) with no evidence ref to a matching "
+            "event — possible invented narrative. The injected draft context "
+            "says where each finding actually came from; verify or cut.")
+    if not notes:
         return None
-    return (
-        "\n\n> **Review note (claims coverage):** paragraph(s) "
-        + ", ".join(map(str, flagged))
-        + " carry no evidence footnotes. Verify or cut before approving."
-    )
+    return "\n\n" + "\n\n".join(notes)
 
 
 @llm_behavior(
     name="draft_writer",
     on=["object.created"],
-    where={"object.type": "observation", "object.data.metadata.finding": True},
+    where={"object.type": "observation", "object.data.metadata.draft_request": True},
     description=_PROMPTS["draft_writer"],
     output_schema=BlogDraft,
     model=None,
@@ -896,20 +1214,22 @@ def _coverage_review(body: str) -> Optional[str]:
     tools=[],
 )
 def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
-    """Turn a finding into a blog post draft + a gated publish decision.
+    """Turn a draft request into a blog post draft + a gated publish decision.
 
-    On: object.created (observation, metadata.finding=true). Branch-decided
-    findings arrive on this same trigger because gate emits a finding
-    observation when an approved promote decision lands on a branch with >=2
-    evidence objects (see _emit_branch_finding).
+    On: object.created (observation, metadata.draft_request=true) — the ONLY
+    trigger (ADR-014). Requests come from digest (accumulated findings →
+    note), gate (decided branch / synthesis → research), or the operator's
+    chat escape hatch. The request's data carries the code-injected draft
+    context: classification guidance and per-item provenance (4a/5a).
 
-    Creates: artifact (kind=blog_draft, status=draft, mirrored to
-    drafts/<slug>.md — the graph copy is canonical) + produced relation +
-    decision (kind=publish, status=pending). The gate does the rest: NOTHING
-    publishes without an approved decision.
+    Creates: artifact (kind=blog_draft, status=draft, metadata.post_kind,
+    mirrored to drafts/<slug>.md — the graph copy is canonical) + produced
+    relation + decision (kind=publish, status=pending). The gate does the
+    rest: NOTHING publishes without an approved decision.
 
     Post-generation: claims-coverage check appends a review note for any
-    paragraph without evidence footnotes; a provenance block (branch,
+    paragraph without evidence footnotes and for first-person process claims
+    without a matching evidence ref (5b); a provenance block (branch,
     evidence, event horizon, model, crawl mode) is always appended.
     """
     consume_llm_anomalies(graph)
@@ -929,10 +1249,17 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
         return
 
     branch_id = meta.get("lab_branch_id")
+    finding_ids = list(meta.get("finding_ids") or [])
     evidence = list(meta.get("evidence_refs") or [])
-    if obs_id not in evidence:
+    for f in finding_ids:
+        if f not in evidence:
+            evidence.append(f)
+    if not evidence:
         evidence.append(obs_id)
-    evidence += [s for s in (data.get("source_ids") or []) if s not in evidence]
+
+    post_kind = getattr(out, "post_kind", None) or meta.get("post_kind_hint") or "note"
+    if post_kind not in ("note", "research", "build"):
+        post_kind = "note"
 
     title = (out.title or "Untitled lab note").strip()
     slug = _slugify(out.slug or title)
@@ -977,7 +1304,11 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
         "status": "draft",
         "observation_ids": evidence,
         "metadata": {"lab": "blog_draft", "slug": slug,
-                     "lab_branch_id": branch_id, "finding_id": obs_id,
+                     "post_kind": post_kind,
+                     "lab_branch_id": branch_id,
+                     "finding_id": (finding_ids[0] if finding_ids else obs_id),
+                     "finding_ids": finding_ids,
+                     "request_id": obs_id,
                      "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer")},
     })
     if branch_id:
@@ -1011,6 +1342,7 @@ _STEER_PAUSE = ("pause",)
 _STEER_RESUME = ("resume", "unpause", "reactivate")
 _STEER_APPROVE = ("approve",)
 _STEER_REJECT = ("reject",)
+_STEER_DRAFT = ("draft",)
 
 
 def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
@@ -1029,6 +1361,19 @@ def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
             return None
         graph.patch_object(branch_id, {"status": "active"})
         return "branch resumed (status=active)"
+    if any(w in low for w in _STEER_DRAFT):
+        # 4b escape hatch: the operator can request a draft on anything.
+        # Explicit attention — bypasses the pending-publish cap (ADR-014).
+        evidence = _branch_evidence_ids(graph, branch_id)
+        hint = "research" if branch.data.get("status") == "decided" else "note"
+        _request_draft(
+            graph, post_kind_hint=hint, item_ids=evidence,
+            requested_by="operator", branch_id=branch_id,
+            mission_id=branch.data.get("mission_id"),
+            rationale=(f"Operator requested a draft on branch "
+                       f"'{branch.data.get('title')}': {content[:160]}"),
+        )
+        return f"draft requested on this branch ({hint}; operator escape hatch)"
     if any(w in low for w in _STEER_APPROVE):
         decision_id = _PENDING_BY_SUBJECT.get(branch_id)
         if decision_id:
@@ -1127,4 +1472,4 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
 
 
 # Registration order is execution order within an event batch.
-BEHAVIORS = [ingest, plan, work, interpret, gate, draft_writer, answer]
+BEHAVIORS = [ingest, plan, work, interpret, digest, gate, draft_writer, answer]

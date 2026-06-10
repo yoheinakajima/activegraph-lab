@@ -98,3 +98,25 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Decision: Code lives in one of four tiers. KERNEL (GitHub only, forever): the gate behavior, auth middleware, event loop/runtime wiring, replay machinery, the storage adapter, and the seam/code loaders themselves — the thing that governs self-modification is never subject to it. SEAMS (graph-stored, gated): prompts, feed narration templates, whitelisted behavior settings values. GRAPH CODE (graph-stored, gated, dark by default): behaviors and tools drafted as artifacts, sandbox-tested, promoted only through an approved decision AND `LAB_ALLOW_GRAPH_CODE=1`. PLUMBING (GitHub, pragmatically): server, UI, scripts.
 - Enforcement: `lab_pack/kernel.py` is the manifest of protected module paths; the seam and code loaders refuse any graph artifact that names, imports from, shadows, or monkeypatches a manifest entry. The manifest itself is kernel. The seam-eligible settings whitelist is kernel.
 - Rationale: Graph-stored seams and code give perfect replay provenance — the code that ran is in the log that replays. The kernel stays in git for bootstrap and security. Self-modification is a capability like any other: one bit, gated, absolute (ADR-002).
+
+## ADR-013: Public site structure — the blog is the front door
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: The root of the lab's domain is a blog: published posts rendered server-side from the graph (artifacts with status=published), newest first. Each post page renders the post plus its provenance subgraph: originating branch, evidence observations, chat messages on that branch, the publish decision, and prior draft versions. The notebook feed moves to /lab and shows everything — all branches (active, proposed, decided, archived), all chats, all decisions including resolved ones.
+- Rationale: The work is the product; the blog is the front door, the notebook is the open workshop behind it. Rendering posts from the graph (not the drafts/ mirror) keeps the UI a pure projection of the log, and "Show the work" makes the inspectability pitch concrete on every post.
+- Note: publishing now appends an `artifact.published` marker event through the gate path. Marker events (here and ADR-015) carry no graph-state projection — they are log entries the lab's own projections read — so the "lab adds no event types" line in ARCHITECTURE.md is amended to "no state-bearing event types".
+
+## ADR-014: Editorial policy — notes accumulate, research is earned
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: Artifacts of kind=blog_draft gain a post_kind field: note | research | build. Small single-finding posts are notes; multi-evidence or multi-branch syntheses are research; posts about constructing the lab itself are build. Notes do not auto-draft one-per-finding: findings accumulate as queued observations, and a digest behavior proposes one combined note when unpublished queued findings reach setting.digest_min_findings (default 3). Research/build drafts require a decided branch with at least setting.research_min_evidence (default 3) linked evidence objects, or a synthesis of ≥2 decided branches whose combined evidence meets the same bar. When pending publish decisions reach setting.max_drafts_pending (default 5), automatic drafting idles and records an observation — the operator's attention is also a budget. The operator can always request a draft on a branch via chat; an explicit request is spent attention, so it bypasses the pending cap.
+- Rationale: Fire-per-finding floods the inbox and produces thin posts. Accumulation plus thresholds makes volume a policy, and every threshold is a seam setting — tuning editorial policy is self-modification through the gate, not a redeploy.
+
+## ADR-015: Operator controls — pause and a daily cost ceiling
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: A global pause and a daily cost ceiling, both persisted as events and rebuilt from the log at boot (restart-proof, the same mechanism as the daily call cap). POST /lab/pause and /lab/resume append lab.paused / lab.resumed marker events; mutations are operator-token-gated like everything else. While paused, every LLM behavior except answer idles, recording one behavior-skipped observation per behavior per pause episode (not per event); answer stays live — the operator can always talk to the lab, and answer is cheap and budget-counted. The cost ceiling uses activegraph's native cost accounting (cost_usd on llm.responded events), capped by setting.daily_cost_cap_usd (default 5.00, seam-whitelisted); blocked-by-cost attempts log like blocked-by-count.
+- Rationale: The kill switch and the spend limit must survive restarts, which means they live in the log, not in process memory or env vars. Keeping answer alive while paused preserves the one channel the operator steers through.

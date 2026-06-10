@@ -69,6 +69,36 @@ class LabSettings(BaseModel):
         default="lab",
         description="comm_message channel the answer behavior listens on.",
     )
+    digest_min_findings: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Editorial policy (ADR-014): findings accumulate as queued "
+            "observations; when at least this many unpublished queued findings "
+            "exist, the digest behavior requests ONE combined note-kind draft. "
+            "Seam-eligible — tuning editorial policy is self-modification."
+        ),
+    )
+    research_min_evidence: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Editorial policy (ADR-014): a research/build draft requires a "
+            "decided branch with at least this many linked evidence objects, "
+            "or a synthesis of >=2 decided branches whose combined evidence "
+            "meets this bar. Seam-eligible."
+        ),
+    )
+    max_drafts_pending: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Editorial policy (ADR-014): when the inbox holds this many "
+            "pending publish decisions, automatic drafting idles and records "
+            "an observation — the operator's attention is also a budget. "
+            "Operator-requested drafts (via chat) bypass the cap. Seam-eligible."
+        ),
+    )
     drafts_dir: str = Field(
         default="drafts",
         description=(
@@ -99,6 +129,17 @@ class LabSettings(BaseModel):
             "Daily LLM call cap, UTC reset. Counted from llm.requested events "
             "in the log (persisted by construction; restart-safe). On "
             "exhaustion: one observation, then idle until the UTC date turns."
+        ),
+    )
+    daily_cost_cap_usd: float = Field(
+        default=5.0,
+        ge=0.0,
+        description=(
+            "Daily LLM cost ceiling in USD, UTC reset (ADR-015). Spend is "
+            "rebuilt from the cost_usd activegraph stamps on llm.responded "
+            "events — restart-proof. Blocked-by-cost attempts log like "
+            "blocked-by-count. Seam-eligible: tuning the ceiling is "
+            "self-modification through the gate."
         ),
     )
     max_total_llm_calls_per_session: int = Field(

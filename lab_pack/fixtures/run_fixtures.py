@@ -342,8 +342,64 @@ def run_draft_writer() -> bool:
         if fspec.get("expect_rejected_header"):
             c.that(path.read_text().startswith("REJECTED"),
                    f"{fspec['key']}: rejected mirror lacks REJECTED header")
-        results[fspec["key"]] = {"artifact": artifact, "status": final, "slug": slug}
+        results[fspec["key"]] = {"artifact": artifact, "status": final, "slug": slug,
+                                 "decision": decision}
         print(f"  {fspec['key']}: draft → decision {fspec['resolution']} → {final} ({slug}.md)")
+
+    # ── Phase 1 (ADR-013): the publishing last mile ─────────────────────────
+    import lab_pack.behaviors as lb
+
+    def published_events_for(artifact_id):
+        return [e for e in g.events if str(e.type) == "artifact.published"
+                and e.payload.get("artifact_id") == artifact_id]
+
+    approved = results.get("approved_draft")
+    rejected = results.get("rejected_draft")
+    if approved:
+        a = g.get_object(approved["artifact"].id)
+        meta = a.data.get("metadata") or {}
+        first_published_at = meta.get("published_at")
+        c.that(bool(first_published_at),
+               "approved publish stamps metadata.published_at")
+        c.that(len(published_events_for(a.id)) == 1,
+               "approve emits exactly one artifact.published event")
+        # Re-approval idempotent: even if the gate's applied-decision dedup is
+        # lost (registry cleared = simulated restart), an already-published
+        # artifact keeps its timestamp and no second event is emitted.
+        lb._APPLIED_DECISIONS.discard(approved["decision"].id)
+        approve_decision_fn(g, approved["decision"].id, True, "fixture: re-approve")
+        rt.run_until_idle()
+        a = g.get_object(approved["artifact"].id)
+        c.that((a.data.get("metadata") or {}).get("published_at") == first_published_at
+               and len(published_events_for(a.id)) == 1,
+               "re-approval is idempotent (published_at kept, one event)")
+    if rejected:
+        c.that(not published_events_for(rejected["artifact"].id),
+               "reject emits no artifact.published event")
+
+    # Slug uniqueness at publish time (1b): a colliding published slug from a
+    # prior run gets a numeric suffix on this publish.
+    f3 = g.add_object("observation", {
+        "text": "Finding: slug collisions at publish time are suffixed, not fatal.",
+        "confidence": 0.9, "category": "fact",
+        "metadata": {"lab": "finding", "finding": True,
+                     "lab_branch_id": branch.id, "evidence_refs": []},
+    })
+    rt.run_until_idle()
+    a3 = next((x for x in g.objects(type="artifact")
+               if (x.data.get("metadata") or {}).get("finding_id") == f3.id), None)
+    c.that(a3 is not None, "collision case: draft created")
+    if a3 is not None:
+        draft_slug = (a3.data.get("metadata") or {}).get("slug")
+        lb._PUBLISHED_SLUGS.add(draft_slug)  # simulate an earlier published post
+        d3 = next(d for d in g.objects(type="decision")
+                  if d.data.get("subject_ref") == a3.id and d.data.get("status") == "pending")
+        approve_decision_fn(g, d3.id, True, "fixture: collision approve")
+        rt.run_until_idle()
+        got = (g.get_object(a3.id).data.get("metadata") or {}).get("slug")
+        c.that(got == f"{draft_slug}-2",
+               f"publish-time slug collision suffixed ({draft_slug} → {got})")
+        print(f"  slug_collision: {draft_slug} → {got}")
 
     exp = spec["expected_outputs"]
     drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
@@ -371,6 +427,268 @@ def run_draft_writer() -> bool:
                            for d in pubs)]
         c.that(not bad, f"artifacts published without approved decision: {bad}")
     return c.done("draft_writer")
+
+
+def run_editorial() -> bool:
+    spec = _load("editorial.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: editorial — digest threshold, earned research, pending cap, escape hatch")
+    print("=" * 64)
+
+    import tempfile
+    settings = dict(spec.get("settings") or {})
+    settings["drafts_dir"] = tempfile.mkdtemp(prefix="lab-editorial-")
+
+    clear_lab_registry()
+    rt = Runtime(Graph(), llm_provider=LabMockProvider())
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def drafts():
+        return [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
+
+    def requests():
+        return _lab_obs(g, "draft_request")
+
+    def add_finding(text):
+        f = g.add_object("observation", {
+            "text": text, "confidence": 0.9, "category": "fact",
+            "metadata": {"lab": "finding", "finding": True,
+                         "mission_id": mission.id, "evidence_refs": []},
+        })
+        rt.run_until_idle()
+        return f
+
+    # ── A: findings accumulate; threshold → ONE digest note ────────────────
+    add_finding("Finding one: replay is deterministic at this pin.")
+    add_finding("Finding two: the packs repo is split on relation order.")
+    c.that(not requests() and not drafts(),
+           f"2 findings < threshold → no draft request, no draft "
+           f"({len(requests())}, {len(drafts())})")
+    add_finding("Finding three: entry-point discovery works across repos.")
+    c.that(len(requests()) == 1 and len(drafts()) == 1,
+           f"3rd finding reaches the threshold → exactly one digest "
+           f"({len(requests())} requests, {len(drafts())} drafts)")
+    if drafts():
+        d0 = drafts()[0]
+        meta = d0.data.get("metadata") or {}
+        c.that(meta.get("post_kind") == exp["digest_note"]["post_kind"],
+               f"digest draft is post_kind=note (got {meta.get('post_kind')})")
+        c.that(len(meta.get("finding_ids") or []) == exp["digest_note"]["findings_covered"],
+               f"digest covers all {exp['digest_note']['findings_covered']} queued findings")
+        covers = [r for r in g.relations() if str(r.type) == "covers"]
+        c.that(len(covers) >= 3, f"covers relations recorded ({len(covers)})")
+    print(f"  A: 2 findings idle, 3rd → one note digest covering 3")
+
+    # ── B0: a thin decided branch (1 evidence) earns nothing ───────────────
+    def decide_branch(title, n_evidence):
+        b = create_branch_fn(g, mission.id, title, "intent", status="active")
+        rt.run_until_idle()
+        for i in range(n_evidence):
+            o = g.add_object("observation", {
+                "text": f"Evidence {i} for {title}: verified against the runtime.",
+                "confidence": 0.8, "category": "fact",
+                "metadata": {"lab": "interpretation", "lab_branch_id": b.id},
+            }, actor="research.worker")
+            g.add_relation(b.id, o.id, "supported_by")
+        d = g.add_object("decision", {
+            "subject_ref": b.id, "kind": "promote", "status": "pending",
+            "rationale": f"fixture: decide {title}", "evidence_refs": [],
+            "metadata": {},
+        })
+        rt.run_until_idle()
+        approve_decision_fn(g, d.id, True, "fixture approve")
+        rt.run_until_idle()
+        return b
+
+    before = len(requests())
+    thin1 = decide_branch("Thin branch one", 1)
+    c.that(g.get_object(thin1.id).data.get("status") == "decided"
+           and len(requests()) == before,
+           "thin decided branch (1 evidence) → no research request")
+
+    # ── B: decided branch with >= research_min_evidence → research draft ───
+    rich = decide_branch("Rich branch", 3)
+    research = [r for r in requests()
+                if (r.data.get("metadata") or {}).get("requested_by") == "lab.gate"]
+    c.that(len(research) == 1, f"rich decided branch → one research request ({len(research)})")
+    research_drafts = [a for a in drafts()
+                       if (a.data.get("metadata") or {}).get("post_kind") == "research"]
+    c.that(len(research_drafts) == 1,
+           f"research draft created, post_kind=research ({len(research_drafts)})")
+    print(f"  B: thin branch idles; rich branch (3 evidence) → research draft")
+
+    # ── B2: second thin branch → synthesis across decided branches ─────────
+    thin2 = decide_branch("Thin branch two", 2)
+    gate_reqs = [r for r in requests()
+                 if (r.data.get("metadata") or {}).get("requested_by") == "lab.gate"]
+    c.that(len(gate_reqs) == 2,
+           f"two thin decided branches, combined evidence 3 → synthesis request "
+           f"({len(gate_reqs)} gate requests)")
+    print(f"  B2: thin1 + thin2 (1+2 evidence) → synthesis research draft")
+
+    # ── C: pending cap reached → drafting idles, one observation ───────────
+    pending_pub = [d for d in g.objects(type="decision")
+                   if d.data.get("kind") == "publish" and d.data.get("status") == "pending"]
+    c.that(len(pending_pub) == 3, f"3 publish decisions pending = the cap ({len(pending_pub)})")
+    n_drafts = len(drafts())
+    add_finding("Finding four: queued behind the cap.")
+    add_finding("Finding five: still queued.")
+    add_finding("Finding six: the queue reaches the threshold under the cap.")
+    add_finding("Finding seven: the idle observation must not repeat.")
+    idle = _lab_obs(g, "drafting_idle")
+    c.that(len(drafts()) == n_drafts,
+           f"cap reached → no new draft ({len(drafts())} == {n_drafts})")
+    c.that(len(idle) == exp["drafting_idle_observations"],
+           f"drafting idles with exactly one observation per episode ({len(idle)})")
+    print(f"  C: cap {settings['max_drafts_pending']} pending → drafting idles, "
+          f"{len(idle)} idle observation")
+
+    # ── D: the operator escape hatch bypasses the cap ──────────────────────
+    _, msg = send_branch_message_fn(g, rich.id, "please draft this up as a post")
+    rt.run_until_idle()
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "draft requested" in (cands[0].data.get("content") or ""),
+           "operator chat reply confirms the draft request")
+    op_reqs = [r for r in requests()
+               if (r.data.get("metadata") or {}).get("requested_by") == "operator"]
+    c.that(len(op_reqs) == 1, f"operator draft request recorded ({len(op_reqs)})")
+    c.that(len(drafts()) == n_drafts + 1,
+           f"operator request bypasses the pending cap ({len(drafts())})")
+    print(f"  D: operator 'draft' in chat → draft despite the cap")
+
+    c.that(len(drafts()) == exp["blog_drafts_total"],
+           f"expected {exp['blog_drafts_total']} drafts total, got {len(drafts())}")
+    c.that(len(requests()) == exp["draft_requests_total"],
+           f"expected {exp['draft_requests_total']} draft requests, got {len(requests())}")
+    c.that(all(a.data.get("status") == "draft" for a in drafts()),
+           "every draft stays gated (status=draft, nothing auto-published)")
+
+    # ── 5c: provenance-aware review notes ───────────────────────────────────
+    # The digest covered SEEDED findings — in fixture mode the model invents a
+    # first-person process narrative there, and the coverage check must flag
+    # it. The research draft's evidence arose from live work (a worker actor)
+    # — that draft must pass clean.
+    digest_body = drafts()[0].data.get("content") or ""
+    c.that("Review note (process claims)" in digest_body,
+           "seeded-finding draft flags the invented process narrative (5c)")
+    research_body = research_drafts[0].data.get("content") or "" if research_drafts else ""
+    c.that("Review note (process claims)" not in research_body,
+           "correctly-attributed (live-work) draft passes the process check clean")
+    print("  5c: seeded → process-claim flag; live-work → clean")
+    return c.done("editorial")
+
+
+def run_operator_controls() -> bool:
+    spec = _load("operator_controls.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: operator_controls — pause/resume + daily cost ceiling (ADR-015)")
+    print("=" * 64)
+
+    from lab_pack.behaviors import emit_lab_event
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, _lab_prompt_bodies,
+                              lab_paused, reset_llm_session, set_lab_paused,
+                              sync_daily_budget)
+
+    clear_lab_registry()
+    reset_llm_session()
+    cap = float(spec["cost_cap_usd"])
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=10, max_daily=200,
+                                 max_daily_cost_usd=cap,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt = Runtime(Graph(), llm_provider=wrapper)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Control branch", "talk here",
+                              status="active")
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def add_claim(i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+        rt.run_until_idle()
+
+    def proposed():
+        return [b for b in g.objects(type="branch") if b.data.get("status") == "proposed"]
+
+    def plan_skips():
+        return [o for o in _lab_obs(g, "behavior_skipped")
+                if (o.data.get("metadata") or {}).get("behavior") == "plan"]
+
+    # ── pause: marker event + LLM behaviors idle, ONE skip obs ──────────────
+    set_lab_paused(g, True)
+    c.that(str(g.events[-1].type) == "lab.paused" and lab_paused(),
+           "pause appends a lab.paused marker event")
+    add_claim(1)
+    add_claim(2)
+    c.that(len(proposed()) == 0, "paused → plan does not propose branches")
+    c.that(len(plan_skips()) == exp["paused_plan_skips"],
+           f"one behavior-skipped observation per behavior per episode, "
+           f"not per event ({len(plan_skips())} for 2 triggers)")
+
+    # ── answer stays live while paused ──────────────────────────────────────
+    _, msg = send_branch_message_fn(g, branch.id, "are you alive in there?")
+    rt.run_until_idle()
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "as of event" in (cands[0].data.get("content") or ""),
+           "answer still fires while paused (the operator can always talk)")
+    print(f"  paused: 2 plan triggers → 0 branches, {len(plan_skips())} skip obs; "
+          "answer replied")
+
+    # ── restart-proof: pause state rebuilds from the log ────────────────────
+    saved_anomalies = list(_LLM_STATE["anomalies"])
+    reset_llm_session()  # simulate a process restart
+    sync_daily_budget(rt)
+    c.that(lab_paused(), "paused state rebuilt from the log after restart")
+    _LLM_STATE["anomalies"] = saved_anomalies
+
+    # ── resume: behaviors fire again ────────────────────────────────────────
+    set_lab_paused(g, False)
+    c.that(str(g.events[-1].type) == "lab.resumed" and not lab_paused(),
+           "resume appends a lab.resumed marker event")
+    add_claim(3)
+    c.that(len(proposed()) == exp["resumed_branches"],
+           f"resumed → plan proposes again ({len(proposed())})")
+    print(f"  resumed: claim → {len(proposed())} proposed branch")
+
+    # ── daily cost ceiling: native cost accounting, restart-proof ──────────
+    emit_lab_event(g, "llm.responded", {"cost_usd": spec["synthetic_spend"],
+                                        "model": "fixture", "behavior": "fixture"})
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           f"cost rebuilt from llm.responded events "
+           f"(${float(_LLM_STATE['daily_cost']):.2f} >= ${cap:.2f})")
+    n_before = len(proposed())
+    add_claim(4)
+    blocked = [o for o in _lab_obs(g, "llm_budget")
+               if "cost cap" in (o.data.get("text") or "")]
+    c.that(len(proposed()) == n_before, "cost cap reached → plan blocked")
+    c.that(len(blocked) == exp["cost_blocked_observations"],
+           f"blocked-by-cost recorded once ({len(blocked)})")
+    reset_llm_session()  # simulate another restart
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           "cost ceiling is restart-proof: bouncing the process cannot reset it")
+    print(f"  cost: ${float(_LLM_STATE['daily_cost']):.2f} spent >= ${cap:.2f} cap "
+          f"→ blocked, {len(blocked)} observation, survives restart")
+    return c.done("operator_controls")
 
 
 def run_seams() -> bool:
@@ -665,6 +983,8 @@ def run_all() -> None:
         run_thread_equals_branch(),
         run_capability_gap(),
         run_draft_writer(),
+        run_editorial(),
+        run_operator_controls(),
         run_seams(),
         run_graph_code(),
         run_compat_regression(),

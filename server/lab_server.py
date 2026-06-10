@@ -109,16 +109,50 @@ def _rebuild_lab_registries(rt) -> None:
     for d in g.objects(type="decision"):
         if d.data.get("status") == "pending":
             lb._PENDING_BY_SUBJECT[d.data.get("subject_ref", "")] = d.id
+            if d.data.get("kind") == "publish":
+                lb._PENDING_PUBLISH.add(d.id)
         elif d.data.get("kind") == "publish" and d.data.get("status") == "approved":
             lb._APPROVED_PUBLISH.add(d.data.get("subject_ref", ""))
         if d.data.get("status") in ("approved", "rejected"):
             lb._APPLIED_DECISIONS.add(d.id)
+    # 5a: observation provenance — actor + timestamp from each object.created
+    # event (replay rebuilds objects, not the in-process provenance registry).
+    created_by: dict[str, tuple[str, str]] = {}
+    for e in g.events:
+        if str(e.type) == "object.created":
+            o_ = e.payload.get("object") or {}
+            if o_.get("type") == "observation":
+                created_by[o_.get("id")] = (str(e.actor or "system"),
+                                            str(e.timestamp or ""))
     for o in g.objects(type="observation"):
         meta = o.data.get("metadata") or {}
         if meta.get("lab") == "capability_gap" and meta.get("task_id"):
             lb._GAP_CHECKED.add(meta["task_id"])
         if meta.get("lab") == "site_claim":
             lb._PLANNED_OBS.add(o.id)
+        if meta.get("lab"):
+            actor, ts = created_by.get(str(o.id), ("system", ""))
+            branch = g.get_object(meta.get("lab_branch_id")) \
+                if meta.get("lab_branch_id") else None
+            lb._OBS_PROVENANCE[str(o.id)] = {
+                "finding_id": str(o.id),
+                "text": (o.data.get("text") or "")[:500],
+                "branch_id": meta.get("lab_branch_id"),
+                "branch_title": (branch.data.get("title") if branch is not None else None),
+                "created_at": ts,
+                "created_by": actor,
+                "origin": ("seeded" if actor == "system"
+                           else f"live work by the {actor} behavior"),
+                "evidence_refs": list(meta.get("evidence_refs") or []),
+            }
+        if meta.get("finding"):
+            lb._QUEUED_FINDINGS[str(o.id)] = lb._OBS_PROVENANCE.get(str(o.id)) \
+                or {"finding_id": str(o.id)}
+        if meta.get("lab") == "draft_request":
+            for f in meta.get("finding_ids") or []:
+                lb._COVERED_FINDINGS.add(f)
+            if meta.get("requested_by") == "lab.gate" and meta.get("lab_branch_id"):
+                lb._RESEARCH_REQUESTED.add(meta["lab_branch_id"])
     for e in g.objects(type="evaluation"):
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
@@ -128,8 +162,14 @@ def _rebuild_lab_registries(rt) -> None:
         if meta.get("lab") == "blog_draft":
             if meta.get("slug"):
                 lb._SLUGS.add(meta["slug"])
-            if meta.get("finding_id"):
+                if a.data.get("status") == "published":
+                    lb._PUBLISHED_SLUGS.add(meta["slug"])
+            if meta.get("request_id"):
+                lb._DRAFTED_OBS.add(meta["request_id"])
+            elif meta.get("finding_id"):
+                # pre-ADR-014 drafts triggered straight off the finding
                 lb._DRAFTED_OBS.add(meta["finding_id"])
+                lb._COVERED_FINDINGS.add(meta["finding_id"])
             if meta.get("lab_branch_id"):
                 lb._FINDING_EMITTED.add(meta["lab_branch_id"])
     for r in g.relations():
@@ -138,6 +178,12 @@ def _rebuild_lab_registries(rt) -> None:
             lb._THREAD_TO_BRANCH[src] = tgt
         elif rel_type == "dispatched":
             lb._DISPATCHED.add(src)
+        elif rel_type == "supported_by":
+            bucket = lb._BRANCH_EVIDENCE.setdefault(src, [])
+            if tgt not in bucket:
+                bucket.append(tgt)
+        elif rel_type == "covers":
+            lb._COVERED_FINDINGS.add(tgt)
 
 
 def _build_runtime():
@@ -330,6 +376,9 @@ DEFAULT_TEMPLATES = {
     "draft_mirror_failure": "{short_text}",
     "synthetic_crawl":  "{short_text}",
     "seam_refused":     "Refused a seam proposal: {short_text}",
+    "draft_request":    "Draft requested: {short_text}",
+    "drafting_idle":    "{short_text}",
+    "behavior_skipped": "{short_text}",
 }
 
 
@@ -462,9 +511,18 @@ def _event_index(event_id: str) -> int:
         return -1
 
 
+_KIND_BY_TYPE = {
+    "comm_message": "chat", "comm_response_candidate": "chat",
+    "observation": "observation", "branch": "branch", "decision": "decision",
+    "artifact": "draft", "task": "task", "evaluation": "evaluation",
+    "mission": "mission", "source": "crawl",
+}
+
+
 def _build_entries(g, timeline=None) -> list[dict]:
     """Every renderable feed entry, chronological. Shared by /lab/feed,
-    /lab/entries (pagination) and /lab/stream (SSE)."""
+    /lab/entries (pagination) and /lab/stream (SSE). Each entry carries a
+    coarse `kind` for the /lab filter row (3a)."""
     entries: list[dict] = []
     if timeline is None:
         timeline = _seam_template_timeline(g)
@@ -472,11 +530,13 @@ def _build_entries(g, timeline=None) -> list[dict]:
         tmpl = (lambda kind, _i=i: _template_at(timeline, kind, _i))
         sentence = None
         branch_id = None
+        kind = None
         if e.type == "object.created":
             obj = e.payload.get("object", {}) or {}
             data = obj.get("data", {}) or {}
             sentence = _narrate_created(g, obj.get("type"), data, obj.get("id"), tmpl)
             branch_id = _branch_of_object(g, obj.get("type"), data, obj.get("id"))
+            kind = _KIND_BY_TYPE.get(str(obj.get("type")))
             if obj.get("type") == "comm_message" and not branch_id:
                 branch_id = (data.get("metadata") or {}).get("lab_branch_id")
         elif e.type == "patch.applied":
@@ -485,24 +545,49 @@ def _build_entries(g, timeline=None) -> list[dict]:
             if obj is not None:
                 sentence = _narrate_patch(g, obj, e.payload.get("diff") or {})
                 branch_id = _branch_of_object(g, str(obj.type), obj.data, str(obj.id))
+                kind = _KIND_BY_TYPE.get(str(obj.type))
+        elif e.type == "artifact.published":
+            # Marker events (ADR-013/015) are pure log entries — narrate here.
+            slug = e.payload.get("slug")
+            sentence = (f"Published: “{e.payload.get('title') or slug}” "
+                        f"→ /posts/{slug}")
+            kind = "publish"
+            a = g.get_object(e.payload.get("artifact_id"))
+            if a is not None:
+                branch_id = (a.data.get("metadata") or {}).get("lab_branch_id")
+        elif e.type == "lab.paused":
+            sentence = "Lab paused by the operator — LLM behaviors idle; answer stays live."
+            kind = "control"
+        elif e.type == "lab.resumed":
+            sentence = "Lab resumed by the operator."
+            kind = "control"
         if sentence:
             entry = {
                 "event_id": str(e.id),
                 "timestamp": str(e.timestamp) if e.timestamp else None,
                 "branch_id": branch_id,
                 "sentence": sentence,
+                "kind": kind or "event",
             }
+            if e.type == "artifact.published" and e.payload.get("slug"):
+                entry["post_url"] = f"/posts/{e.payload['slug']}"
             # B4: blog drafts carry a preview snippet + link into the thread view.
             if e.type == "object.created":
                 obj = e.payload.get("object", {}) or {}
                 data = obj.get("data", {}) or {}
                 if (data.get("metadata") or {}).get("lab") == "blog_draft":
                     body = data.get("content") or ""
+                    live = g.get_object(obj.get("id"))
+                    live_meta = (live.data.get("metadata") or {}) if live is not None else {}
                     entry["artifact"] = {
                         "id": obj.get("id"),
-                        "slug": (data.get("metadata") or {}).get("slug"),
+                        "slug": live_meta.get("slug")
+                                or (data.get("metadata") or {}).get("slug"),
                         "title": data.get("title"),
                         "preview": _shorten(body.split("##", 1)[-1], 220),
+                        # 3b: once published, the feed entry cross-links the post.
+                        "published": bool(live is not None
+                                          and live.data.get("status") == "published"),
                     }
             entry["index"] = i
             entries.append(entry)
@@ -518,6 +603,23 @@ def _feed(rt, limit: int = 100) -> dict:
     total_entries = len(all_entries)
     entries = all_entries[-limit:] if limit and limit > 0 else all_entries
     oldest_rendered = entries[0]["event_id"] if entries else None
+
+    # 3a: resolved decisions, newest first — the inbox's collapsed history.
+    resolved = []
+    for d in g.objects(type="decision"):
+        if d.data.get("status") not in ("approved", "rejected"):
+            continue
+        subject = g.get_object(d.data.get("subject_ref"))
+        resolved.append({
+            "id": str(d.id),
+            "kind": d.data.get("kind"),
+            "status": d.data.get("status"),
+            "rationale": _shorten(d.data.get("rationale") or "", 200),
+            "subject_ref": d.data.get("subject_ref"),
+            "subject_title": (subject.data.get("title") if subject is not None else None),
+            "branch_id": _branch_of_object(g, "decision", d.data, d.id),
+        })
+    resolved.sort(key=lambda x: _event_index(x["id"].replace("#", "_")), reverse=True)
 
     # The inbox: pending decisions with their evidence attached inline.
     inbox = []
@@ -557,8 +659,10 @@ def _feed(rt, limit: int = 100) -> dict:
     return {
         "as_of_event": str(g.events[-1].id) if g.events else None,
         "llm": _llm_info,
+        "status": _operator_status(),
         "mission": missions[0] if missions else None,
         "inbox": inbox,
+        "resolved": resolved,
         "total_entries": total_entries,
         "oldest_rendered": oldest_rendered,
         "mission_entries": mission_entries,
@@ -568,6 +672,33 @@ def _feed(rt, limit: int = 100) -> dict:
             reverse=True,
         ),
     }
+
+
+def _operator_status() -> dict:
+    """ADR-015 status: paused, calls today/cap, cost today/cap. In-process
+    state is authoritative between syncs; all of it rebuilds from the log."""
+    from lab_pack.llm import _LLM_STATE
+    from lab_pack.settings import LabSettings
+    defaults = LabSettings()
+    cap = _LLM_STATE.get("cost_cap_override")
+    return {
+        "paused": bool(_LLM_STATE.get("paused")),
+        "llm_calls_today": int(_LLM_STATE.get("daily_used") or 0),
+        "llm_calls_cap": defaults.max_llm_calls_per_day,
+        "llm_cost_today": round(float(_LLM_STATE.get("daily_cost") or 0), 4),
+        "llm_cost_cap": float(cap if cap is not None else defaults.daily_cost_cap_usd),
+    }
+
+
+def _status_line() -> str:
+    """Small status line for the blog footer and /lab header (6c):
+    live|paused · $today/$cap."""
+    try:
+        s = _operator_status()
+    except Exception:
+        return ""
+    return (f"{'paused' if s['paused'] else 'live'} · "
+            f"${s['llm_cost_today']:.2f}/${s['llm_cost_cap']:.2f} today · ")
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
@@ -618,11 +749,50 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def _send_html(self, body: str, status: int = 200):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = urlparse(self.path).path
         qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
         try:
+            # ── the public blog (ADR-013): / is the front door ──────────────
             if path == "/":
+                from server import blog
+                rt = _get_rt()
+                with _lock:
+                    page = blog.index_page(rt.graph, status_line=_status_line())
+                self._send_html(page)
+            elif path.startswith("/posts/"):
+                from server import blog
+                rt = _get_rt()
+                slug = path[len("/posts/"):].strip("/")
+                with _lock:
+                    page = blog.post_page(rt.graph, slug, status_line=_status_line())
+                if page is None:
+                    self._send_html("<h1>404</h1><p>No such post.</p>", 404)
+                else:
+                    self._send_html(page)
+            elif path == "/feed.xml":
+                from server import blog
+                rt = _get_rt()
+                proto = self.headers.get("X-Forwarded-Proto", "http")
+                host = self.headers.get("Host", "localhost")
+                with _lock:
+                    body = blog.rss(rt.graph, f"{proto}://{host}").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            # ── the open workshop: the notebook UI lives at /lab ────────────
+            elif path in ("/lab", "/lab/"):
                 self._send_static("index.html")
             elif path in ("/app.js", "/style.css"):
                 self._send_static(path)
@@ -671,7 +841,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_error_json("Not found", 404)
                 return
-            if path in ("/chat", "/lab/decision"):
+            if path in ("/chat", "/lab/decision", "/lab/pause", "/lab/resume"):
                 status, msg = _check_bearer(self.headers)
                 if status:
                     if status == 401:
@@ -692,6 +862,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif path == "/lab/decision":
                 self._handle_decision(body)
+            elif path in ("/lab/pause", "/lab/resume"):
+                self._handle_pause(path == "/lab/pause")
             else:
                 self._send_error_json("Not found", 404)
         except Exception as e:
@@ -796,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
             "uptime_seconds": int(time.monotonic() - _BOOT_TIME) if _BOOT_TIME else 0,
             "read_only": not _operator_token(),
             "llm": _llm_info,
+            **_operator_status(),  # 6c: paused, calls today/cap, cost today/cap
         })
 
     # ── GET /lab/draft?slug= ────────────────────────────────────────────────
@@ -975,6 +1148,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(out[2], out[1])
             return
         self._send_json(out[1])
+
+    # ── POST /lab/pause, /lab/resume (ADR-015) ──────────────────────────────
+
+    def _handle_pause(self, paused: bool):
+        """Flip the global pause: a lab.paused/lab.resumed marker event is the
+        durable state (rebuilt from the log at boot, like the daily cap)."""
+        from lab_pack.llm import lab_paused, set_lab_paused
+        _get_rt()
+
+        def job(rt):
+            if lab_paused() == paused:
+                return {"paused": paused, "changed": False}
+            set_lab_paused(rt.graph, paused, by="operator")
+            _save(rt)
+            return {"paused": paused, "changed": True}
+
+        self._send_json(_run_on_worker(job))
 
     # ── POST /reset ─────────────────────────────────────────────────────────
 

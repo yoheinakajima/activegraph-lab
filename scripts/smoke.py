@@ -122,20 +122,30 @@ def main() -> int:
     check(len(cands) == 1 and "as of event" in cands[0].data.get("content", ""),
           "stamped answer produced")
 
-    print("== draft_writer: seeded findings -> drafts + gated publish decisions ==")
+    print("== editorial discipline (ADR-014): seeded findings -> ONE digest ==")
+    findings = [o for o in g.objects(type="observation")
+                if (o.data.get("metadata") or {}).get("finding")]
     drafts = [a for a in g.objects(type="artifact") if a.data.get("kind") == "blog_draft"]
     pub_pending = [d for d in g.objects(type="decision")
                    if d.data.get("kind") == "publish" and d.data.get("status") == "pending"]
-    check(len(drafts) >= 3, f"blog drafts from seeded findings ({len(drafts)})")
+    check(len(findings) >= 5, f"seeded findings queued ({len(findings)})")
+    check(len(drafts) >= 1, f"digest drafted from accumulated findings ({len(drafts)})")
+    check(len(drafts) < len(findings),
+          f"no fire-per-finding: {len(drafts)} draft(s) from {len(findings)} findings")
+    digest_meta = drafts[0].data.get("metadata") or {} if drafts else {}
+    check(digest_meta.get("post_kind") == "note",
+          f"digest draft is post_kind=note ({digest_meta.get('post_kind')})")
+    check(len(digest_meta.get("finding_ids") or []) >= 3,
+          f"digest covers >=3 findings ({len(digest_meta.get('finding_ids') or [])})")
     check(all(a.data.get("status") == "draft" for a in drafts),
           "every draft is gated (status=draft, nothing published)")
-    check(len(pub_pending) >= 3, f"publish decisions pending ({len(pub_pending)})")
+    check(len(pub_pending) >= 1, f"publish decisions pending ({len(pub_pending)})")
     check(all("[^" in (a.data.get("content") or "") for a in drafts),
           "every draft carries evidence footnotes")
     check(all("*Provenance:*" in (a.data.get("content") or "") for a in drafts),
           "every draft carries a provenance block")
     files = list(Path(settings.drafts_dir).glob("*.md"))
-    check(len(files) >= 3, f"drafts mirrored to disk ({len(files)})")
+    check(len(files) >= 1, f"drafts mirrored to disk ({len(files)})")
 
     main_run_llm_calls = llm_usage()["total"]
 
@@ -207,18 +217,62 @@ def main() -> int:
         check(all((e.get("sentence") or "").strip() for e in all_entries),
               "no feed entry renders blank")
 
+        print("== blog SSR (ADR-013) ==")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as r:
+            home = r.read().decode()
+        check("Nothing is published yet" in home and "/lab" in home,
+              "pre-publish empty state explains the site and links to /lab")
+        from lab_pack.tools import approve_decision_fn
+        approve_decision_fn(g, pub_pending[0].id, True, "smoke: publish one post")
+        rt.run_until_idle()
+        published = [a for a in g.objects(type="artifact")
+                     if a.data.get("kind") == "blog_draft"
+                     and a.data.get("status") == "published"]
+        check(len(published) == 1, "approved publish decision published the artifact")
+        slug = (published[0].data.get("metadata") or {}).get("slug")
+        check(bool((published[0].data.get("metadata") or {}).get("published_at")),
+              "published artifact carries published_at")
+        check(any(str(e.type) == "artifact.published" for e in g.events),
+              "artifact.published event in the log")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as r:
+            home = r.read().decode()
+        check(f"/posts/{slug}" in home, "blog index lists the published post")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/posts/{slug}", timeout=10) as r:
+            post = r.read().decode()
+        check("Show the work" in post and "Evidence" in post,
+              "post page renders the provenance subgraph (Show the work)")
+        check("#branch=" in post, "post provenance links into the /lab thread view")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/feed.xml", timeout=10) as r:
+            feed_xml = r.read().decode()
+        check(f"/posts/{slug}" in feed_xml and "<rss" in feed_xml,
+              "RSS at /feed.xml lists the published post")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/lab", timeout=10) as r:
+            lab_html = r.read().decode()
+        check("app.js" in lab_html, "the notebook UI is served at /lab")
+
+        print("== operator controls (ADR-015) ==")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as r:
+            hz = json.loads(r.read())
+        check({"paused", "llm_calls_today", "llm_calls_cap",
+               "llm_cost_today", "llm_cost_cap"} <= set(hz),
+              "healthz reports paused + calls/cost against caps")
+        check(feed.get("status", {}).get("paused") is False,
+              "feed status block present (UI status line source)")
+
         # 2d: tokenless read succeeds (above); tokenless mutation must fail.
         import os as _os
         import urllib.error as _ue
         _os.environ.pop("LAB_OPERATOR_TOKEN", None)
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/chat", method="POST",
-            data=json.dumps({"branch_id": target.id, "content": "x"}).encode())
-        try:
-            urllib.request.urlopen(req, timeout=10)
-            check(False, "tokenless mutation must not succeed")
-        except _ue.HTTPError as e:
-            check(e.code in (401, 403), f"tokenless mutation refused ({e.code})")
+        for mpath, mbody in (("/chat", {"branch_id": target.id, "content": "x"}),
+                             ("/lab/pause", {})):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}{mpath}", method="POST",
+                data=json.dumps(mbody).encode())
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                check(False, f"tokenless mutation must not succeed ({mpath})")
+            except _ue.HTTPError as e:
+                check(e.code in (401, 403), f"tokenless mutation refused ({mpath}: {e.code})")
     finally:
         httpd.shutdown()
         lab_server._rt = None

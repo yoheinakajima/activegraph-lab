@@ -42,14 +42,23 @@ KERNEL_MANIFEST: tuple[str, ...] = (
 )
 
 # Settings that MAY be overridden through seams (ADR-012). Everything not
-# listed is kernel-adjacent: auth, gating, LLM budgets, and loader behavior
-# are not seams. This whitelist is kernel.
+# listed is kernel-adjacent: auth, gating, LLM call budgets, and loader
+# behavior are not seams. The daily COST ceiling is deliberately
+# seam-eligible (ADR-015) — tuning spend policy is self-modification through
+# the gate, while the call-count backstops stay in git. This whitelist is
+# kernel.
 SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "crawl_max_depth",
     "crawl_page_cap",
     "max_claims_per_page",
     "max_open_branches",
     "progress_interval_seconds",
+    # Editorial policy (ADR-014): tuning these IS self-modification.
+    "digest_min_findings",
+    "research_min_evidence",
+    "max_drafts_pending",
+    # Operator controls (ADR-015): the daily cost ceiling.
+    "daily_cost_cap_usd",
 })
 
 # Word-ish boundary match so "lab_pack.kernel" hits imports, attribute
