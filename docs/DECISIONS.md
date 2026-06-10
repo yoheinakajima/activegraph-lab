@@ -68,3 +68,33 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Date: 2026-06-10
 - Decision: The lab writes relations in signature order — `add_relation(source_id, target_id, type)` — everywhere, and reads mixed graphs through one documented helper, `lab_pack/compat.py:decode_relation`, which discriminates per relation (object ids contain `#`, relation type names never do). All lab code that reads relations goes through this helper.
 - Rationale: The packs repo is split on argument order (core/research/tool_gateway type-first; chat signature-order); a composed graph holds both encodings. Signature order is what runtime view traversal and relation queries require, so the lab writes it; the decode shim is quarantined in one place, linked to the friction observation seeded under the mission, and goes away if upstream standardizes (the lab's draft issue artifact proposes exactly that).
+
+## ADR-009: Storage — native PostgresEventStore, selected at boot
+
+- Status: accepted
+- Date: 2026-06-11
+- Decision: The event store is activegraph's native persistence layer (ag-coder pattern: a dedicated `activegraph` Postgres schema, framework-owned tables, fork/replay native, via `pip install "activegraph[postgres]"`). `DATABASE_URL` present → Postgres; absent → SQLite under `data/` (the dev/fixture default; fixtures stay keyless and deterministic). Backend selection lives in exactly one place (`lab_pack/storage.py`, kernel); no other code may know which store is active, and all projections read through runtime/event APIs, never raw SQL against framework tables.
+- Rationale: The log is the source of truth; the store is the framework's concern, not the lab's. One selection point keeps the swap auditable and the rest of the codebase backend-blind.
+- OPEN: memory_gateway's own store stays local-SQLite for now.
+
+## ADR-010: Deployment — Replit, continuously running
+
+- Status: accepted
+- Date: 2026-06-11
+- Decision: The lab deploys to Replit as a continuously running server; all durable state lives in managed Postgres (ADR-009), never the filesystem. A single operator authenticates with a bearer token (`LAB_OPERATOR_TOKEN`); all projections are publicly readable.
+- Rationale: One operator, one always-on process, zero filesystem state makes redeploys idempotent: the schema either has events (resume) or it doesn't (seed).
+
+## ADR-011: Public log policy
+
+- Status: accepted
+- Date: 2026-06-11
+- Decision: Operator chat is part of the public log, deliberately. No secrets in any event payload, observation, artifact, boot log, or error path — enforced by an automated sentinel audit (DATABASE_URL is a credential too).
+- Rationale: The lab's pitch is an inspectable agent; a private side-channel would undercut it. The cost is discipline about payloads, which the audit makes mechanical instead of aspirational.
+
+## ADR-012: Code residency — the four-tier ladder
+
+- Status: accepted
+- Date: 2026-06-11
+- Decision: Code lives in one of four tiers. KERNEL (GitHub only, forever): the gate behavior, auth middleware, event loop/runtime wiring, replay machinery, the storage adapter, and the seam/code loaders themselves — the thing that governs self-modification is never subject to it. SEAMS (graph-stored, gated): prompts, feed narration templates, whitelisted behavior settings values. GRAPH CODE (graph-stored, gated, dark by default): behaviors and tools drafted as artifacts, sandbox-tested, promoted only through an approved decision AND `LAB_ALLOW_GRAPH_CODE=1`. PLUMBING (GitHub, pragmatically): server, UI, scripts.
+- Enforcement: `lab_pack/kernel.py` is the manifest of protected module paths; the seam and code loaders refuse any graph artifact that names, imports from, shadows, or monkeypatches a manifest entry. The manifest itself is kernel. The seam-eligible settings whitelist is kernel.
+- Rationale: Graph-stored seams and code give perfect replay provenance — the code that ran is in the log that replays. The kernel stays in git for bootstrap and security. Self-modification is a capability like any other: one bit, gated, absolute (ADR-002).

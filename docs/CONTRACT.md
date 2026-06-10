@@ -17,7 +17,12 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 ## Authority
 
 - One bit per capability: `auto` or `gated`.
-- Publishing and self-modification are always gated.
+- Publishing and self-modification are always gated. Self-modification additionally requires its enabling flag (`LAB_ALLOW_GRAPH_CODE=1` for graph code) — an approved decision alone is not enough (ADR-012).
+
+## Code residency (ADR-012)
+
+- KERNEL stays in git forever: gate, auth, runtime wiring, replay, storage adapter, loaders, the manifest (`lab_pack/kernel.py`). The thing that governs self-modification is never subject to it.
+- SEAMS and GRAPH CODE live in the graph, gated; PLUMBING in git. Loaders refuse artifacts referencing the kernel manifest.
 
 ## Messages and steering
 
