@@ -2,21 +2,25 @@
 
 Build only the current milestone. Deferred items need an ADR to move up.
 
-## Milestone 0: doc scaffold (this session)
+## Milestone 0: doc scaffold — done
 
-Repo skeleton, the six governing docs. Done when this file exists.
+Repo skeleton, the six governing docs, ADR-003..006 amendments.
 
-## Milestone 1: lab_kernel
+## Milestone 1: lab_pack — current
 
-The pack: five object types, ingest behavior. Branch zero (`read_the_website`) runs against activegraph.ai and produces a gap list as evidence objects. No UI, no workers — kernel behaviors only. Done when the gap list exists in the graph and replays cleanly from the log.
+The single lab pack per ADR-003/004: three object types, six behaviors (ingest, plan, work, interpret, gate, answer), deterministic fixtures runnable without an API key (`python lab_pack/fixtures/run_fixtures.py`). Done when all fixtures pass.
 
-## Milestone 2: lab_interface
+## Milestone 2: bundle + thin server
 
-Message ingestion and the answer behavior. Done when you can talk to branch zero: send a message, get a stamped answer that reflects graph state without blocking on running work.
+`build_lab()` composing upstream packs + lab_pack, creating the activegraph.ai mission and the `read_the_website` seed branch. Thin server with `/graph`, `/trace`, `/chat`, `/reset`, `GET /lab/feed`. Done when you can talk to branch zero through `/chat` and read the feed projection.
 
-## Milestone 3: first worker adapter
+## Milestone 3: notebook feed UI
 
-`deep-research` adapter behind the worker contract (progress events or declared-uninterruptible). Done when a branch can dispatch a research task and the results land as evidence objects.
+`ui/`: feed view (reverse-chron, branch-grouped, pinned pending decisions) and thread view (one-scroll timeline, chat input, approve/reject). Done when a gated decision can be approved from the browser.
+
+## Milestone 4: live run
+
+Branch zero runs against https://activegraph.ai with a real LLM provider and real fetches through tool_gateway, producing a gap list as observation objects that replays cleanly from the log.
 
 ## Deferred
 
@@ -26,3 +30,5 @@ Message ingestion and the answer behavior. Done when you can talk to branch zero
 - Branch scoring
 - Multi-worker scheduling
 - Public site
+- Upstream the lab pack or its conventions to activegraph-packs if it proves general
+- Consume packs from PyPI once published

@@ -1,31 +1,27 @@
 # INTERFACE
 
-Outline. The UI is a projection of the event log — no state of its own (CONTRACT.md). Built starting Milestone 2.
+The UI is a projection of the event log — no state of its own (CONTRACT.md). Built fresh in `ui/`; the upstream Inspector is the separate debugging view (point it at the lab runtime — see README).
 
-## Thread = branch = runtime fork
+## Thread = branch
 
-One concept at three layers. A conversation thread in the UI is a branch object in the graph is a fork in the runtime. There is no separate chat model.
+One relation, not a new layer (ADR-004): a communication-pack `comm_thread` `discusses` a lab `branch`. Chatting in a thread is chatting inside the branch; the lab's `answer` behavior replies from graph state.
 
-## Timeline
+## Timeline (thread view)
 
-Inside a thread: run events and messages interleaved in one scroll, ordered by the log. The user reads what the agent did and says things into the same stream. No separate "activity" tab.
+Inside a thread: run events and chat messages interleaved in ONE scroll, ordered by the log. An input box posts to `/chat` with the thread→branch link. Pending decisions show approve/reject buttons that mutate the decision object through the API. No separate chat pane.
 
 ## Feed
 
-The home view: all branches, notebook register. Entries are agent-narrated — the agent writes what happened in each branch, in prose, as it happens. OPEN: narration cadence (per event, per work cycle, or on-demand summarization).
-
-## Inbox
-
-Gated decisions awaiting the user, each with its linked evidence attached inline. Approving or rejecting writes a decision object and its gate event. The inbox is the only place anything blocks on the user.
+The home view: reverse-chron entries projected from lab events via `GET /lab/feed`, grouped by branch. Each entry is one human sentence derived from event type + payload — template-based; LLM narration is a later branch. Pending decisions are pinned at the top — that is the inbox, not a separate page.
 
 ## Event-horizon stamps
 
-Every answer from the fast answer behavior is stamped with the last event it could see. If work is in flight, the stamp tells the user how stale the answer might be.
+Every answer is stamped with the last event it could see ("as of event N"). If work is in flight, the stamp tells the user how stale the answer might be.
 
 ## Fork rule
 
-Forking a thread anchors to a committed event only; the picker offers committed events, nothing in-flight. In-flight work stays with the parent branch.
+Forking anchors to a committed event only (`branch.fork_event_id`). In-flight work stays with the parent branch.
 
 ## Deferred
 
-Graph pane (visual object graph). Diff view (compare branches or artifact versions). Not in any current milestone.
+Graph pane. Fork diff view. LLM-narrated feed entries. OPEN: feed pagination (currently the server returns the full projection; paginate when it hurts).

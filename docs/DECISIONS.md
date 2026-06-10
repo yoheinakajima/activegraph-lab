@@ -25,3 +25,32 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Date: 2026-06-10
 - Decision: Each capability is either auto or gated; publishing and self-modification are always gated.
 - Rationale: Maturity ladders (trust levels, graduated autonomy tiers) are bureaucracy the lab can evolve later if evidence demands it. One bit is auditable at a glance and cheap to flip per capability via a gated decision.
+
+## ADR-003: Lab is a layered pack on core
+
+- Status: accepted; supersedes the "exactly five object types" invariant of ADR-001
+- Date: 2026-06-10
+- Decision: The lab is a layered pack on the activegraph-packs core pack. It adds exactly THREE object types (mission, branch, decision) and reuses core primitives: core artifact for outputs, core observation + evaluation for evidence, core task for work dispatch, core source for ingested pages/repos/papers.
+- Rationale: Core is the lingua franca; a parallel ontology would violate the conventions the lab is built on.
+- New invariant: adding a fourth lab object type requires a gated decision object AND an ADR.
+
+## ADR-004: No lab_interface pack
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: The upstream communication + chat packs provide threads, messages, intents, and message injection. Thread = branch is one relation (discusses: thread → branch) plus one answer behavior in the lab pack. The lab_kernel/lab_interface split collapses into a single lab pack (`lab_pack/`).
+- Rationale: The interface already exists upstream; we add a projection, not a layer.
+
+## ADR-005: Standalone repo, packs as pinned git dependency
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: activegraph-lab consumes activegraph-packs as a git dependency (`activegraph-packs @ git+https://github.com/yoheinakajima/activegraph-packs`, pinned to a commit SHA), with a single-line editable-install override for local dev. The lab is the first external consumer of the packs conventions; friction encountered while consuming them is evidence — record it as observations under the mission, and propose upstream issues as artifacts, never as direct edits to the packs repo. Bumping the pinned SHA is a gated decision the lab records about itself.
+- Rationale: The packs repo is a reference library, not a product; the lab is a product.
+
+## ADR-006: Workers via emergent coordination
+
+- Status: accepted
+- Date: 2026-06-10
+- Decision: The lab never calls domain packs directly. Its work behavior writes core task objects with a routing convention (task.kind or tags); research and codebase pack behaviors react. No adapters/ directory.
+- Rationale: Packs compose through graph state, not function calls — the packs repo's central design rule. An adapter layer would be a coordinator in disguise.
