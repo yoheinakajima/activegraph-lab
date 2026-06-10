@@ -139,3 +139,12 @@ table.seams th { color: var(--dim); font-family: ui-monospace, Menlo, monospace;
 .observer-note { color: var(--dim); font-style: italic; font-size: 13px; }
 footer { max-width: 760px; margin: 30px auto; padding: 0 22px; }
 footer a { color: var(--dim); font-size: 12px; }
+
+.chip.kind-publish { color: var(--accent); border-color: var(--accent); }
+.chip.kind-self_modify { color: #d88fc2; border-color: #d88fc2; }
+.chip.kind-promote { color: #9ec0d8; border-color: #9ec0d8; }
+#load-older {
+  font: inherit; font-size: 13px; margin: 10px 0; padding: 4px 14px;
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  border-radius: 4px; cursor: pointer;
+}

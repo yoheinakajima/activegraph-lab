@@ -22,7 +22,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
@@ -188,12 +188,72 @@ def _build_runtime():
     return rt
 
 
+# ─── runtime worker (6a) ──────────────────────────────────────────────────────
+# SSE needs a ThreadingHTTPServer (a stream holds its connection open), but
+# the event store is thread-bound. So ONE worker thread owns the runtime and
+# executes every mutation; request threads only read graph state under _lock.
+
+import queue
+
+
+class _RuntimeWorker(threading.Thread):
+    def __init__(self) -> None:
+        super().__init__(daemon=True, name="lab-runtime")
+        self.jobs: queue.Queue = queue.Queue()
+        self.ready = threading.Event()
+        self.boot_error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        global _rt
+        try:
+            with _lock:
+                _rt = _build_runtime()
+        except BaseException as exc:  # boot failure must surface, not hang
+            self.boot_error = exc
+            self.ready.set()
+            return
+        self.ready.set()
+        while True:
+            fn, fut = self.jobs.get()
+            try:
+                with _lock:
+                    fut["result"] = fn(_rt)
+            except BaseException as exc:
+                fut["error"] = exc
+            fut["done"].set()
+
+
+_worker: Optional[_RuntimeWorker] = None
+
+
 def _get_rt():
-    global _rt
-    with _lock:
-        if _rt is None:
-            _rt = _build_runtime()
-        return _rt
+    """Runtime accessor. Starts the worker on first use; in test mode
+    (lab_server._rt injected directly, no worker) returns it as-is."""
+    global _worker, _rt
+    if _rt is not None and _worker is None:
+        return _rt  # test mode: smoke/check_ui/test_auth inject _rt directly
+    if _worker is None:
+        _worker = _RuntimeWorker()
+        _worker.start()
+    _worker.ready.wait()
+    if _worker.boot_error is not None:
+        raise _worker.boot_error
+    return _rt
+
+
+def _run_on_worker(fn, timeout: float = 180):
+    """Execute a runtime mutation on the owning thread (store affinity).
+    Test mode (no worker): run inline under the lock."""
+    if _worker is None or not _worker.is_alive():
+        with _lock:
+            return fn(_rt)
+    fut = {"done": threading.Event(), "result": None, "error": None}
+    _worker.jobs.put((fn, fut))
+    if not fut["done"].wait(timeout):
+        raise TimeoutError("runtime worker did not finish in time")
+    if fut["error"] is not None:
+        raise fut["error"]
+    return fut["result"]
 
 
 # ─── serialization (projection helpers) ───────────────────────────────────────
@@ -392,12 +452,19 @@ def _narrate_patch(g, obj, diff: dict) -> Optional[str]:
     return None
 
 
-def _feed(rt) -> dict:
-    """The notebook feed: lab events joined with their objects, one sentence
-    each, grouped by branch, pending decisions pinned on top (the inbox)."""
-    g = rt.graph
+def _event_index(event_id: str) -> int:
+    try:
+        return int(str(event_id).rsplit("_", 1)[-1])
+    except ValueError:
+        return -1
+
+
+def _build_entries(g, timeline=None) -> list[dict]:
+    """Every renderable feed entry, chronological. Shared by /lab/feed,
+    /lab/entries (pagination) and /lab/stream (SSE)."""
     entries: list[dict] = []
-    timeline = _seam_template_timeline(g)
+    if timeline is None:
+        timeline = _seam_template_timeline(g)
     for i, e in enumerate(g.events):
         tmpl = (lambda kind, _i=i: _template_at(timeline, kind, _i))
         sentence = None
@@ -434,7 +501,20 @@ def _feed(rt) -> dict:
                         "title": data.get("title"),
                         "preview": _shorten(body.split("##", 1)[-1], 220),
                     }
+            entry["index"] = i
             entries.append(entry)
+    return entries
+
+
+def _feed(rt, limit: int = 100) -> dict:
+    """The notebook feed: lab events joined with their objects, one sentence
+    each, grouped by branch, pending decisions pinned on top (the inbox).
+    6b: returns the newest `limit` entries; older pages via /lab/entries."""
+    g = rt.graph
+    all_entries = _build_entries(g)
+    total_entries = len(all_entries)
+    entries = all_entries[-limit:] if limit and limit > 0 else all_entries
+    oldest_rendered = entries[0]["event_id"] if entries else None
 
     # The inbox: pending decisions with their evidence attached inline.
     inbox = []
@@ -476,6 +556,8 @@ def _feed(rt) -> dict:
         "llm": _llm_info,
         "mission": missions[0] if missions else None,
         "inbox": inbox,
+        "total_entries": total_entries,
+        "oldest_rendered": oldest_rendered,
         "mission_entries": mission_entries,
         "branches": sorted(
             branches.values(),
@@ -543,10 +625,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_static(path)
             elif path == "/lab/feed":
                 from lab_pack.watchdog import check_stalls
+                rt = _get_rt()
+                _run_on_worker(check_stalls)  # A5: stalled work is released
+                limit = int(qs.get("limit", 100))
                 with _lock:
-                    rt = _get_rt_unlocked()
-                    check_stalls(rt)  # A5: stalled work is released, never hangs silently
-                    self._send_json(_feed(rt))
+                    self._send_json(_feed(rt, limit=limit))
+            elif path == "/lab/entries":
+                self._handle_entries(qs)
+            elif path == "/lab/stream":
+                self._handle_stream()
             elif path == "/lab/draft":
                 self._handle_draft(qs)
             elif path == "/lab/seams":
@@ -607,6 +694,71 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             self._send_error_json("internal error", 500)
+
+    # ── GET /lab/entries (6b: "load older") ─────────────────────────────────
+
+    def _handle_entries(self, qs: dict):
+        rt = _get_rt()
+        limit = max(1, min(int(qs.get("limit", 100)), 500))
+        before = qs.get("before")
+        branch_id = qs.get("branch_id")
+        with _lock:
+            entries = _build_entries(rt.graph)
+        if before:
+            cut = _event_index(before)
+            entries = [e for e in entries if e["index"] < cut]
+        if branch_id:
+            want = None if branch_id == "mission" else branch_id
+            entries = [e for e in entries if e["branch_id"] == want]
+        page = entries[-limit:]
+        self._send_json({
+            "entries": list(reversed(page)),  # reverse-chron, like the feed
+            "oldest_rendered": page[0]["event_id"] if page else None,
+            "more": len(entries) > len(page),
+        })
+
+    # ── GET /lab/stream (6a: SSE) ───────────────────────────────────────────
+
+    def _handle_stream(self):
+        """Server-sent events: pushes new feed entries as they commit.
+        Runs on its own request thread (ThreadingHTTPServer); reads graph
+        state under _lock in 2s ticks, heartbeats every ~14s. The UI falls
+        back to polling on error."""
+        import time
+        _get_rt()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            with _lock:
+                last_count = len(_rt.graph.events)
+            ticks = 0
+            while ticks < 1800:  # ~1h max per connection; client reconnects
+                time.sleep(2)
+                ticks += 1
+                rt = _rt  # /reset may swap the runtime
+                if rt is None:
+                    break
+                with _lock:
+                    n = len(rt.graph.events)
+                    fresh = _build_entries(rt.graph) if n > last_count else []
+                if n > last_count:
+                    for entry in fresh:
+                        if entry["index"] >= last_count:
+                            self.wfile.write(
+                                f"data: {json.dumps(entry, default=str)}\n\n".encode())
+                    last_count = n
+                    self.wfile.flush()
+                elif ticks % 7 == 0:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     # ── GET /lab/seams ──────────────────────────────────────────────────────
 
@@ -751,10 +903,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("content and branch_id are required", 400)
             return
 
-        with _lock:
+        def job(rt):
             if rt.graph.get_object(branch_id) is None:
-                self._send_error_json(f"no such branch: {branch_id}", 404)
-                return
+                return None
             thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
             # 2b: a valid token IS the operator — no anonymous write path, and
             # the client does not get to choose its identity.
@@ -769,8 +920,14 @@ class Handler(BaseHTTPRequestHandler):
                      and c.data.get("created_by_behavior") == "lab.answer"]
             reply = cands[-1].data.get("content") if cands else "No reply produced."
             horizon = (cands[-1].data.get("metadata") or {}).get("event_horizon") if cands else None
-        self._send_json({"content": reply, "thread_id": thread_id,
-                         "branch_id": branch_id, "event_horizon": horizon})
+            return {"content": reply, "thread_id": thread_id,
+                    "branch_id": branch_id, "event_horizon": horizon}
+
+        out = _run_on_worker(job)
+        if out is None:
+            self._send_error_json(f"no such branch: {branch_id}", 404)
+            return
+        self._send_json(out)
 
     # ── POST /lab/decision ──────────────────────────────────────────────────
 
@@ -781,40 +938,44 @@ class Handler(BaseHTTPRequestHandler):
         from lab_pack.tools import approve_decision_fn
 
         reset_llm_run_counters()
-
-        rt = _get_rt()
+        _get_rt()
         decision_id = body.get("decision_id")
         approved = bool(body.get("approved"))
         if not decision_id:
             self._send_error_json("decision_id is required", 400)
             return
-        with _lock:
+        def job(rt):
             d = rt.graph.get_object(decision_id)
             if d is None or str(d.type) != "decision":
-                self._send_error_json(f"no such decision: {decision_id}", 404)
-                return
+                return ("error", 404, f"no such decision: {decision_id}")
             if d.data.get("status") != "pending":
-                self._send_error_json(f"decision is already {d.data.get('status')}", 409)
-                return
+                return ("error", 409, f"decision is already {d.data.get('status')}")
             approve_decision_fn(rt.graph, decision_id, approved,
                                 body.get("rationale") or "via /lab/decision")
             rt.run_until_idle()
             _save(rt)
             d = rt.graph.get_object(decision_id)
             subject = rt.graph.get_object(d.data.get("subject_ref"))
-        self._send_json({
-            "decision_id": decision_id,
-            "status": d.data.get("status"),
-            "subject_ref": d.data.get("subject_ref"),
-            "subject_status": subject.data.get("status") if subject is not None else None,
-        })
+            return ("ok", {
+                "decision_id": decision_id,
+                "status": d.data.get("status"),
+                "subject_ref": d.data.get("subject_ref"),
+                "subject_status": subject.data.get("status") if subject is not None else None,
+            })
+
+        out = _run_on_worker(job)
+        if out[0] == "error":
+            self._send_error_json(out[2], out[1])
+            return
+        self._send_json(out[1])
 
     # ── POST /reset ─────────────────────────────────────────────────────────
 
     def _handle_reset(self):
         from lab_pack import storage
-        global _rt
-        with _lock:
+
+        def job(rt):
+            global _rt
             _rt = None
             err = storage.dev_reset()
             if err is None:
@@ -826,10 +987,15 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         err = f"could not remove: {f}"
             if err:
-                self._send_error_json(err, 500)
-                return
-            rt = _get_rt_unlocked()
-        self._send_json({"status": "reset", "event_count": len(rt.graph.events)})
+                return ("error", err)
+            _rt = _build_runtime()
+            return ("ok", len(_rt.graph.events))
+
+        out = _run_on_worker(job)
+        if out[0] == "error":
+            self._send_error_json(out[1], 500)
+            return
+        self._send_json({"status": "reset", "event_count": out[1]})
 
 
 
@@ -839,14 +1005,6 @@ def _save(rt) -> None:
         rt.save_state()
     except Exception:
         pass
-
-def _get_rt_unlocked():
-    """_get_rt without re-acquiring _lock (callers already hold it)."""
-    global _rt
-    if _rt is None:
-        _rt = _build_runtime()
-    return _rt
-
 
 def main() -> None:
     import time
@@ -858,9 +1016,11 @@ def main() -> None:
               "READ-ONLY. All mutations (chat, decisions) will be refused until "
               "the token is configured.", flush=True)
     _get_rt()  # build/resume before accepting requests
-    # Single-threaded on purpose (demo_server pattern): the runtime and its
-    # SQLite store are owned by one thread; requests serialize through it.
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    # ThreadingHTTPServer so SSE streams can hold connections open (6a);
+    # store thread-affinity is preserved by the runtime worker, which owns
+    # the runtime and executes every mutation.
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
     print(f"[lab_server] listening on http://localhost:{port}  "
           f"(feed UI at /, API: /lab/feed /graph /trace /chat /lab/decision /reset)",
           flush=True)

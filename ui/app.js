@@ -2,7 +2,7 @@
    Pure projection: everything rendered here comes from GET /lab/feed; the only
    writes are POST /chat (talk inside a branch) and POST /lab/decision
    (approve/reject — the inbox). No client-side state beyond the current view.
-   Feed pagination: OPEN (docs/INTERFACE.md) — full projection for now. */
+   Feed pagination: cursor on event id (/lab/entries), 'load older'. */
 
 let FEED = null;
 let VIEW = { mode: "feed", branchId: null };
@@ -105,7 +105,7 @@ function decisionCard(d) {
   const ev = (d.evidence || [])
     .map(x => `<li>[${x.type}] ${escapeHtml(x.text)}</li>`).join("");
   card.innerHTML =
-    `<div class="kind">${d.kind} — awaiting approval</div>` +
+    `<div class="kind"><span class="chip kind-${d.kind}">${d.kind}</span> awaiting approval</div>` +
     `<div class="rationale">${escapeHtml(d.rationale || "")}</div>` +
     (d.subject_title ? `<div class="evidence">subject: ${escapeHtml(d.subject_title)}</div>` : "") +
     (ev ? `<ul class="evidence">${ev}</ul>` : "") +
@@ -248,6 +248,34 @@ function renderFeed() {
     ml.insertAdjacentHTML("beforeend", `<div class="empty">Nothing logged yet.</div>`);
   }
   FEED.mission_entries.slice(0, 12).forEach(e => ml.appendChild(entryNode(e)));
+
+  // 6b: cursor pagination on event id.
+  const older = document.createElement("div");
+  older.id = "older";
+  OLDER_ENTRIES.forEach(e => older.appendChild(entryNode(e)));
+  ml.appendChild(older);
+  if (FEED.oldest_rendered && (FEED.total_entries > 100 || OLDER_ENTRIES.length)) {
+    const btn = document.createElement("button");
+    btn.id = "load-older";
+    btn.textContent = "load older";
+    btn.onclick = loadOlder;
+    ml.appendChild(btn);
+  }
+}
+
+let OLDER_ENTRIES = [];
+let OLDER_CURSOR = null;
+
+async function loadOlder() {
+  const before = OLDER_CURSOR || FEED.oldest_rendered;
+  if (!before) return;
+  try {
+    const r = await fetch(`/lab/entries?before=${encodeURIComponent(before)}&limit=100`);
+    const data = await r.json();
+    OLDER_ENTRIES = OLDER_ENTRIES.concat(data.entries || []);
+    OLDER_CURSOR = data.oldest_rendered;
+    render();
+  } catch (e) { /* next click retries */ }
 }
 
 function renderThread() {
@@ -296,5 +324,34 @@ $("composer").onsubmit = async (ev) => {
   refresh();
 };
 
+/* 6a: SSE push with automatic fallback to polling. The stream is a refresh
+   trigger; the data always reloads through /lab/feed (one projection). */
+let POLL = null;
+let SSE = null;
+
+function startPolling() {
+  if (!POLL) POLL = setInterval(refresh, 3000);
+}
+function stopPolling() {
+  if (POLL) { clearInterval(POLL); POLL = null; }
+}
+function startStream() {
+  if (!window.EventSource) { startPolling(); return; }
+  try {
+    SSE = new EventSource("/lab/stream");
+    SSE.onopen = () => stopPolling();
+    SSE.onmessage = () => refresh();
+    SSE.onerror = () => {
+      try { SSE.close(); } catch (e) {}
+      SSE = null;
+      startPolling();
+      setTimeout(startStream, 30000); // retry SSE later
+    };
+  } catch (e) {
+    startPolling();
+  }
+}
+
 refresh();
-setInterval(refresh, 3000);
+startPolling();   // until the stream confirms open
+startStream();
