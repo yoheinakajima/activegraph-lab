@@ -570,6 +570,19 @@ def run_editorial() -> bool:
            f"expected {exp['draft_requests_total']} draft requests, got {len(requests())}")
     c.that(all(a.data.get("status") == "draft" for a in drafts()),
            "every draft stays gated (status=draft, nothing auto-published)")
+
+    # ── 5c: provenance-aware review notes ───────────────────────────────────
+    # The digest covered SEEDED findings — in fixture mode the model invents a
+    # first-person process narrative there, and the coverage check must flag
+    # it. The research draft's evidence arose from live work (a worker actor)
+    # — that draft must pass clean.
+    digest_body = drafts()[0].data.get("content") or ""
+    c.that("Review note (process claims)" in digest_body,
+           "seeded-finding draft flags the invented process narrative (5c)")
+    research_body = research_drafts[0].data.get("content") or "" if research_drafts else ""
+    c.that("Review note (process claims)" not in research_body,
+           "correctly-attributed (live-work) draft passes the process check clean")
+    print("  5c: seeded → process-claim flag; live-work → clean")
     return c.done("editorial")
 
 

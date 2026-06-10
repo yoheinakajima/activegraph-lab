@@ -1151,25 +1151,53 @@ def _slugify(text: str) -> str:
 
 _FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
 
+# 5b: first-person process claims — "I was reading…", "during my review…",
+# "I examined…" — are narrative about HOW the lab worked. Without an evidence
+# ref to a matching event they are invention: the lab's findings were often
+# seeded or produced by other behaviors, and the model must not imply
+# firsthand process it never performed.
+_PROCESS_CLAIM_RE = re.compile(
+    r"\bI was (?:reading|reviewing|examining|looking|browsing|crawling|digging)\b"
+    r"|\bduring my (?:review|reading|examination|investigation|crawl|research)\b"
+    r"|\bI (?:examined|reviewed|inspected|read through|sat down|dug into|"
+    r"went through|looked over|combed through)\b",
+    re.I)
+
 
 def _coverage_review(body: str) -> Optional[str]:
     """Claims-coverage check (draft contract): any substantive paragraph with
-    zero evidence refs gets flagged in a review note — never silently accepted."""
+    zero evidence refs gets flagged in a review note — never silently
+    accepted. Extension (5b): first-person process claims without a footnote
+    are flagged separately as possible invented narrative."""
     flagged = []
+    process_flagged = []
     for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
         if not para or para.startswith("#") or para.startswith("[^"):
             continue
+        has_footnote = bool(_FOOTNOTE_RE.search(para))
+        if _PROCESS_CLAIM_RE.search(para) and not has_footnote:
+            process_flagged.append(i + 1)
         if len(para) < 80:
             continue  # headings, transitions — not claims
-        if not _FOOTNOTE_RE.search(para):
+        if not has_footnote:
             flagged.append(i + 1)
-    if not flagged:
+    notes = []
+    if flagged:
+        notes.append(
+            "> **Review note (claims coverage):** paragraph(s) "
+            + ", ".join(map(str, flagged))
+            + " carry no evidence footnotes. Verify or cut before approving.")
+    if process_flagged:
+        notes.append(
+            "> **Review note (process claims):** paragraph(s) "
+            + ", ".join(map(str, process_flagged))
+            + " make first-person process claims (“I was reading…”, "
+            "“during my review…”) with no evidence ref to a matching "
+            "event — possible invented narrative. The injected draft context "
+            "says where each finding actually came from; verify or cut.")
+    if not notes:
         return None
-    return (
-        "\n\n> **Review note (claims coverage):** paragraph(s) "
-        + ", ".join(map(str, flagged))
-        + " carry no evidence footnotes. Verify or cut before approving."
-    )
+    return "\n\n" + "\n\n".join(notes)
 
 
 @llm_behavior(

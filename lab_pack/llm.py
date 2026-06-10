@@ -171,12 +171,22 @@ class LabMockProvider:
             cites = "".join(f"[^{i+1}]" for i in range(len(ev)))
             hint_m = re.findall(r'"post_kind_hint":\s*"(note|research|build)"', blob)
             kind = hint_m[-1] if hint_m else "note"
+            # 5c: when the injected draft context shows a SEEDED finding, the
+            # mock reproduces the failure mode the coverage check must catch —
+            # an invented first-person process narrative with no evidence ref.
+            # Live-work findings draft clean: deterministic both ways.
+            invented = ""
+            if re.search(r'"origin":\s*"seeded"', blob):
+                invented = ("I was reading the site late one evening and went "
+                            "through the commit history by hand before writing "
+                            "this up.\n\n")
             parsed = BlogDraft(
                 title=f"Lab note: {finding[:60].rstrip('. ')}",
                 slug=f"lab-note-{digest}",
                 post_kind=kind,
                 body_markdown=(
-                    f"## What we tried\n\nI followed the mission's loop on this finding: "
+                    f"## What we tried\n\n{invented}"
+                    f"I followed the mission's loop on this finding: "
                     f"{finding[:200]}{cites}\n\n"
                     f"## What happened\n\nThe runtime recorded the outcome as graph "
                     f"objects, linked below as footnotes.{cites}\n\n"
