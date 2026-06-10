@@ -397,6 +397,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_graph()
             elif path == "/trace":
                 self._handle_trace(qs)
+            elif path == "/summary":
+                self._handle_summary()
+            elif path == "/packs":
+                self._handle_packs()
             elif path == "/health":
                 self._send_json({"status": "ok", "llm": _llm_info})
             else:
@@ -447,6 +451,45 @@ class Handler(BaseHTTPRequestHandler):
         total = len(events)
         self._send_json({"events": events[offset:offset + limit],
                          "total": total, "offset": offset, "limit": limit})
+
+    # ── GET /summary, /packs (Inspector debugging-view compatibility) ───────
+
+    def _handle_summary(self):
+        rt = _get_rt()
+        with _lock:
+            objects = rt.graph.all_objects()
+            counts: dict[str, int] = {}
+            for o in objects:
+                counts[str(o.type)] = counts.get(str(o.type), 0) + 1
+            self._send_json({
+                "object_count": len(objects),
+                "relation_count": len(rt.graph.all_relations()),
+                "event_count": len(rt.graph.events),
+                "pack_count": len(rt.loaded_packs()),
+                "frame_count": 0,
+                "by_type": [{"type": t, "pack": "", "count": n} for t, n in counts.items()],
+                "runtime_ready": True,
+            })
+
+    def _handle_packs(self):
+        rt = _get_rt()
+        with _lock:
+            packs = []
+            for p in rt.loaded_packs():
+                packs.append({
+                    "name": p.name,
+                    "version": str(p.version),
+                    "description": getattr(p, "description", None),
+                    "object_types": [{"name": ot.name, "description": ot.description}
+                                     for ot in p.object_types],
+                    "relation_types": [{"name": rt_.name, "description": rt_.description}
+                                       for rt_ in p.relation_types],
+                    "behaviors": [{"name": b.name,
+                                   "trigger": str(b.on[0]) if b.on else None,
+                                   "creates": list(b.creates) if b.creates else []}
+                                  for b in p.behaviors],
+                })
+        self._send_json({"packs": packs, "total": len(packs)})
 
     # ── POST /chat ──────────────────────────────────────────────────────────
 
