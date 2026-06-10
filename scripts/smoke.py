@@ -181,6 +181,19 @@ def main() -> int:
         check(len(all_entries) > 5, f"feed entries present ({len(all_entries)})")
         check(all((e.get("sentence") or "").strip() for e in all_entries),
               "no feed entry renders blank")
+
+        # 2d: tokenless read succeeds (above); tokenless mutation must fail.
+        import os as _os
+        import urllib.error as _ue
+        _os.environ.pop("LAB_OPERATOR_TOKEN", None)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/chat", method="POST",
+            data=json.dumps({"branch_id": target.id, "content": "x"}).encode())
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            check(False, "tokenless mutation must not succeed")
+        except _ue.HTTPError as e:
+            check(e.code in (401, 403), f"tokenless mutation refused ({e.code})")
     finally:
         httpd.shutdown()
         lab_server._rt = None

@@ -36,6 +36,47 @@ if str(_REPO) not in sys.path:
 _lock = threading.Lock()
 _rt = None
 _llm_info: dict = {}
+_BOOT_TIME = None  # set in main()
+
+
+# ─── auth (KERNEL — ADR-010/012) ──────────────────────────────────────────────
+# Public GETs are open to everyone; mutations require the operator's bearer
+# token, compared with hmac.compare_digest. Token unset → read-only mode.
+
+import hmac
+from collections import deque
+
+_RATE_WINDOW_SECONDS = 60
+_RATE_MAX_MUTATIONS = 30
+_mutation_times: deque = deque()
+
+
+def _operator_token() -> str:
+    return os.environ.get("LAB_OPERATOR_TOKEN", "").strip()
+
+
+def _check_bearer(headers) -> tuple[int, str]:
+    """Returns (0, '') if authorized; else (http_status, message)."""
+    token = _operator_token()
+    if not token:
+        return 403, "read-only mode: LAB_OPERATOR_TOKEN is not set on the server"
+    supplied = (headers.get("Authorization") or "").strip()
+    if not supplied.startswith("Bearer ") or not supplied[7:].strip():
+        return 401, "missing bearer token"
+    if not hmac.compare_digest(supplied[7:].strip(), token):
+        return 403, "invalid token"
+    return 0, ""
+
+
+def _rate_limited() -> bool:
+    import time
+    now = time.monotonic()
+    while _mutation_times and now - _mutation_times[0] > _RATE_WINDOW_SECONDS:
+        _mutation_times.popleft()
+    if len(_mutation_times) >= _RATE_MAX_MUTATIONS:
+        return True
+    _mutation_times.append(now)
+    return False
 
 
 def _ts() -> str:
@@ -439,8 +480,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_summary()
             elif path == "/packs":
                 self._handle_packs()
-            elif path == "/health":
-                self._send_json({"status": "ok", "llm": _llm_info})
+            elif path == "/frames":
+                self._send_json({"frames": [], "total": 0})
+            elif path in ("/health", "/healthz"):
+                self._handle_healthz()
             else:
                 self._send_error_json("Not found", 404)
         except Exception as e:
@@ -452,17 +495,62 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         try:
+            # /reset exists only in dev — in prod it is a 404, no override.
+            if path == "/reset":
+                if os.environ.get("LAB_ENV", "dev") == "dev":
+                    self._handle_reset()
+                else:
+                    self._send_error_json("Not found", 404)
+                return
+            if path in ("/chat", "/lab/decision"):
+                status, msg = _check_bearer(self.headers)
+                if status:
+                    if status == 401:
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", "Bearer")
+                        body_b = json.dumps({"error": msg}).encode()
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body_b)))
+                        self.end_headers()
+                        self.wfile.write(body_b)
+                    else:
+                        self._send_error_json(msg, status)
+                    return
+                if _rate_limited():
+                    self._send_error_json("rate limited (30 mutations/min)", 429)
+                    return
             if path == "/chat":
                 self._handle_chat(body)
             elif path == "/lab/decision":
                 self._handle_decision(body)
-            elif path == "/reset":
-                self._handle_reset()
             else:
                 self._send_error_json("Not found", 404)
         except Exception as e:
             traceback.print_exc()
-            self._send_error_json(str(e), 500)
+            self._send_error_json("internal error", 500)
+
+    # ── GET /healthz ────────────────────────────────────────────────────────
+
+    def _handle_healthz(self):
+        import time
+        from lab_pack import storage
+        rt = _get_rt()
+        with _lock:
+            events = rt.graph.events
+            pending = sum(1 for d in rt.graph.objects(type="decision")
+                          if d.data.get("status") == "pending")
+            last_ts = str(events[-1].timestamp) if events else None
+            n = len(events)
+        self._send_json({
+            "status": "ok",
+            "backend": storage.backend(),
+            "event_count": n,
+            "last_event_ts": last_ts,
+            "pending_decisions": pending,
+            "uptime_seconds": int(time.monotonic() - _BOOT_TIME) if _BOOT_TIME else 0,
+            "read_only": not _operator_token(),
+            "llm": _llm_info,
+        })
 
     # ── GET /lab/draft?slug= ────────────────────────────────────────────────
 
@@ -577,12 +665,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error_json(f"no such branch: {branch_id}", 404)
                 return
             thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
+            # 2b: a valid token IS the operator — no anonymous write path, and
+            # the client does not get to choose its identity.
             thread_id, msg = send_branch_message_fn(
                 rt.graph, branch_id, content,
-                user_ref=body.get("user_ref") or "owner", thread_id=thread_id,
+                user_ref="operator", thread_id=thread_id,
             )
             rt.run_until_idle()
-            rt.save_state()
+            _save(rt)
             cands = [c for c in rt.graph.objects(type="comm_response_candidate")
                      if c.data.get("message_id") == msg.id
                      and c.data.get("created_by_behavior") == "lab.answer"]
@@ -618,7 +708,7 @@ class Handler(BaseHTTPRequestHandler):
             approve_decision_fn(rt.graph, decision_id, approved,
                                 body.get("rationale") or "via /lab/decision")
             rt.run_until_idle()
-            rt.save_state()
+            _save(rt)
             d = rt.graph.get_object(decision_id)
             subject = rt.graph.get_object(d.data.get("subject_ref"))
         self._send_json({
@@ -651,6 +741,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"status": "reset", "event_count": len(rt.graph.events)})
 
 
+
+def _save(rt) -> None:
+    """save_state on store-backed runtimes; no-op for ephemeral test runtimes."""
+    try:
+        rt.save_state()
+    except Exception:
+        pass
+
 def _get_rt_unlocked():
     """_get_rt without re-acquiring _lock (callers already hold it)."""
     global _rt
@@ -660,7 +758,14 @@ def _get_rt_unlocked():
 
 
 def main() -> None:
-    port = int(os.environ.get("LAB_PORT", "7799"))
+    import time
+    global _BOOT_TIME
+    _BOOT_TIME = time.monotonic()
+    port = int(os.environ.get("PORT") or os.environ.get("LAB_PORT") or "7799")
+    if not _operator_token():
+        print("[lab_server] WARNING: LAB_OPERATOR_TOKEN is not set — the lab is "
+              "READ-ONLY. All mutations (chat, decisions) will be refused until "
+              "the token is configured.", flush=True)
     _get_rt()  # build/resume before accepting requests
     # Single-threaded on purpose (demo_server pattern): the runtime and its
     # SQLite store are owned by one thread; requests serialize through it.

@@ -10,6 +10,46 @@ let LAST_ERROR = null;
 
 const $ = (id) => document.getElementById(id);
 
+/* 2c: observer mode. The token lives in localStorage, rides as a Bearer
+   header on mutations, and is NEVER rendered into the DOM. */
+function token() { try { return localStorage.getItem("lab_token") || ""; } catch (e) { return ""; } }
+function isOperator() { return !!token(); }
+function clearToken() { try { localStorage.removeItem("lab_token"); } catch (e) {} }
+
+async function mutate(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: token() ? { "Authorization": "Bearer " + token() } : {},
+    body: JSON.stringify(body),
+  });
+  if (r.status === 401 || r.status === 403) {
+    clearToken();
+    render();
+    const b = await r.json().catch(() => ({}));
+    throw new Error(b.error || `not authorized (${r.status})`);
+  }
+  return r;
+}
+
+function renderAuth() {
+  const link = $("auth-link");
+  const role = $("role");
+  if (isOperator()) {
+    role.textContent = "operator";
+    link.textContent = "log out";
+    link.onclick = (e) => { e.preventDefault(); clearToken(); render(); };
+  } else {
+    role.textContent = "observing";
+    link.textContent = "operator login";
+    link.onclick = (e) => {
+      e.preventDefault();
+      const t = window.prompt("Operator token:");
+      if (t) { try { localStorage.setItem("lab_token", t.trim()); } catch (err) {} }
+      render();
+    };
+  }
+}
+
 async function refresh() {
   try {
     const r = await fetch("/lab/feed");
@@ -69,10 +109,14 @@ function decisionCard(d) {
     `<div class="rationale">${escapeHtml(d.rationale || "")}</div>` +
     (d.subject_title ? `<div class="evidence">subject: ${escapeHtml(d.subject_title)}</div>` : "") +
     (ev ? `<ul class="evidence">${ev}</ul>` : "") +
-    `<button class="approve">Approve</button><button class="reject">Reject</button>` +
+    (isOperator()
+      ? `<button class="approve">Approve</button><button class="reject">Reject</button>`
+      : `<span class="observer-note">awaiting the operator</span>`) +
     `<span class="decision-error"></span>`;
-  card.querySelector(".approve").onclick = () => resolveDecision(card, d.id, true);
-  card.querySelector(".reject").onclick = () => resolveDecision(card, d.id, false);
+  if (isOperator()) {
+    card.querySelector(".approve").onclick = () => resolveDecision(card, d.id, true);
+    card.querySelector(".reject").onclick = () => resolveDecision(card, d.id, false);
+  }
   return card;
 }
 
@@ -84,10 +128,7 @@ function escapeHtml(s) {
 
 async function resolveDecision(card, id, approved) {
   try {
-    const r = await fetch("/lab/decision", {
-      method: "POST",
-      body: JSON.stringify({ decision_id: id, approved }),
-    });
+    const r = await mutate("/lab/decision", { decision_id: id, approved });
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       throw new Error(body.error || `server returned ${r.status}`);
@@ -131,6 +172,8 @@ function render() {
   $("llm").textContent = `llm: ${FEED.llm.mode}${FEED.llm.model ? " · " + FEED.llm.model : ""}`;
   $("horizon").textContent = `as of ${FEED.as_of_event || "—"}`;
 
+  renderAuth();
+  $("composer").style.display = isOperator() ? "" : "none";
   if (VIEW.mode === "feed") renderFeed(); else renderThread();
   $("feed-view").hidden = VIEW.mode !== "feed";
   $("thread-view").hidden = VIEW.mode !== "thread";
@@ -208,12 +251,9 @@ $("composer").onsubmit = async (ev) => {
   if (!content || !VIEW.branchId) return;
   input.value = "";
   try {
-    await fetch("/chat", {
-      method: "POST",
-      body: JSON.stringify({ branch_id: VIEW.branchId, content }),
-    });
+    await mutate("/chat", { branch_id: VIEW.branchId, content });
   } catch (e) {
-    LAST_ERROR = "Message not delivered — server unreachable.";
+    LAST_ERROR = `Message not delivered — ${e.message}.`;
   }
   refresh();
 };

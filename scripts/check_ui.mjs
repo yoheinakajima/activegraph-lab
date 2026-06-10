@@ -31,8 +31,8 @@ const dom = new JSDOM(html, { url: "http://localhost/", runScripts: "dangerously
 const { window } = dom;
 window.fetch = async (url, opts = {}) => {
   if ((opts.method || "GET") === "POST") {
-    posts.push({ url, body: JSON.parse(opts.body || "{}") });
-    return { ok: true, json: async () => ({ status: "ok" }) };
+    posts.push({ url, body: JSON.parse(opts.body || "{}"), headers: opts.headers || {} });
+    return { ok: true, status: 200, json: async () => ({ status: "ok" }) };
   }
   if (url === "/lab/feed") return { ok: true, json: async () => feed };
   return { ok: false, status: 404, json: async () => ({}) };
@@ -42,12 +42,31 @@ window.eval(appJs);
 await new Promise((r) => setTimeout(r, 100)); // let the initial refresh() settle
 const doc = window.document;
 
+console.log("== observer mode (default, no token) ==");
+check(!doc.querySelector("#inbox .decision-card button.approve"),
+  "observer mode hides approve/reject buttons");
+check(doc.getElementById("composer").style.display === "none",
+  "observer mode hides the composer");
+check(doc.getElementById("role").textContent === "observing",
+  "observing indicator shown");
+check(!doc.body.innerHTML.includes("test-operator-token"),
+  "token never rendered into the DOM");
+
+console.log("== operator mode (token in localStorage) ==");
+window.localStorage.setItem("lab_token", "test-operator-token");
+window.eval("render()");
+await new Promise((r) => setTimeout(r, 50));
+check(!doc.body.innerHTML.includes("test-operator-token"),
+  "token still never rendered after login");
+
 console.log("== feed view ==");
 const cards = doc.querySelectorAll("#inbox .decision-card");
 check(cards.length === feed.inbox.length && cards.length > 0,
   `inbox renders one card per pending decision (${cards.length}/${feed.inbox.length})`);
 check(!!doc.querySelector("#inbox .decision-card button.approve"),
-  "decision cards have approve/reject buttons");
+  "decision cards have approve/reject buttons (operator)");
+check(doc.getElementById("composer").style.display !== "none",
+  "composer visible for the operator");
 const groups = doc.querySelectorAll("#branches .branch-group");
 check(groups.length === feed.branches.length && groups.length > 0,
   `branch groups render (${groups.length}/${feed.branches.length})`);
@@ -97,6 +116,8 @@ await new Promise((r) => setTimeout(r, 50));
 const hit = posts.find((p) => p.url === "/lab/decision");
 check(!!hit && hit.body.decision_id === decisionId && hit.body.approved === true,
   `approve button POSTs {decision_id: ${decisionId}, approved: true} to /lab/decision`);
+check(!!hit && hit.headers && hit.headers.Authorization === "Bearer test-operator-token",
+  "mutation carries the Bearer header");
 
 console.log(`\ncheck_ui (jsdom): ${failures.length === 0 ? "PASS" : "FAIL"} (${failures.length} failure(s))`);
 process.exit(failures.length === 0 ? 0 : 1);

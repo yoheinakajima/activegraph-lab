@@ -124,3 +124,8 @@ h3.register {
 .draft-preview { margin: 4px 0 4px 18px; font-size: 13px; }
 .draft-preview a { color: var(--accent); }
 .draft-preview .snippet { color: var(--dim); font-style: italic; }
+
+#role { color: var(--warn); }
+.observer-note { color: var(--dim); font-style: italic; font-size: 13px; }
+footer { max-width: 760px; margin: 30px auto; padding: 0 22px; }
+footer a { color: var(--dim); font-size: 12px; }
