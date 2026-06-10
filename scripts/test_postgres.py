@@ -47,10 +47,10 @@ def main() -> int:
         "<p>ActiveGraph is an event-sourced agent runtime. Every mutation is "
         "appended to an event log before it changes graph state.</p>")}
 
-    def fetch(u, **_kw):
-        page = pages.get(u.rstrip("/"))
-        return ({"url": u, "status": 200, "content": page} if page
-                else {"url": u, "status": 404, "content": "", "error": "404"})
+    def fetch(url, **_kw):
+        page = pages.get(url.rstrip("/"))
+        return ({"url": url, "status": 200, "content": page} if page
+                else {"url": url, "status": 404, "content": "", "error": "404"})
 
     print("== boot fresh on postgres ==")
     clear_lab_registry()

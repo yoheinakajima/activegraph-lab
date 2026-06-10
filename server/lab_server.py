@@ -430,7 +430,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # CORS: public reads are permissive; mutations are same-origin (no
+        # Access-Control-Allow-Origin on POST responses, none preflighted).
+        if self.command == "GET":
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(body)
 
@@ -450,9 +456,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        # Only reads are cross-origin; preflight never green-lights mutations.
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -486,9 +493,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_healthz()
             else:
                 self._send_error_json("Not found", 404)
-        except Exception as e:
-            traceback.print_exc()
-            self._send_error_json(str(e), 500)
+        except Exception:
+            traceback.print_exc()  # details to stderr only (ADR-011)
+            self._send_error_json("internal error", 500)
 
     def do_POST(self):
         path = urlparse(self.path).path
