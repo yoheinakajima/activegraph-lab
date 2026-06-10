@@ -114,3 +114,13 @@ h3.register {
   border: 1px solid var(--accent); background: none; color: var(--accent);
 }
 .empty { color: var(--dim); font-style: italic; padding: 8px 0; }
+
+#error-banner {
+  display: none; background: #3a2420; color: #d9a05b;
+  padding: 8px 22px; font-size: 13px;
+  border-bottom: 1px solid #c97a6a;
+}
+.decision-error { color: #c97a6a; font-size: 13px; margin-left: 8px; }
+.draft-preview { margin: 4px 0 4px 18px; font-size: 13px; }
+.draft-preview a { color: var(--accent); }
+.draft-preview .snippet { color: var(--dim); font-style: italic; }

@@ -6,21 +6,32 @@
 
 let FEED = null;
 let VIEW = { mode: "feed", branchId: null };
+let LAST_ERROR = null;
 
 const $ = (id) => document.getElementById(id);
 
 async function refresh() {
   try {
     const r = await fetch("/lab/feed");
+    if (!r.ok) throw new Error(`feed returned ${r.status}`);
     FEED = await r.json();
-    render();
-  } catch (e) { /* server restarting; next poll wins */ }
+    LAST_ERROR = null;
+  } catch (e) {
+    LAST_ERROR = "Server unreachable. Retrying every few seconds; leave this tab open.";
+  }
+  render();
 }
 
-function fmtTime(ts) {
+/* C2: relative timestamps — "just now", "4m ago", "2h ago", then the date. */
+function relTime(ts) {
   if (!ts) return "";
-  const m = ts.match(/T(\d\d:\d\d:\d\d)/);
-  return m ? m[1] : ts;
+  const then = new Date(ts);
+  if (isNaN(then)) return ts;
+  const s = Math.max(0, (Date.now() - then.getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return then.toISOString().slice(0, 10);
 }
 
 function entryClass(sentence) {
@@ -32,15 +43,25 @@ function entryClass(sentence) {
 function entryNode(e) {
   const div = document.createElement("div");
   div.className = entryClass(e.sentence);
-  div.innerHTML = `<span class="when">${fmtTime(e.timestamp)} ${e.event_id}</span>` +
+  div.innerHTML = `<span class="when">${relTime(e.timestamp)} · ${e.event_id}</span>` +
                   `<span class="text"></span>`;
   div.querySelector(".text").textContent = e.sentence;
+  if (e.artifact && e.artifact.slug) {
+    const a = document.createElement("div");
+    a.className = "draft-preview";
+    a.innerHTML = `<a href="/lab/draft?slug=${encodeURIComponent(e.artifact.slug)}" ` +
+                  `target="_blank">read draft: ${escapeHtml(e.artifact.slug)}.md</a>` +
+                  `<div class="snippet"></div>`;
+    a.querySelector(".snippet").textContent = e.artifact.preview || "";
+    div.appendChild(a);
+  }
   return div;
 }
 
 function decisionCard(d) {
   const card = document.createElement("div");
   card.className = "decision-card";
+  card.dataset.decisionId = d.id;
   const ev = (d.evidence || [])
     .map(x => `<li>[${x.type}] ${escapeHtml(x.text)}</li>`).join("");
   card.innerHTML =
@@ -48,9 +69,10 @@ function decisionCard(d) {
     `<div class="rationale">${escapeHtml(d.rationale || "")}</div>` +
     (d.subject_title ? `<div class="evidence">subject: ${escapeHtml(d.subject_title)}</div>` : "") +
     (ev ? `<ul class="evidence">${ev}</ul>` : "") +
-    `<button class="approve">Approve</button><button class="reject">Reject</button>`;
-  card.querySelector(".approve").onclick = () => resolveDecision(d.id, true);
-  card.querySelector(".reject").onclick = () => resolveDecision(d.id, false);
+    `<button class="approve">Approve</button><button class="reject">Reject</button>` +
+    `<span class="decision-error"></span>`;
+  card.querySelector(".approve").onclick = () => resolveDecision(card, d.id, true);
+  card.querySelector(".reject").onclick = () => resolveDecision(card, d.id, false);
   return card;
 }
 
@@ -60,17 +82,50 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
-async function resolveDecision(id, approved) {
-  await fetch("/lab/decision", {
-    method: "POST",
-    body: JSON.stringify({ decision_id: id, approved }),
-  });
+async function resolveDecision(card, id, approved) {
+  try {
+    const r = await fetch("/lab/decision", {
+      method: "POST",
+      body: JSON.stringify({ decision_id: id, approved }),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || `server returned ${r.status}`);
+    }
+  } catch (e) {
+    /* C3: decision failure — plain text on the card, decision stays pending. */
+    const slot = card.querySelector(".decision-error");
+    if (slot) slot.textContent = ` could not apply: ${e.message}`;
+    return;
+  }
   refresh();
 }
 
 function render() {
-  if (!FEED) return;
-  $("mission-title").textContent = FEED.mission ? FEED.mission.data.title : "(no mission)";
+  /* C3: server unreachable — one plain banner, keep last good content. */
+  let banner = $("error-banner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "error-banner";
+    document.body.prepend(banner);
+  }
+  banner.textContent = LAST_ERROR || "";
+  banner.style.display = LAST_ERROR ? "block" : "none";
+  if (!FEED) {
+    if (!LAST_ERROR) {
+      $("mission-title").textContent = "loading…";
+    }
+    return;
+  }
+
+  /* C2: pending decisions visible in the tab title. */
+  const pending = FEED.inbox.length;
+  document.title = pending ? `(${pending}) activegraph-lab` : "activegraph-lab";
+
+  /* C3: before mission boot. */
+  $("mission-title").textContent = FEED.mission
+    ? FEED.mission.data.title
+    : "No mission yet — the lab boots one on first run.";
   const crawl = FEED.mission && FEED.mission.data.metadata.crawl;
   $("crawl").textContent = crawl ? `crawl ${crawl.fetched}/${crawl.page_cap} pages` : "";
   $("llm").textContent = `llm: ${FEED.llm.mode}${FEED.llm.model ? " · " + FEED.llm.model : ""}`;
@@ -93,12 +148,14 @@ function renderFeed() {
   const wrap = $("branches");
   wrap.innerHTML = `<h3 class="register">Branches</h3>`;
   if (!FEED.branches.length) {
-    wrap.insertAdjacentHTML("beforeend", `<div class="empty">No branches yet.</div>`);
+    wrap.insertAdjacentHTML("beforeend",
+      `<div class="empty">No branches yet — the seed branch appears after first boot.</div>`);
   }
   FEED.branches.forEach(b => {
     const d = b.branch.data;
     const g = document.createElement("div");
     g.className = "branch-group";
+    g.dataset.branchId = b.branch.id;
     g.innerHTML =
       `<div class="branch-head"><span class="title"></span>` +
       `<span class="chip ${d.status}">${d.status}</span></div>`;
@@ -113,6 +170,9 @@ function renderFeed() {
 
   const ml = $("mission-log");
   ml.innerHTML = `<h3 class="register">Mission log</h3>`;
+  if (!FEED.mission_entries.length) {
+    ml.insertAdjacentHTML("beforeend", `<div class="empty">Nothing logged yet.</div>`);
+  }
   FEED.mission_entries.slice(0, 12).forEach(e => ml.appendChild(entryNode(e)));
 }
 
@@ -147,10 +207,14 @@ $("composer").onsubmit = async (ev) => {
   const content = input.value.trim();
   if (!content || !VIEW.branchId) return;
   input.value = "";
-  await fetch("/chat", {
-    method: "POST",
-    body: JSON.stringify({ branch_id: VIEW.branchId, content }),
-  });
+  try {
+    await fetch("/chat", {
+      method: "POST",
+      body: JSON.stringify({ branch_id: VIEW.branchId, content }),
+    });
+  } catch (e) {
+    LAST_ERROR = "Message not delivered — server unreachable.";
+  }
   refresh();
 };
 
