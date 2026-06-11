@@ -266,19 +266,32 @@ def _build_runtime():
         n = seams.apply_approved(rt.graph)
         if n:
             print(f"[lab_server] seams: re-applied {n} approved prompt seam(s)", flush=True)
+        # ADR-015 state (paused, budgets) rebuilds from the log BEFORE the
+        # boot run cycle below — a log whose tail is lab.paused must gate the
+        # very first drain, not discover the pause afterwards.
+        from lab_pack.llm import reset_llm_run_counters, sync_daily_budget
+        sync_daily_budget(rt)
         # Findings discovered after first deploy reach a resumed log here
         # (fresh builds get them via _seed_findings; the key dedups).
         from lab_pack.bundle import queue_findings_once
         mission = next(iter(rt.graph.objects(type="mission")), None)
         seed_branch = next(iter(rt.graph.objects(type="branch")), None)
+        n_f = 0
         if mission is not None and seed_branch is not None:
             n_f = queue_findings_once(rt.graph, branch_id=str(seed_branch.id),
                                       mission_id=str(mission.id))
             if n_f:
-                rt.run_until_idle()
-                rt.save_state()
                 print(f"[lab_server] findings: backfilled {n_f} live finding(s)",
                       flush=True)
+        # The boot run cycle ALWAYS happens — paused gates which behaviors
+        # fire (everything but answer idles, via the LLM gate), never whether
+        # the worker runs. Replay requeues every event that never fired a
+        # behavior (everything after the log's last runtime.idle); without
+        # this drain a process that boots into paused=true parks that backlog
+        # — and any backfilled findings — until the next unrelated mutation.
+        reset_llm_run_counters()
+        rt.run_until_idle()
+        rt.save_state()
     else:
         mode = "fresh"
         rt = build_lab(
@@ -844,6 +857,25 @@ def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
             + (reply["reply_event_ids"] if reply else [])}
 
 
+def _pause_job(rt, paused: bool) -> dict:
+    """Flip the global pause (ADR-015). Runs on the runtime worker. A resume
+    drains immediately: the lab.resumed marker must take effect in the running
+    process — queued triggers (including any replay-requeued backlog) fire on
+    this run cycle, not at the next unrelated mutation. Pausing needs no
+    drain: the LLM gate idles behaviors per call, and triggers that arrive
+    while paused are consumed (as skip observations) by whichever run cycle
+    meets them."""
+    from lab_pack.llm import lab_paused, reset_llm_run_counters, set_lab_paused
+    if lab_paused() == paused:
+        return {"paused": paused, "changed": False}
+    set_lab_paused(rt.graph, paused, by="operator")
+    if not paused:
+        reset_llm_run_counters()
+        rt.run_until_idle()
+    _save(rt)
+    return {"paused": paused, "changed": True}
+
+
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
 
 _UI_DIR = _REPO / "ui"
@@ -1398,17 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_pause(self, paused: bool):
         """Flip the global pause: a lab.paused/lab.resumed marker event is the
         durable state (rebuilt from the log at boot, like the daily cap)."""
-        from lab_pack.llm import lab_paused, set_lab_paused
         _get_rt()
-
-        def job(rt):
-            if lab_paused() == paused:
-                return {"paused": paused, "changed": False}
-            set_lab_paused(rt.graph, paused, by="operator")
-            _save(rt)
-            return {"paused": paused, "changed": True}
-
-        self._send_json(_run_on_worker(job))
+        self._send_json(_run_on_worker(lambda rt: _pause_job(rt, paused)))
 
     # ── POST /reset ─────────────────────────────────────────────────────────
 

@@ -276,8 +276,10 @@ def main() -> int:
         # Simulate a stuck worker for the reply phase only: the bounded wait
         # is the one call that passes an explicit timeout, so key on that.
         real_row = lab_server._run_on_worker
+        seen_waits: list = []
         def stuck_reply(fn, timeout=180):
             if timeout != 180:
+                seen_waits.append(timeout)
                 raise TimeoutError("simulated: runtime worker did not finish in time")
             return real_row(fn, timeout)
         lab_server._run_on_worker = stuck_reply
@@ -290,6 +292,9 @@ def main() -> int:
         check(s == 200 and isinstance(out, dict)
               and out.get("status") == "reply_pending",
               f"timed-out reply → structured partial success ({out.get('status') if isinstance(out, dict) else out})")
+        check(seen_waits == [15],
+              f"reply wait defaults to 15s — under claude.ai's tool timeout "
+              f"({seen_waits})")
         check(len(out.get("message_event_ids", [])) >= 1,
               "partial carries the committed message event ids")
         check("get_branch" in (out.get("detail") or ""),
@@ -309,8 +314,68 @@ def main() -> int:
         check(any("timeout path" in e["sentence"] for e in br.get("entries", [])),
               "get_branch shows the pending message (the advertised poll path)")
 
-        print("== rate limiter shared with the rest of the server ==")
+        print("== reply wait is a seam setting; slow reply → reply_pending within the bound ==")
         import time
+        from lab_pack.seams import propose_seam_fn
+        propose_seam_fn(rt.graph, "setting.mcp_reply_wait_seconds", "1",
+                        "test_mcp: tighten the MCP reply wait")
+        rt.run_until_idle()
+        dw = next(d for d in rt.graph.objects(type="decision")
+                  if d.data.get("kind") == "self_modify"
+                  and d.data.get("status") == "pending"
+                  and (d.data.get("metadata") or {}).get("seam_name")
+                  == "setting.mcp_reply_wait_seconds")
+        approve_decision_fn(rt.graph, dw.id, True, "test_mcp: approve reply wait seam")
+        rt.run_until_idle()
+        # A reply phase slower than the bound: test mode runs jobs inline and
+        # ignores the timeout, so enforce it for real here — and substitute a
+        # reply collector that cannot land within the 1s seam bound. The
+        # sleeper never touches the runtime, so the side thread is safe.
+        real_collect = lab_server._chat_collect_reply
+        def slow_collect(rt_, message_id):
+            time.sleep(6)
+            return None
+        def bounded_row(fn, timeout=180):
+            if timeout == 180:
+                return real_row(fn, timeout)
+            seen_waits.append(timeout)
+            box: dict = {}
+            def run():
+                try:
+                    box["result"] = fn(lab_server._rt)
+                except BaseException as exc:
+                    box["error"] = exc
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            t.join(timeout)
+            if t.is_alive():
+                raise TimeoutError("runtime worker did not finish in time")
+            if "error" in box:
+                raise box["error"]
+            return box.get("result")
+        seen_waits.clear()
+        lab_server._chat_collect_reply = slow_collect
+        lab_server._run_on_worker = bounded_row
+        t0 = time.monotonic()
+        try:
+            s, _, out = call_tool(base, "send_chat",
+                                  {"branch_id": seed_branch.id,
+                                   "message": "does a slow reply stay within the bound?"})
+        finally:
+            lab_server._chat_collect_reply = real_collect
+            lab_server._run_on_worker = real_row
+        elapsed = time.monotonic() - t0
+        check(seen_waits == [1],
+              f"approved seam overrides the reply wait (15 → 1) ({seen_waits})")
+        check(s == 200 and isinstance(out, dict)
+              and out.get("status") == "reply_pending" and elapsed < 5,
+              f"slow reply → reply_pending within the bound ({elapsed:.1f}s)")
+        check(rt.graph.get_object(out.get("message_id")) is not None
+              if isinstance(out, dict) else False,
+              "the slow-path message still landed in the log")
+        rt.run_until_idle()  # drain the pending answer before later sections
+
+        print("== rate limiter shared with the rest of the server ==")
         lab_server._mutation_times.clear()
         lab_server._mutation_times.extend([time.monotonic()] * 30)
         s, b = rpc(base, "tools/call",

@@ -1,0 +1,18 @@
+description: |
+  Boot-into-paused (the evt_1702/1845/1846/1847 incident): a persisted log
+  whose tail is lab.paused plus an undrained trigger must boot with a live
+  worker. Covers: pause state rebuilt from the log BEFORE the boot drain;
+  the boot run cycle always happens (the replay-requeued backlog is
+  processed — queue empty — with paused gating the behaviors, never the
+  worker); answer still replies on a paused boot; resume takes effect in
+  the running process (lab.resumed + immediate drain, autonomous behavior
+  fires on the next trigger, no restart); the incident itself is queued as
+  a finding.
+
+settings:
+  crawl_enabled: false
+
+expected_outputs:
+  queue_depth_after_boot: 0
+  proposed_while_paused: 0
+  resumed_proposes: 1

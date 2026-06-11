@@ -107,7 +107,8 @@ TOOLS: list[dict] = [
                        "lab's reply, its event-horizon stamp, and the event "
                        "ids created — or status=reply_pending with the "
                        "message event ids when the message landed but the "
-                       "reply missed the bounded wait (poll get_branch).",
+                       "reply missed the bounded wait (default 15s; poll "
+                       "get_branch).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -295,11 +296,18 @@ def _tool_failure(msg_id: Any, message: str) -> dict:
                                 "isError": True})
 
 
-# Bounded wait for the reply phase. The answer behavior's own LLM call is
-# capped at 60s; past this the message is still committed and the reply, if
-# it lands, is visible via get_branch — so the tool reports partial success
-# instead of a generic error.
-REPLY_WAIT_SECONDS = 60
+# Bounded wait for the reply phase. MCP clients enforce their own tool
+# timeouts (claude.ai errors out well under the answer behavior's 60s LLM
+# cap), so the wait must come in under theirs: past the bound the message is
+# still committed and the reply, if it lands, is visible via get_branch — so
+# the tool reports partial success instead of the client seeing a transport
+# error. The value is setting.mcp_reply_wait_seconds, seam-whitelisted
+# (lab_pack/kernel.py), default 15.
+def _reply_wait_seconds(graph) -> int:
+    from lab_pack.seams import effective_setting
+    from lab_pack.settings import LabSettings
+    return max(1, int(effective_setting(graph, LabSettings(),
+                                        "mcp_reply_wait_seconds")))
 
 
 def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
@@ -313,6 +321,7 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     with lock:
         b = rt.graph.get_object(branch_id)
         status = b.data.get("status") if b is not None and str(b.type) == "branch" else None
+        reply_wait = _reply_wait_seconds(rt.graph)
     if status is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
     if status == "archived":
@@ -328,7 +337,7 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     try:
         reply = run_on_worker(
             lambda rt: _chat_collect_reply(rt, posted["message_id"]),
-            REPLY_WAIT_SECONDS)
+            reply_wait)
     except Exception:
         import traceback
         traceback.print_exc()  # details to stderr only (ADR-011)

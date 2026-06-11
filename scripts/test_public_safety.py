@@ -91,9 +91,10 @@ def _run() -> int:
         # DATABASE_URL point nowhere; backend() still reads them, which is
         # exactly what we audit.
         rt = build_lab(
-            # max_total=3: under ADR-014 the digest drafts once, so the
-            # session makes fewer LLM calls — 3 still exhausts mid-run.
-            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=3,
+            # max_total=4: under ADR-014 the digest drafts once, so the
+            # session makes few LLM calls — 4 leaves plan one proposal and
+            # still exhausts mid-run (the paused-boot finding added a call).
+            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=4,
                                             prompt_bodies=_lab_prompt_bodies()),
             lab_settings=LabSettings(drafts_dir=tempfile.mkdtemp()),
             fetch_handler=fetch)
