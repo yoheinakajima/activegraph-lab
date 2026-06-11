@@ -124,7 +124,7 @@ def _run() -> int:
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                         "params": params or {}}).encode(),
             get_rt=lambda: rt, lock=threading.Lock(),
-            run_on_worker=lambda fn: fn(rt), rate_limited=lambda: False)
+            run_on_worker=lambda fn, *_t: fn(rt), rate_limited=lambda: False)
         return resp
 
     mcp_outputs = [mcp_call("initialize", {"protocolVersion": "2025-06-18"})]
@@ -173,6 +173,99 @@ def _run() -> int:
             except urllib.error.HTTPError as e:
                 url_outputs.append({"status": e.code,
                                     "body": (e.read() or b"").decode()})
+
+        # ── OAuth flow (ADR-017): DCR → authorize → PKCE → token →
+        # tools/call, end to end over HTTP. The 302 Location and the /token
+        # response are the intended delivery channels; everything ELSE the
+        # flow shows the public (metadata, the authorize page, error bodies,
+        # the OAuth-borne chat's events) joins the corpus, and the minted
+        # code/access/refresh tokens become sentinels that must be absent
+        # from it — as must any other LAB_MCP_TOKEN-derived value.
+        import base64
+        import hashlib
+        import secrets as _secrets
+        from urllib.parse import parse_qs as _pq
+        from urllib.parse import urlencode, urlparse as _up
+        from server import oauth
+
+        oauth_outputs = []
+        oauth_secrets = {}
+        with contextlib.redirect_stdout(http_log), contextlib.redirect_stderr(http_log):
+            def get(path):
+                with urllib.request.urlopen(base + path, timeout=10) as r:
+                    return r.read().decode()
+
+            def post(path, data: bytes, ctype: str):
+                req = urllib.request.Request(base + path, method="POST", data=data)
+                req.add_header("Content-Type", ctype)
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        return r.status, dict(r.headers), r.read().decode()
+                except urllib.error.HTTPError as e:
+                    return e.code, dict(e.headers), (e.read() or b"").decode()
+
+            oauth_outputs.append(get("/.well-known/oauth-authorization-server"))
+            oauth_outputs.append(get("/.well-known/oauth-protected-resource/mcp"))
+            cb = "https://claude.ai/api/mcp/auth_callback"
+            s, _, body = post("/register",
+                              json.dumps({"redirect_uris": [cb]}).encode(),
+                              "application/json")
+            oauth_outputs.append(body)
+            client_id = json.loads(body)["client_id"]
+            verifier = base64.urlsafe_b64encode(_secrets.token_bytes(32)).rstrip(b"=").decode()
+            challenge = base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+            auth_q = {"response_type": "code", "client_id": client_id,
+                      "redirect_uri": cb, "code_challenge": challenge,
+                      "code_challenge_method": "S256", "state": "audit-state"}
+            oauth_outputs.append(get("/authorize?" + urlencode(auth_q)))
+
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+
+            req = urllib.request.Request(
+                base + "/authorize", method="POST",
+                data=urlencode({**auth_q,
+                                "token": os.environ["LAB_MCP_TOKEN"]}).encode())
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            try:
+                resp = urllib.request.build_opener(_NoRedirect).open(req, timeout=10)
+                loc = resp.headers.get("Location", "")
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location", "")
+            oauth_secrets["oauth_code"] = (_pq(_up(loc).query).get("code") or [""])[0]
+            s, _, body = post("/token", urlencode({
+                "grant_type": "authorization_code",
+                "code": oauth_secrets["oauth_code"], "code_verifier": verifier,
+                "client_id": client_id, "redirect_uri": cb}).encode(),
+                "application/x-www-form-urlencoded")
+            tok = json.loads(body)
+            oauth_secrets["oauth_access_token"] = tok["access_token"]
+            oauth_secrets["oauth_refresh_token"] = tok["refresh_token"]
+            # the OAuth bearer drives a chat: its events join the log corpus
+            req = urllib.request.Request(
+                base + "/mcp", method="POST",
+                data=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                 "params": {"name": "send_chat",
+                                            "arguments": {"branch_id": str(branch.id),
+                                                          "message": "oauth audit ping"}}}).encode())
+            req.add_header("Authorization", f"Bearer {tok['access_token']}")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                oauth_outputs.append(json.loads(r.read()))
+            # error paths join the corpus: wrong password, bad grant
+            s, _, body = post("/authorize",
+                              urlencode({**auth_q, "token": "wrong-password"}).encode(),
+                              "application/x-www-form-urlencoded")
+            oauth_outputs.append({"status": s, "body": body})
+            s, _, body = post("/token", urlencode({
+                "grant_type": "authorization_code", "code": "garbage.garbage",
+                "code_verifier": verifier, "client_id": client_id,
+                "redirect_uri": cb}).encode(),
+                "application/x-www-form-urlencoded")
+            oauth_outputs.append({"status": s, "body": body})
+        oauth_secrets["oauth_signing_key_hex"] = \
+            oauth.derive_key(os.environ["LAB_MCP_TOKEN"]).hex()
     finally:
         httpd.shutdown()
         lab_server._rt = None
@@ -187,6 +280,7 @@ def _run() -> int:
         "feed": _feed(rt),
         "mcp": mcp_outputs,
         "mcp_url_path": url_outputs,
+        "oauth": oauth_outputs,
         "http_log": http_log.getvalue(),
         "boot_log": boot_log.getvalue(),
     }
@@ -194,7 +288,7 @@ def _run() -> int:
 
     print(f"== sentinel audit over {len(g.events)} events, "
           f"{len(g.all_objects())} objects, the feed, the MCP surface, "
-          "and the boot log ==")
+          "the OAuth flow, and the boot log ==")
     chat_out = (mcp_outputs[-1].get("result") or {})
     check(not chat_out.get("isError", True),
           "MCP send_chat path exercised (reply produced, joins the corpus)")
@@ -202,8 +296,19 @@ def _run() -> int:
           and (url_outputs[0].get("result") or {}).get("protocolVersion")
           and url_outputs[-1].get("status") == 401,
           "URL-token path exercised over HTTP (initialize, send_chat, wrong-token 401)")
+    check(all(oauth_secrets.values())
+          and not ((oauth_outputs[-3].get("result") or {}).get("isError", True)),
+          "OAuth flow exercised end to end (code, tokens minted; "
+          "OAuth-borne send_chat replied)")
     for name, sentinel in SENTINELS.items():
         check(sentinel not in blob, f"{name} sentinel absent from the public corpus")
+    # ADR-017: nothing the OAuth flow mints — the code, both tokens, their
+    # signature halves, or the derived signing key — may reach the corpus.
+    for name, secret in oauth_secrets.items():
+        check(secret not in blob, f"{name} absent from the public corpus")
+        if "." in secret:
+            check(secret.rsplit(".", 1)[-1] not in blob,
+                  f"{name} signature fragment absent")
     # DATABASE_URL fragments count too (host, user, password)
     for frag in ("db.sentinel.internal", "sentinel_user", "pw-SENTINEL-aB5xY1"):
         check(frag not in blob, f"credential fragment '{frag}' absent")
