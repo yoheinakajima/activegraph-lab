@@ -34,7 +34,7 @@ from typing import Any, Optional
 from .kernel import SEAM_ELIGIBLE_SETTINGS, kernel_reference
 
 _PROMPT_BEHAVIORS = ("plan", "interpret", "answer", "draft_writer",
-                     "research_worker")
+                     "research_worker", "seam_writer")
 
 # ── the charter (ADR-018) ────────────────────────────────────────────────────
 # An operator-authored mission charter, itself a seam: versioned, gated,
@@ -159,8 +159,19 @@ def apply_model_routing(graph, provider: Any = None) -> dict[str, str]:
 _CACHE: dict[str, Optional[tuple[int, str]]] = {}
 
 
+# Highest version SEEN per seam_name, pending proposals included — the
+# version counter behaviors can use (BehaviorGraph cannot scan artifacts).
+# Fed by propose_seam_fn/hot_load and rebuilt from the graph on resume.
+_VERSIONS: dict[str, int] = {}
+
+
+def note_seam_version(seam_name: str, version: int) -> None:
+    _VERSIONS[seam_name] = max(int(version or 0), _VERSIONS.get(seam_name, 0))
+
+
 def clear_seam_cache() -> None:
     _CACHE.clear()
+    _VERSIONS.clear()
 
 
 def _valid_name(seam_name: str) -> Optional[str]:
@@ -186,13 +197,22 @@ def _valid_name(seam_name: str) -> Optional[str]:
 
 
 def _seam_artifacts(graph, seam_name: str) -> list:
+    if not hasattr(graph, "objects"):
+        return []  # BehaviorGraph — the version registry stands in
     return [a for a in graph.objects(type="artifact")
             if a.data.get("kind") == "seam"
             and (a.data.get("metadata") or {}).get("seam_name") == seam_name]
 
 
-def propose_seam_fn(graph, seam_name: str, body: str, rationale: str = ""):
+def propose_seam_fn(graph, seam_name: str, body: str, rationale: str = "",
+                    evidence_refs: Optional[list[str]] = None,
+                    request_id: Optional[str] = None,
+                    requested_by: str = "lab.seams"):
     """Propose a seam override: artifact (draft) + pending self_modify decision.
+
+    `evidence_refs` (Phase 4): the ids that informed the proposal (rejected
+    decisions, operator messages) — recorded on the decision's evidence_refs
+    and the artifact's metadata, so the proposal EVENT carries them.
 
     Refusals (bad name, non-whitelisted setting, kernel reference) are
     graph-visible: a seam_refused observation is recorded and None returned —
@@ -216,26 +236,33 @@ def propose_seam_fn(graph, seam_name: str, body: str, rationale: str = ""):
     versions = [int((a.data.get("metadata") or {}).get("version") or 0) for a in existing]
     # ADR-018: the charter's file default IS version 1 (operator-authored),
     # so the first graph-stored proposal is v2; every other seam starts at 1.
+    # The registry covers behavior context, where artifacts cannot be scanned.
     base = 1 if seam_name == CHARTER_SEAM else 0
-    version = max(versions + [base]) + 1
+    version = max(versions + [_VERSIONS.get(seam_name, 0), base]) + 1
+    note_seam_version(seam_name, version)
     active = active_version(graph, seam_name)
 
+    meta = {"lab": "seam", "seam_name": seam_name,
+            "version": version, "parent_version": active}
+    if evidence_refs:
+        meta["evidence_refs"] = list(evidence_refs)
+    if request_id:
+        meta["request_id"] = request_id
     artifact = graph.add_object("artifact", {
         "kind": "seam",
         "title": f"{seam_name} v{version}",
         "content": body,
         "format": "plain_text",
         "status": "draft",
-        "metadata": {"lab": "seam", "seam_name": seam_name,
-                     "version": version, "parent_version": active},
+        "metadata": meta,
     })
     graph.add_object("decision", {
         "subject_ref": artifact.id,
         "kind": "self_modify",
         "status": "pending",
         "rationale": rationale or f"Promote {seam_name} to v{version}.",
-        "evidence_refs": [artifact.id],
-        "metadata": {"requested_by": "lab.seams", "seam_name": seam_name,
+        "evidence_refs": [artifact.id] + list(evidence_refs or []),
+        "metadata": {"requested_by": requested_by, "seam_name": seam_name,
                      "version": version},
     })
     return artifact
@@ -334,6 +361,7 @@ def hot_load(graph, artifact_id: str) -> None:
     current = _CACHE.get(seam_name)
     if not current or version >= current[0]:
         _CACHE[seam_name] = (version, body)
+    note_seam_version(seam_name, version)
 
     if seam_name.startswith("prompt."):
         _apply_prompt(seam_name.split(".", 1)[1], body)

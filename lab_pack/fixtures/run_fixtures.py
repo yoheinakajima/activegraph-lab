@@ -1016,6 +1016,96 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_seam_proposal() -> bool:
+    spec = _load("seam_proposal.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seam_proposal — chat intent → seam artifact + pending decision")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    # Evidence on the record: a rejected publish decision over a draft.
+    rejected_artifact = g.add_object("artifact", {
+        "kind": "blog_draft", "title": "A draft the operator rejected",
+        "content": "## rejected body", "format": "markdown", "status": "draft",
+        "metadata": {"lab": "blog_draft", "slug": "rejected-one"},
+    })
+    rejected_decision = g.add_object("decision", {
+        "subject_ref": rejected_artifact.id, "kind": "publish",
+        "status": "pending", "rationale": "fixture: publish?",
+        "evidence_refs": [], "metadata": {},
+    })
+    rt.run_until_idle()
+    approve_decision_fn(g, rejected_decision.id, False, "fixture: rejected")
+    rt.run_until_idle()
+
+    file_default = lb._file_default_description("draft_writer")
+
+    # ── the chat intent ──────────────────────────────────────────────────────
+    _, msg = send_branch_message_fn(g, branch.id, spec["message"].strip())
+    rt.run_until_idle()
+
+    requests = _lab_obs(g, "seam_proposal_request")
+    c.that(len(requests) == 1
+           and (requests[0].data.get("metadata") or {}).get("seam_name")
+           == exp["seam_name"],
+           f"steering intent assembled a seam proposal request ({len(requests)})")
+    req_meta = (requests[0].data.get("metadata") or {}) if requests else {}
+    c.that(req_meta.get("current_version") == 0
+           and exp["seam_name"].split(".", 1)[1] in str(req_meta.get("current_body"))
+           or bool(req_meta.get("current_body")),
+           "request carries the current version body verbatim")
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "seam proposal requested"
+           in (cands[0].data.get("content") or ""),
+           "answer acknowledges the proposal request")
+
+    # ── seam artifact + PENDING decision, evidence recorded ────────────────
+    seams_ = [a for a in g.objects(type="artifact")
+              if a.data.get("kind") == "seam"
+              and (a.data.get("metadata") or {}).get("seam_name") == exp["seam_name"]]
+    c.that(len(seams_) == 1, f"one seam artifact authored ({len(seams_)})")
+    a_meta = (seams_[0].data.get("metadata") or {}) if seams_ else {}
+    c.that(a_meta.get("version") == exp["proposal_version"]
+           and a_meta.get("request_id") == (requests[0].id if requests else None),
+           f"artifact is the next version, tied to the request ({a_meta.get('version')})")
+    pend = [d for d in g.objects(type="decision")
+            if d.data.get("kind") == "self_modify"
+            and d.data.get("status") == "pending"
+            and d.data.get("subject_ref") == (seams_[0].id if seams_ else None)]
+    c.that(len(pend) == exp["pending_self_modify"],
+           f"pending self_modify decision opened ({len(pend)})")
+    if pend:
+        refs = pend[0].data.get("evidence_refs") or []
+        c.that(msg.id in refs and rejected_decision.id in refs,
+               f"the proposal records the evidence ids that informed it ({refs})")
+    c.that((seams_[0].data.get("status") if seams_ else None) == "draft",
+           "the proposal is a draft — nothing auto-applies")
+    live = next(b for b in lb.BEHAVIORS if b.name == "draft_writer")
+    reg_desc = rt.get_behavior("lab.draft_writer").description
+    # The loader appends the pack prompt to the registered copy, so compare
+    # by prefix and by absence of the proposed body — not exact equality.
+    proposed_body = (seams_[0].data.get("content") or "") if seams_ else "@"
+    c.that(live.description == file_default
+           and reg_desc.startswith(file_default)
+           and proposed_body not in reg_desc,
+           "draft_writer's live prompt is untouched (gate not passed)")
+    print(f"  chat → request → {exp['seam_name']} v{a_meta.get('version')} "
+          f"+ pending self_modify; evidence: msg + rejected decision")
+    return c.done("seam_proposal")
+
+
 def run_research_worker() -> bool:
     spec = _load("research_worker.yaml")
     print("\n" + "=" * 64)
@@ -1590,6 +1680,7 @@ def run_all() -> None:
         run_charter(),
         run_model_routing(),
         run_research_worker(),
+        run_seam_proposal(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

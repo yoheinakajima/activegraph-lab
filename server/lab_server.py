@@ -219,6 +219,11 @@ def _rebuild_lab_registries(rt) -> None:
             lb._APPROVED_PUBLISH.add(d.data.get("subject_ref", ""))
         if d.data.get("status") in ("approved", "rejected"):
             lb._APPLIED_DECISIONS.add(d.id)
+        if d.data.get("status") == "rejected":
+            # Phase 4: rejected decisions are the seam-proposal evidence pool.
+            lb._REJECTED_DECISIONS.append({
+                "id": d.id, "kind": d.data.get("kind"),
+                "subject_ref": d.data.get("subject_ref")})
     # 5a: observation provenance — actor + timestamp from each object.created
     # event (replay rebuilds objects, not the in-process provenance registry).
     created_by: dict[str, tuple[str, str]] = {}
@@ -277,6 +282,15 @@ def _rebuild_lab_registries(rt) -> None:
             rw._SYNTHESIZED.add(str(meta["task_id"]))
     for a in g.objects(type="artifact"):
         meta = a.data.get("metadata") or {}
+        if meta.get("lab") == "seam":
+            if meta.get("request_id"):
+                lb._SEAM_PROPOSED.add(str(meta["request_id"]))  # Phase 4 dedup
+            if meta.get("seam_name"):
+                # The version counter behaviors propose against (pending
+                # proposals included — monotonicity survives restarts).
+                from lab_pack import seams as _seams
+                _seams.note_seam_version(str(meta["seam_name"]),
+                                         int(meta.get("version") or 0))
         if meta.get("lab") == "blog_draft":
             if meta.get("slug"):
                 lb._SLUGS.add(meta["slug"])
@@ -572,6 +586,8 @@ DEFAULT_TEMPLATES = {
     "research_progress": "{short_text}",
     "research_synthesis_request": "{short_text}",
     "research_finding": "Research finding: “{short_text}”",
+    "seam_proposal_request": "{short_text}",
+    "seam_proposal_failed": "{short_text}",
 }
 
 

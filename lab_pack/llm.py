@@ -88,6 +88,26 @@ class ResearchSynthesis(BaseModel):
         description="1-5 source-attributed findings.")
 
 
+class SeamProposal(BaseModel):
+    """Structured output for the seam_writer behavior (Phase 4 rails):
+    the next version of a seam body, argued from cited evidence."""
+
+    body: str = Field(
+        description=(
+            "The COMPLETE next-version body for the seam (full prompt text "
+            "for prompt.* / charter.mission; a bare value for setting.*). "
+            "Never reference kernel modules — such bodies are refused."
+        ),
+    )
+    rationale: str = Field(
+        default="",
+        description=(
+            "Why this change, argued ONLY from the evidence in the request "
+            "(rejected decisions, operator messages) — cite their ids."
+        ),
+    )
+
+
 class BlogDraft(BaseModel):
     """Structured output for the draft_writer behavior."""
 
@@ -201,6 +221,26 @@ class LabMockProvider:
                           f"linked source. [mock {digest}]"),
                     source_urls=[u]) for u in urls],
             )
+        elif name == "SeamProposal":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            seam_m = re.findall(
+                r'"seam_name":\s*"((?:prompt|setting|charter|template)[^"]+)"', blob)
+            seam = seam_m[-1] if seam_m else "prompt.unknown"
+            ev = re.findall(r"\b(?:decision|comm_message|artifact)#\d+", blob)
+            cited = ", ".join(dict.fromkeys(ev[:4])) or "the request context"
+            if seam.startswith("setting."):
+                parsed: Any = SeamProposal(
+                    body="4",
+                    rationale=f"Adjusted per the cited evidence ({cited}). [mock {digest}]")
+            else:
+                parsed = SeamProposal(
+                    body=(f"You are the {seam.split('.', 1)[1]} surface of a "
+                          "research lab. Revised per the operator's request: "
+                          "ground every claim in linked evidence, narrate "
+                          "provenance honestly, and treat failures as "
+                          f"findings. [mock proposal {digest}]"),
+                    rationale=(f"Revision argued from the cited evidence "
+                               f"({cited}). [mock {digest}]"))
         elif name == "BlogDraft":
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             refs = re.findall(r"\b(?:observation|evaluation|task|branch)#\d+", blob)
@@ -462,6 +502,8 @@ def _inert_output(output_schema: type, note: str) -> Any:
             return output_schema(reply=note)
         if name == "ResearchSynthesis":
             return output_schema(summary=note, findings=[])
+        if name == "SeamProposal":
+            return output_schema(body="", rationale=note)
         if name == "BlogDraft":
             return output_schema(title=note, slug="", body_markdown="")
     except Exception:
