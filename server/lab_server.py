@@ -335,6 +335,18 @@ def _build_runtime():
     # is a credential (ADR-011) — log the backend name, never the URL.
     db = storage.store_url()
     _BOOT_PHASE["phase"] = "loading"
+
+    def _arm_reconnect(rt_):
+        # Serverless Postgres (Neon) kills idle connections and the store's
+        # is boot-lifetime: reconnect + retry-exactly-once on connection-class
+        # errors. Each reconnect lands on the ring buffer, never the log —
+        # the log may be the thing that broke (ADR-023).
+        if storage.harden_store(rt_.graph.store,
+                                record=lambda exc: _record_error(
+                                    "store_reconnected", exc)):
+            print("[lab_server] storage: reconnect-on-failure armed "
+                  "(serverless pg idle-kills connections)", flush=True)
+
     if storage.store_has_run(db):
         mode = "resumed"
         # ADR-023 leaf fix: a row-level pg restore leaves the BIGSERIAL
@@ -347,6 +359,9 @@ def _build_runtime():
                   f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
                   flush=True)
         rt = Runtime.load(db, llm_provider=provider)
+        # Armed before the boot drain: a long resumed drain (LLM calls
+        # between writes) can outlive a serverless idle window too.
+        _arm_reconnect(rt)
         # ADR-020: the worker defaults dark in the pack; the server boot is
         # the one place that turns it on — the live lab always runs it.
         load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
@@ -395,6 +410,7 @@ def _build_runtime():
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
+        _arm_reconnect(rt)
         _BOOT_PHASE["phase"] = "draining"
         rt.run_until_idle()
         rt.save_state()
