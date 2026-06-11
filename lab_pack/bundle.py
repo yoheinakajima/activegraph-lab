@@ -304,6 +304,27 @@ LIVE_FINDINGS: list[dict] = [
             "the add_relation convention finding."
         ),
     },
+    {
+        "key": "store_immortal_connection",
+        "text": (
+            "Finding (upstream, activegraph core): PostgresEventStore "
+            "assumes an immortal connection — a URL target opens one "
+            "dedicated connection at construction and never reconnects — "
+            "while serverless Postgres guarantees the opposite: Neon "
+            "suspends an idle compute and kills its connections. Observed "
+            "twice in production with the identical signature: the first "
+            "write after an idle suspend fails AdminShutdown ('terminating "
+            "connection due to administrator command'), every subsequent "
+            "write fails OperationalError ('the connection is closed') "
+            "until a process restart. ADR-023 surfaced both correctly; "
+            "nothing committed. The lab works around it in its storage "
+            "adapter (reconnect + retry-exactly-once on connection-class "
+            "errors, never on constraint violations, each reconnect on the "
+            "diagnostics ring buffer). Proposed upstream change: "
+            "reconnect-with-bounded-retry belongs in the store itself — "
+            "any URL-target store on a serverless backend hits this."
+        ),
+    },
 ]
 
 

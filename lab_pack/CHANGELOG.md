@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Store connection resilience (ADR-009 note; the Neon idle-suspend
+  incident, twice): PostgresEventStore's single boot-lifetime connection
+  dies when serverless Postgres suspends an idle compute — first write
+  fails AdminShutdown, every later one OperationalError until restart.
+  `storage.harden_store` (armed at server boot) reconnects and retries
+  exactly once on connection-class errors; constraint violations are
+  never retried; a second failure surfaces structured (ADR-023). Each
+  reconnect records `store_reconnected` on the diagnostics ring buffer,
+  never the event log. Locked by the new reconnect fixtures in
+  test_chat_robustness (policy everywhere; backend-kill end to end under
+  LAB_TEST_PG_URL); the upstream candidate is queued in LIVE_FINDINGS.
+
 - ADR-023 (the evt_1847/evt_1934 incident): the chat path's failure domain
   is now explicit — the message append is the only step that may fail a
   request, post-commit failures degrade to reply_pending + a
