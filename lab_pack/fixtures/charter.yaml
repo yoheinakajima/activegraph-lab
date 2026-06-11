@@ -1,0 +1,33 @@
+# Charter fixture (ADR-018): the operator-authored charter is a seam —
+# injected verbatim into plan/interpret/draft_writer context assembly,
+# v1 ships as the file default, graph v2 supersedes through the gate,
+# and behavior outputs record the charter version in force (replay
+# fidelity: replay never re-fires behaviors, so the stamps replay verbatim).
+
+settings:
+  crawl_enabled: false
+
+mission:
+  title: Charter mission
+
+cases:
+  charter_v2_body: |
+    CHARTER v2 — test override
+
+    WHAT THIS IS: a fixture charter. The body is arbitrary operator prose;
+    the gate, not the content, is what makes it active.
+  prompt_v1_body: |
+    You are the planning behavior (fixture override v1). Decide whether the
+    claim's evidence gap warrants a branch.
+  refusals:
+    - seam_name: charter.bogus
+      body: "not a whitelisted charter surface"
+    - seam_name: charter.mission
+      body: "this body references lab_pack.kernel and must be refused"
+
+expected_outputs:
+  charter_behaviors: [plan, interpret, draft_writer]
+  uninjected_behaviors: [answer]
+  file_default_version: 1
+  first_graph_version: 2
+  refusal_observations: 2

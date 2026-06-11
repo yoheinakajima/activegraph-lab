@@ -57,7 +57,8 @@ _ERRORS_MAX = 50
 _ERRORS: _deque = _deque(maxlen=_ERRORS_MAX)
 
 _SECRET_ENV_KEYS = ("LAB_MCP_TOKEN", "LAB_OPERATOR_TOKEN", "LAB_DATABASE_URL",
-                    "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+                    "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                    "GITHUB_TOKEN")
 
 
 def _sanitize_error_text(text: str) -> str:
@@ -219,6 +220,11 @@ def _rebuild_lab_registries(rt) -> None:
             lb._APPROVED_PUBLISH.add(d.data.get("subject_ref", ""))
         if d.data.get("status") in ("approved", "rejected"):
             lb._APPLIED_DECISIONS.add(d.id)
+        if d.data.get("status") == "rejected":
+            # Phase 4: rejected decisions are the seam-proposal evidence pool.
+            lb._REJECTED_DECISIONS.append({
+                "id": d.id, "kind": d.data.get("kind"),
+                "subject_ref": d.data.get("subject_ref")})
     # 5a: observation provenance — actor + timestamp from each object.created
     # event (replay rebuilds objects, not the in-process provenance registry).
     created_by: dict[str, tuple[str, str]] = {}
@@ -261,8 +267,31 @@ def _rebuild_lab_registries(rt) -> None:
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
             lb._EVALUATED.add(meta["task_id"])
+    # Research worker (ADR-020): claimed/synthesized task ids rebuild from
+    # their observations and evaluations; in-flight fetches do not survive a
+    # restart — the stall watchdog releases those tasks.
+    from lab_pack import research_worker as rw
+    for o in g.objects(type="observation"):
+        meta = o.data.get("metadata") or {}
+        if meta.get("lab") == "research_progress" and meta.get("task_id"):
+            rw._CLAIMED.add(str(meta["task_id"]))
+        elif meta.get("lab") == "research_synthesis_request" and meta.get("task_id"):
+            rw._SYNTH_REQUESTED.add(str(meta["task_id"]))
+    for e in g.objects(type="evaluation"):
+        meta = e.data.get("metadata") or {}
+        if meta.get("lab") == "research_synthesis" and meta.get("task_id"):
+            rw._SYNTHESIZED.add(str(meta["task_id"]))
     for a in g.objects(type="artifact"):
         meta = a.data.get("metadata") or {}
+        if meta.get("lab") == "seam":
+            if meta.get("request_id"):
+                lb._SEAM_PROPOSED.add(str(meta["request_id"]))  # Phase 4 dedup
+            if meta.get("seam_name"):
+                # The version counter behaviors propose against (pending
+                # proposals included — monotonicity survives restarts).
+                from lab_pack import seams as _seams
+                _seams.note_seam_version(str(meta["seam_name"]),
+                                         int(meta.get("version") or 0))
         if meta.get("lab") == "blog_draft":
             if meta.get("slug"):
                 lb._SLUGS.add(meta["slug"])
@@ -318,9 +347,14 @@ def _build_runtime():
                   f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
                   flush=True)
         rt = Runtime.load(db, llm_provider=provider)
-        load_lab_packs(rt, memory_backend_url=_memory_db_path())
+        # ADR-020: the worker defaults dark in the pack; the server boot is
+        # the one place that turns it on — the live lab always runs it.
+        load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
+                       memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
+        from lab_pack.github_read import register_github_read
+        register_github_read()  # ADR-022 rung 1
         _rebuild_lab_registries(rt)
         from lab_pack import seams
         n = seams.apply_approved(rt.graph)
@@ -357,7 +391,7 @@ def _build_runtime():
         mode = "fresh"
         rt = build_lab(
             llm_provider=provider,
-            lab_settings=LabSettings(),
+            lab_settings=LabSettings(research_worker_enabled=True),  # ADR-020
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
@@ -552,6 +586,11 @@ DEFAULT_TEMPLATES = {
     "drafting_idle":    "{short_text}",
     "behavior_skipped": "{short_text}",
     "chat_path_degraded": "{short_text}",
+    "research_progress": "{short_text}",
+    "research_synthesis_request": "{short_text}",
+    "research_finding": "Research finding: “{short_text}”",
+    "seam_proposal_request": "{short_text}",
+    "seam_proposal_failed": "{short_text}",
 }
 
 
@@ -735,6 +774,12 @@ def _build_entries(g, timeline=None) -> list[dict]:
         elif e.type == "lab.resumed":
             sentence = "Lab resumed by the operator."
             kind = "control"
+        elif e.type == "lab.budget_set":
+            p = e.payload or {}
+            scope = "today only" if p.get("today_only") else "until changed"
+            sentence = (f"Daily budget set to ${float(p.get('new_usd') or 0):.2f} "
+                        f"({scope}) — was ${float(p.get('old_usd') or 0):.2f}.")
+            kind = "control"
         if sentence:
             entry = {
                 "event_id": str(e.id),
@@ -842,6 +887,10 @@ def _event_summary(g, e) -> str:
         return "lab paused by the operator"
     if t == "lab.resumed":
         return "lab resumed by the operator"
+    if t == "lab.budget_set":
+        scope = "today only" if p.get("today_only") else "until changed"
+        return (f"daily budget set to ${float(p.get('new_usd') or 0):.2f} "
+                f"({scope}) — was ${float(p.get('old_usd') or 0):.2f}")
     return t  # unknown kind: labeled, never blank
 
 
@@ -1036,16 +1085,16 @@ def _feed(rt, limit: int = 100) -> dict:
 def _operator_status() -> dict:
     """ADR-015 status: paused, calls today/cap, cost today/cap. In-process
     state is authoritative between syncs; all of it rebuilds from the log."""
-    from lab_pack.llm import _LLM_STATE
+    from lab_pack.llm import _LLM_STATE, current_cost_cap
     from lab_pack.settings import LabSettings
     defaults = LabSettings()
-    cap = _LLM_STATE.get("cost_cap_override")
     return {
         "paused": bool(_LLM_STATE.get("paused")),
         "llm_calls_today": int(_LLM_STATE.get("daily_used") or 0),
         "llm_calls_cap": defaults.max_llm_calls_per_day,
         "llm_cost_today": round(float(_LLM_STATE.get("daily_cost") or 0), 4),
-        "llm_cost_cap": float(cap if cap is not None else defaults.daily_cost_cap_usd),
+        # Clamped to the kernel ceiling like the enforcement path (ADR-019).
+        "llm_cost_cap": current_cost_cap(defaults.daily_cost_cap_usd),
     }
 
 
@@ -1216,7 +1265,7 @@ def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
     return out
 
 
-def _pause_job(rt, paused: bool) -> dict:
+def _pause_job(rt, paused: bool, by: str = "operator") -> dict:
     """Flip the global pause (ADR-015). Runs on the runtime worker. A resume
     drains immediately: the lab.resumed marker must take effect in the running
     process — queued triggers (including any replay-requeued backlog) fire on
@@ -1227,7 +1276,7 @@ def _pause_job(rt, paused: bool) -> dict:
     from lab_pack.llm import lab_paused, reset_llm_run_counters, set_lab_paused
     if lab_paused() == paused:
         return {"paused": paused, "changed": False}
-    set_lab_paused(rt.graph, paused, by="operator")
+    set_lab_paused(rt.graph, paused, by=by)
     if not paused:
         reset_llm_run_counters()
         rt.run_until_idle()

@@ -1,0 +1,48 @@
+# Research worker fixture (ADR-020): a task routed research.deep_research is
+# claimed, its sources fetched through tool_gateway against canned pages,
+# synthesized with per-claim source attribution, and completed — the existing
+# interpret loop takes the outcome. Failure path records the error in the
+# event; the per-task fetch cap binds; unhandled (codebase) routing still
+# records a capability gap with the worker enabled.
+
+settings:
+  crawl_enabled: false
+  research_worker_enabled: true
+  research_fetch_cap: 2
+  dispatch_gap_check: true
+
+mission:
+  title: Research worker mission
+
+pages:
+  "https://example.com/replay": >
+    <p>Replay rebuilds graph state deterministically from the event log;
+    forks anchor to committed events only.</p>
+  "https://example.com/forks": >
+    <p>Any run can be forked at an event boundary and the two outcomes
+    diffed object by object.</p>
+
+branches:
+  success:
+    title: Verify the replay claim from primary sources
+    intent: >
+      Verify replay determinism using https://example.com/replay and
+      https://example.com/forks as primary sources.
+  failure:
+    title: Verify against an unreachable source
+    intent: >
+      Verify the deployment claim using https://example.com/down as the
+      only source.
+  capped:
+    title: Verify with more sources than the cap allows
+    intent: >
+      Survey https://example.com/replay https://example.com/forks
+      https://example.com/three https://example.com/four for evidence.
+  unhandled:
+    title: Implement a parser probe
+    intent: Implement code in the repo to test the parser end to end.
+
+expected_outputs:
+  success_findings_min: 1
+  capped_calls: 2
+  gap_observations: 1

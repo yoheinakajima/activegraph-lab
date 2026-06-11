@@ -30,6 +30,8 @@ SENTINELS = {
     "LAB_MCP_TOKEN": "mcp-SENTINEL-qW7vJ3hF9e",
     "DATABASE_URL": "postgres://sentinel_user:pw-SENTINEL-aB5xY1@db.sentinel.internal:5432/lab",
     "LAB_DATABASE_URL": "postgres://lab_sentinel_user:pw-SENTINEL-mK6tE9@db.lab-sentinel.internal:5432/lab",
+    # ADR-022: the GitHub rate-limit token is a credential like any other.
+    "GITHUB_TOKEN": "ghp_SENTINEL_xT4rW8nQ2j",
 }
 
 FAILURES: list[str] = []
@@ -131,14 +133,36 @@ def _run() -> int:
             run_on_worker=lambda fn, *_t: fn(rt), rate_limited=lambda: False)
         return resp
 
+    # Canned GitHub transport: no network; the live client would carry the
+    # sentinel token in a header — the audit checks it reaches no output.
+    from lab_pack.github_read import set_transport
+    set_transport(lambda url: (200, {"content": __import__("base64").b64encode(
+        b"# canned README for the audit").decode(), "encoding": "base64"}))
+
     mcp_outputs = [mcp_call("initialize", {"protocolVersion": "2025-06-18"})]
     for name, args in (("get_status", {}), ("get_feed", {}),
                        ("get_branch", {"branch_id": str(branch.id)}),
                        ("get_pending_decisions", {}), ("list_posts", {}),
-                       ("list_seams", {}),
+                       ("list_seams", {}), ("get_errors", {}),
+                       # ADR-021 expansion: the new READ + control tools join
+                       # the audited corpus like every public surface.
+                       ("get_log", {"limit": 50}),
+                       ("get_entity", {"id": str(branch.id)}),
+                       ("set_budget", {"amount_usd": 9.5, "today_only": True}),
+                       ("pause_lab", {}), ("resume_lab", {}),
+                       # ADR-022: github_read outputs join the corpus — a
+                       # canned hit (transport injected below) and an
+                       # allowlist refusal; the sentinel GITHUB_TOKEN must
+                       # appear in neither.
+                       ("github_read", {"op": "get_file",
+                                        "repo": "yoheinakajima/activegraph-lab",
+                                        "path": "README.md"}),
+                       ("github_read", {"op": "get_tree",
+                                        "repo": "evil/not-allowlisted"}),
                        ("send_chat", {"branch_id": str(branch.id),
                                       "message": "audit: anything secret in here?"})):
         mcp_outputs.append(mcp_call("tools/call", {"name": name, "arguments": args}))
+    set_transport(None)  # restore the live GitHub client
 
     # ── URL-token path (ADR-016 amendment): the token rides in the URL, so
     # the HTTP surface around it joins the audit — responses, the wrong-token

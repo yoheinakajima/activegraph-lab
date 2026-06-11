@@ -57,18 +57,61 @@ from .llm import (
     BlogDraft,
     InterpretSummary,
     PlanProposal,
+    SeamProposal,
     consume_llm_anomalies,
     is_inert,
     llm_usage,
 )
 from .seams import (
+    charter_file_default,
     clear_seam_cache,
+    composed_description,
     effective_setting,
     seam_versions_stamp,
 )
 from .settings import LabSettings
 
 _PROMPTS = {p.name: p.body for p in load_prompts_from_dir(Path(__file__).parent / "prompts")}
+
+
+def _file_default_description(name: str) -> str:
+    """A behavior's file-default context: its prompt body, plus the verbatim
+    CHARTER v1 block for the charter behaviors (ADR-018). Approved seams
+    recompose this through lab_pack/seams.py at hot-load and boot."""
+    return composed_description(name, _PROMPTS[name], 1, charter_file_default())
+
+
+# The pack loader registers FRESH canonical-named copies of these behaviors
+# (lab.plan, lab.answer, …) on every load_pack — deliberately, so frozen
+# pack contents stay untouched. Anything that mutates live behavior state
+# after load (prompt/charter seam hot-loads, model routing) must therefore
+# mutate the RUNTIME'S copies, not just the module originals; mutating only
+# the originals silently affects future loads and nothing else (discovered
+# while wiring ADR-019 model routing). bind_live_behaviors is called
+# wherever a runtime is built or resumed.
+_LIVE_BEHAVIORS: list = []
+
+
+def bind_live_behaviors(rt) -> int:
+    """Capture the runtime's registered copies of the lab behaviors so seam
+    hot-loads and model routing reach the live registration. Replaces any
+    previous binding (one runtime per process outside fixtures)."""
+    del _LIVE_BEHAVIORS[:]
+    for b in BEHAVIORS:
+        try:
+            _LIVE_BEHAVIORS.append(rt.get_behavior(f"lab.{b.name}"))
+        except Exception:
+            pass
+    return len(_LIVE_BEHAVIORS)
+
+
+def behaviors_named(name: str) -> list:
+    """Every behavior object answering to `name`: the module original plus
+    the bound runtime copy (canonical lab.<name>), when one exists."""
+    out = [b for b in BEHAVIORS if getattr(b, "name", "") == name]
+    out += [b for b in _LIVE_BEHAVIORS
+            if getattr(b, "name", "") == f"lab.{name}"]
+    return out
 
 # ---------------------------------------------------------------- registries
 
@@ -82,6 +125,11 @@ _GAP_CHECKED: set[str] = set()
 _EVALUATED: set[str] = set()
 _PENDING_BY_SUBJECT: dict[str, str] = {}
 _APPLIED_DECISIONS: set[str] = set()
+# Phase 4 (chat-triggered seam proposals): rejected decisions are the
+# evidence pool a proposal cites; BehaviorGraph cannot scan decisions, so
+# the gate feeds this registry (rebuilt from the graph on resume).
+_REJECTED_DECISIONS: list[dict] = []   # {id, kind, subject_ref}
+_SEAM_PROPOSED: set[str] = set()       # seam_proposal_request ids handled
 _APPROVED_PUBLISH: set[str] = set()
 _THREAD_TO_BRANCH: dict[str, str] = {}
 _DRAFTED_OBS: set[str] = set()
@@ -112,6 +160,8 @@ def clear_lab_registry() -> None:
     _EVALUATED.clear()
     _PENDING_BY_SUBJECT.clear()
     _APPLIED_DECISIONS.clear()
+    _REJECTED_DECISIONS.clear()
+    _SEAM_PROPOSED.clear()
     _APPROVED_PUBLISH.clear()
     _THREAD_TO_BRANCH.clear()
     _DRAFTED_OBS.clear()
@@ -126,16 +176,32 @@ def clear_lab_registry() -> None:
     _DECIDED_THIN.clear()
     _PENDING_PUBLISH.clear()
     _IDLE_LOGGED["capped"] = False
+    from .research_worker import clear_research_worker_registry
+    clear_research_worker_registry()
     clear_seam_cache()
-    # Seam hot-loads mutate live behavior descriptions; restore file defaults
-    # so fixture runs are isolated from each other.
-    for b in BEHAVIORS:
-        name = getattr(b, "name", "")
-        if name in _PROMPTS and getattr(b, "description", None) != _PROMPTS[name]:
+    # Seam hot-loads mutate live behavior descriptions (module originals AND
+    # the bound runtime copies); restore file defaults (prompt body + CHARTER
+    # v1 block for the charter behaviors, ADR-018) so fixture runs and
+    # resumed boots are isolated from stale overrides.
+    for b in list(BEHAVIORS) + list(_LIVE_BEHAVIORS):
+        name = getattr(b, "name", "").split(".")[-1]
+        if name not in _PROMPTS:
+            continue
+        default = _file_default_description(name)
+        if getattr(b, "description", None) != default:
             try:
-                setattr(b, "description", _PROMPTS[name])
+                setattr(b, "description", default)
             except Exception:
-                object.__setattr__(b, "description", _PROMPTS[name])
+                object.__setattr__(b, "description", default)
+        # Model routing (ADR-019) mutates behavior.model; reset the module
+        # originals to None so the next Runtime stamps its provider default
+        # and routing re-applies. Bound runtime copies keep their model —
+        # apply_model_routing re-stamps them right after any registry reset.
+        if any(b is x for x in BEHAVIORS) and getattr(b, "model", None) is not None:
+            try:
+                setattr(b, "model", None)
+            except Exception:
+                object.__setattr__(b, "model", None)
 
 
 def _now() -> str:
@@ -441,7 +507,7 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     name="plan",
     on=["object.created"],
     where={"object.type": "observation", "object.data.metadata.lab": "site_claim"},
-    description=_PROMPTS["plan"],
+    description=_file_default_description("plan"),
     output_schema=PlanProposal,
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
@@ -483,7 +549,8 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
             "reasoning": out.reasoning,
             "claim_observation_id": obs_id,
             "proposed_by": "lab.plan",
-            "seam_versions": seam_versions_stamp(graph, "prompt.plan"),
+            "seam_versions": seam_versions_stamp(graph, "prompt.plan",
+                                                 "charter.mission"),
         },
     })
     _BRANCH_COUNT["open"] += 1
@@ -543,8 +610,12 @@ def _task_reacted(graph, task_id: str) -> bool:
     """Did any pack react to the task? Reaction = a relation linking work
     products to the task (core convention: executes/generates), in either
     relation-argument convention (ADR-008, lab_pack/compat.py), or a status
-    change away from 'active'."""
+    change away from 'active'. The lab's own research worker claims through
+    a registry too (BehaviorGraph cannot iterate relations — ADR-020)."""
     from .compat import decode_relation, relation_touches
+    from .research_worker import task_claimed
+    if task_claimed(task_id):
+        return True
     try:
         for r in graph.relations():
             rel_type, _, _ = decode_relation(r)
@@ -660,7 +731,7 @@ def work(event, graph, ctx, *, settings: LabSettings):
     name="interpret",
     on=["object.created"],
     where={"object.type": "evaluation", "object.data.metadata.lab": "task_outcome"},
-    description=_PROMPTS["interpret"],
+    description=_file_default_description("interpret"),
     output_schema=InterpretSummary,
     model=None,
     view={
@@ -700,7 +771,8 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
         "category": "fact",
         "metadata": {"lab": "interpretation", "lab_branch_id": branch_id,
                      "task_id": task_id,
-                     "seam_versions": seam_versions_stamp(graph, "prompt.interpret")},
+                     "seam_versions": seam_versions_stamp(graph, "prompt.interpret",
+                                                          "charter.mission")},
     })
     graph.add_relation(branch_id, obs.id, "supported_by")
     graph.patch_object(branch_id, {"status": "interpreting"})
@@ -1057,6 +1129,9 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
     kind = data.get("kind")
     status = data.get("status")
     _PENDING_BY_SUBJECT.pop(subject, None)
+    if status == "rejected":
+        _REJECTED_DECISIONS.append({"id": decision_id, "kind": kind,
+                                    "subject_ref": subject})
 
     if kind == "promote" and subject:
         new_status = "decided" if status == "approved" else "archived"
@@ -1242,7 +1317,7 @@ def _coverage_review(body: str) -> Optional[str]:
     name="draft_writer",
     on=["object.created"],
     where={"object.type": "observation", "object.data.metadata.draft_request": True},
-    description=_PROMPTS["draft_writer"],
+    description=_file_default_description("draft_writer"),
     output_schema=BlogDraft,
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
@@ -1347,7 +1422,8 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
                      "finding_id": (finding_ids[0] if finding_ids else obs_id),
                      "finding_ids": finding_ids,
                      "request_id": obs_id,
-                     "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer")},
+                     "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer",
+                                                          "charter.mission")},
     })
     if branch_id:
         graph.add_relation(branch_id, artifact.id, "produced")
@@ -1374,6 +1450,69 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     })
 
 
+# ---------------------------------------------------------------- seam_writer
+# Phase 4 rails: the LLM stage of a chat-triggered seam proposal. The
+# steering intent (in answer) assembles the request — current version
+# verbatim + cited evidence — and this behavior authors the next version,
+# which propose_seam_fn turns into a seam artifact + pending self_modify
+# decision through the EXISTING gate. Nothing auto-applies; the reserved
+# prompt.draft_writer voice episode stays reserved (these are the rails,
+# not the performance).
+
+
+@llm_behavior(
+    name="seam_writer",
+    on=["object.created"],
+    where={"object.type": "observation",
+           "object.data.metadata.lab": "seam_proposal_request"},
+    description=_PROMPTS["seam_writer"],
+    output_schema=SeamProposal,
+    model=None,
+    view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
+    creates=["artifact", "decision", "observation"],
+    temperature=0.3,
+    max_tokens=4096,
+    tools=[],
+)
+def seam_writer(event, graph, ctx, out, *, settings: LabSettings):
+    """Author the requested seam version and open the gated proposal.
+
+    Creates: artifact (kind=seam, next version) + decision (self_modify,
+    pending) via propose_seam_fn — the decision's evidence_refs carry the
+    ids that informed the proposal (the operator's message, the rejected
+    decisions), so the proposal event records them.
+    """
+    consume_llm_anomalies(graph)
+    obj = event.payload.get("object", {})
+    obs_id = obj.get("id")
+    data = obj.get("data", {})
+    meta = data.get("metadata") or {}
+    seam_name = meta.get("seam_name")
+    if not obs_id or obs_id in _SEAM_PROPOSED or not seam_name:
+        return
+    _SEAM_PROPOSED.add(obs_id)
+
+    from .seams import propose_seam_fn
+    body = (getattr(out, "body", None) or "").strip() if out is not None else ""
+    if not body or is_inert(getattr(out, "rationale", None)):
+        graph.add_object("observation", {
+            "text": (f"Seam proposal for {seam_name} could not be authored "
+                     "(LLM budget, pause, or parse failure) — the request "
+                     "stands on the record; ask again to retry."),
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "seam_proposal_failed", "seam_name": seam_name,
+                         "request_id": obs_id},
+        })
+        return
+    rationale = (getattr(out, "rationale", None) or "").strip() \
+        or f"Operator-requested revision of {seam_name}."
+    propose_seam_fn(graph, seam_name, body, rationale,
+                    evidence_refs=list(meta.get("evidence_refs") or []),
+                    request_id=obs_id,
+                    requested_by="lab.seam_writer")
+
+
 # ---------------------------------------------------------------- answer
 
 _STEER_PAUSE = ("pause",)
@@ -1381,9 +1520,85 @@ _STEER_RESUME = ("resume", "unpause", "reactivate")
 _STEER_APPROVE = ("approve",)
 _STEER_REJECT = ("reject",)
 _STEER_DRAFT = ("draft",)
+_STEER_PROPOSE = ("propose",)
+
+# Phase 4: which seam is the operator talking about? An explicit seam name
+# wins; otherwise "<behavior> … prompt" or "charter" phrasing resolves.
+_SEAM_NAME_RE = re.compile(
+    r"\b(prompt\.[a-z_]+|setting\.[a-z_.]+|charter\.mission|"
+    r"template\.feed\.[a-z_]+)\b")
+_SEAM_PROMPT_BEHAVIORS = ("draft_writer", "research_worker", "interpret",
+                          "plan", "answer")
 
 
-def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
+def _seam_name_from_message(low: str) -> Optional[str]:
+    m = _SEAM_NAME_RE.search(low)
+    if m:
+        return m.group(1)
+    if "prompt" in low:
+        for b in _SEAM_PROMPT_BEHAVIORS:
+            if b in low:
+                return f"prompt.{b}"
+    if "charter" in low:
+        return "charter.mission"
+    return None
+
+
+def _current_seam_body(graph, seam_name: str) -> tuple[int, str]:
+    """The version + body in force for a seam — graph override else file
+    default — so the proposal's LLM context contains what it would replace."""
+    from .seams import active_charter, resolve
+    if seam_name == "charter.mission":
+        return active_charter(graph)
+    if seam_name.startswith("prompt."):
+        default = _PROMPTS.get(seam_name.split(".", 1)[1], "")
+        return resolve(graph, seam_name, default)
+    version, body = resolve(graph, seam_name, None)
+    return version, (body if body is not None else "")
+
+
+def _request_seam_proposal(graph, branch_id: str, msg_id: str,
+                           content: str, seam_name: str) -> str:
+    """Phase 4 rails: assemble the seam-proposal request the seam_writer
+    behavior drafts from — current version verbatim plus the cited evidence
+    (the operator's message and the rejected decisions on the record). The
+    proposal itself goes through propose_seam_fn → the EXISTING gate;
+    nothing auto-applies."""
+    version, body = _current_seam_body(graph, seam_name)
+    evidence = [msg_id]
+    rejected = []
+    for d in _REJECTED_DECISIONS[-6:]:
+        evidence.append(d["id"])
+        item = {"decision_id": d["id"], "kind": d["kind"],
+                "subject_ref": d["subject_ref"]}
+        subject = graph.get_object(d["subject_ref"]) if d["subject_ref"] else None
+        if subject is not None:
+            item["subject_title"] = subject.data.get("title")
+            if d["subject_ref"] not in evidence:
+                evidence.append(d["subject_ref"])
+        rejected.append(item)
+    graph.add_object("observation", {
+        "text": (f"Seam proposal requested via chat: author the next version "
+                 f"of {seam_name} (current v{version}), addressing the cited "
+                 "evidence. The proposal opens a pending self_modify decision "
+                 "— nothing applies without the gate."),
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "seam_proposal_request",
+                     "seam_name": seam_name,
+                     "current_version": version,
+                     "current_body": (body or "")[:4000],
+                     "operator_request": content[:500],
+                     "evidence_refs": evidence,
+                     "rejected_decisions": rejected,
+                     "lab_branch_id": branch_id,
+                     "message_id": msg_id},
+    })
+    return f"seam proposal requested for {seam_name} (gated, pending review)"
+
+
+def _apply_steering(graph, branch_id: str, content: str,
+                    msg_id: Optional[str] = None) -> Optional[str]:
     """Deterministic steering: the reply is fast, the effect lands at this
     event boundary. Returns a short description of the mutation, or None."""
     low = content.lower()
@@ -1391,6 +1606,13 @@ def _apply_steering(graph, branch_id: str, content: str) -> Optional[str]:
     if branch is None:
         return None
 
+    # Phase 4: checked before the draft verb — "propose an improved
+    # draft_writer prompt" contains 'draft' but is a proposal request.
+    if any(w in low for w in _STEER_PROPOSE):
+        seam_name = _seam_name_from_message(low)
+        if seam_name:
+            return _request_seam_proposal(graph, branch_id, msg_id or "",
+                                          content, seam_name)
     if any(w in low for w in _STEER_PAUSE):
         graph.patch_object(branch_id, {"status": "paused"})
         return "branch paused"
@@ -1481,7 +1703,8 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
         return  # Not a branch thread — the generic chat pack may still reply.
 
     consume_llm_anomalies(graph)
-    mutation = _apply_steering(graph, branch_id, data.get("content") or "")
+    mutation = _apply_steering(graph, branch_id, data.get("content") or "",
+                               msg_id)
 
     branch = graph.get_object(branch_id)
     reply = (getattr(out, "reply", None) or "").strip() if out is not None else ""
@@ -1516,5 +1739,11 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
     graph.add_relation(candidate.id, msg_id, "response_to")
 
 
-# Registration order is execution order within an event batch.
-BEHAVIORS = [ingest, plan, work, interpret, digest, gate, draft_writer, answer]
+# Registration order is execution order within an event batch. The research
+# worker stages (ADR-020) live in lab_pack/research_worker.py — droppable
+# plumbing; this import is the only registration point. It must come last:
+# research_worker.py imports nothing from this module at import time.
+from .research_worker import research_intake, research_worker  # noqa: E402
+
+BEHAVIORS = [ingest, plan, work, research_intake, interpret, digest, gate,
+             draft_writer, research_worker, seam_writer, answer]

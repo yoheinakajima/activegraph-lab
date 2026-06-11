@@ -89,6 +89,8 @@ def build_lab(
     rt = Runtime(graph or Graph(), **kwargs)
     load_lab_packs(rt, lab_settings=lab_settings, memory_backend_url=memory_backend_url)
     register_web_fetch(fetch_handler)
+    from .github_read import register_github_read
+    register_github_read()  # ADR-022 rung 1: read-only, allowlisted
 
     if create_mission:
         mission = create_mission_fn(
@@ -282,6 +284,26 @@ LIVE_FINDINGS: list[dict] = [
             "(everything but answer idles), never whether the worker runs."
         ),
     },
+    {
+        "key": "emit_projects_before_append",
+        "text": (
+            "Finding (upstream, activegraph core): Graph.emit projects an "
+            "event to the in-memory log — and serves it from every "
+            "projection — BEFORE store.append runs, and swallows store "
+            "failures, so a wedged store leaves the runtime confidently "
+            "serving phantom state. This lab ran NON-DURABLE in production "
+            "for two days because of that ordering: a pg_restore'd lineage "
+            "left the events.seq sequence behind the restored rows, every "
+            "durable append died with a UniqueViolation inside graph.emit "
+            "AFTER the event entered memory, and all projections (including "
+            "MCP forensics) kept reporting the writes as committed "
+            "(ADR-023; the evt evidence is in the log). Proposed upstream "
+            "change: surface append failures loudly — fail the emit, or "
+            "mark the runtime degraded so health checks and projections can "
+            "say so. Draft fuel and an upstream issue candidate alongside "
+            "the add_relation convention finding."
+        ),
+    },
 ]
 
 
@@ -328,6 +350,16 @@ def load_lab_packs(
     rt.load_pack(research_pack, settings=ResearchSettings())
     rt.load_pack(codebase_pack, settings=CodebaseSettings())
     rt.load_pack(lab_pack, settings=lab_settings or LabSettings())
+    # The loader registered fresh canonical copies of the lab behaviors;
+    # bind them so seam hot-loads and model routing reach the live runtime.
+    from .behaviors import bind_live_behaviors
+    bind_live_behaviors(rt)
+    # ADR-019: stamp the per-behavior model resolution onto the live
+    # behaviors (the runtime records behavior.model on llm.requested).
+    # Resumed boots re-stamp with seam overrides via seams.apply_approved.
+    from .llm import active_provider
+    from .seams import apply_model_routing
+    apply_model_routing(rt.graph, active_provider() or rt.llm_provider)
 
 
 if __name__ == "__main__":

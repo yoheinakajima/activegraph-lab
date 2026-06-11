@@ -23,7 +23,7 @@ from packs.tool_gateway import pack as tg_pack, ToolGatewaySettings
 from packs.communication import pack as comm_pack, CommunicationSettings
 
 from lab_pack import pack as lab_pack, LabSettings
-from lab_pack.behaviors import clear_lab_registry
+from lab_pack.behaviors import bind_live_behaviors, clear_lab_registry
 from lab_pack.llm import LabMockProvider
 from lab_pack.tools import (
     activate_branch_fn,
@@ -53,6 +53,7 @@ def _new_runtime(spec: dict, *, with_gateway: bool, with_comm: bool) -> Runtime:
     if with_comm:
         rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)  # seam hot-loads must reach the runtime's copies
     return rt
 
 
@@ -363,6 +364,7 @@ def run_draft_writer() -> bool:
     rt = Runtime(Graph(), llm_provider=LabMockProvider())
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    bind_live_behaviors(rt)
     g = rt.graph
 
     m = spec["mission"]
@@ -509,6 +511,7 @@ def run_editorial() -> bool:
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    bind_live_behaviors(rt)
     g = rt.graph
     mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
     rt.run_until_idle()
@@ -673,6 +676,7 @@ def run_operator_controls() -> bool:
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
     g = rt.graph
     mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
     branch = create_branch_fn(g, mission.id, "Control branch", "talk here",
@@ -916,8 +920,14 @@ def run_seams() -> bool:
     rt.run_until_idle()
     c.that(g.get_object(a1.id).data.get("status") == "approved",
            "approved seam artifact patched to approved")
-    c.that(plan_b.description == case["v1_body"],
+    # ADR-018: descriptions compose prompt body + charter block, so the
+    # approved body is the PREFIX of the live description.
+    c.that(plan_b.description.startswith(case["v1_body"]),
            "hot-load: live behavior uses the approved body without restart")
+    # The runtime registers a fresh canonical copy — the hot-load must reach
+    # THAT object, not just the module original (found via ADR-019 routing).
+    c.that(rt.get_behavior("lab.plan").description.startswith(case["v1_body"]),
+           "hot-load reaches the runtime's registered behavior copy")
 
     # ── version monotonicity: v2 supersedes ────────────────────────────────
     a2 = propose_seam_fn(g, case["seam_name"], case["v2_body"], "fixture v2")
@@ -928,7 +938,7 @@ def run_seams() -> bool:
            f"versions monotonic per seam_name ({versions})")
     approve_decision_fn(g, pending_for(a2.id).id, True)
     rt.run_until_idle()
-    c.that(plan_b.description == case["v2_body"] and
+    c.that(plan_b.description.startswith(case["v2_body"]) and
            resolve(g, case["seam_name"], None) == (2, case["v2_body"]),
            "v2 supersedes v1 after approval")
 
@@ -1004,6 +1014,580 @@ def run_seams() -> bool:
            "recorded version matches the active version at execution")
 
     return c.done("seams")
+
+
+def run_github_read() -> bool:
+    spec = _load("github_read.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: github_read — canned responses, allowlist refusal, MCP "
+          "parity, worker source")
+    print("=" * 64)
+
+    import base64
+    import json as _json
+    from lab_pack.github_read import (GITHUB_CAPABILITIES, gh_get_file,
+                                      gh_get_tree, gh_list_commits,
+                                      register_github_read, repo_allowlist,
+                                      set_transport)
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    allowed = exp["allowed_repo"]
+    file_text = exp["file_text"]
+
+    def transport(url):
+        if "/git/trees/" in url:
+            return 200, {"truncated": False, "tree": [
+                {"path": "README.md", "type": "blob", "size": 52},
+                {"path": "lab_pack", "type": "tree"}]}
+        if "/contents/" in url:
+            return 200, {"type": "file", "encoding": "base64",
+                         "content": base64.b64encode(file_text.encode()).decode()}
+        if "/commits" in url:
+            return 200, [{"sha": "abc1234def0", "commit": {"author": {
+                "name": "yohei", "date": "2026-06-11T00:00:00Z"},
+                "message": "seed the lab\n\nbody"}}]
+        return 404, {"message": "Not Found"}
+
+    try:
+        set_transport(transport)
+
+        # ── the read tools against canned responses ────────────────────────
+        tree = gh_get_tree(allowed)
+        c.that(tree["status"] == 200
+               and "README.md" in tree["content"],
+               f"get_tree returns entries ({tree.get('status')})")
+        f = gh_get_file(allowed, "README.md")
+        c.that(f["status"] == 200 and f["content"] == file_text,
+               "get_file decodes the canned base64 body")
+        commits = gh_list_commits(allowed, limit=5)
+        c.that(commits["status"] == 200
+               and _json.loads(commits["content"])["commits"][0]["sha"] == "abc1234def",
+               "list_commits returns trimmed rows")
+
+        # ── allowlist refusal — before any transport call ──────────────────
+        calls = {"n": 0}
+        def counting(url):
+            calls["n"] += 1
+            return transport(url)
+        set_transport(counting)
+        refused = gh_get_tree(exp["refused_repo"])
+        c.that(refused.get("error") and "GITHUB_REPO_ALLOWLIST" in refused["error"]
+               and calls["n"] == 0,
+               "non-allowlisted repo refused with zero network calls")
+        c.that(allowed in repo_allowlist()
+               and "yoheinakajima/activegraph-packs" in repo_allowlist(),
+               f"default allowlist normalizes bare names ({sorted(repo_allowlist())})")
+
+        # ── MCP passthrough parity: same handlers, same allowlist ──────────
+        from server import mcp as mcp_mod
+        def mcp_github(args):
+            resp = mcp_mod._github_read(1, args)
+            result = resp["result"]
+            text = result["content"][0]["text"]
+            return result["isError"], text
+        is_err, text = mcp_github({"op": "get_file", "repo": allowed,
+                                   "path": "README.md"})
+        c.that(not is_err and _json.loads(text) == gh_get_file(allowed, "README.md"),
+               "MCP github_read parity with the gateway handler")
+        is_err, text = mcp_github({"op": "get_tree", "repo": exp["refused_repo"]})
+        c.that(is_err and "GITHUB_REPO_ALLOWLIST" in text,
+               "MCP passthrough enforces the same allowlist (tool error)")
+        is_err, text = mcp_github({"op": "delete_repo", "repo": allowed})
+        c.that(is_err and "unknown op" in text,
+               "only the read ops exist — nothing writable to call")
+        print("  tools + refusal + MCP parity against canned responses")
+
+        # ── the research worker consumes a github.com source ───────────────
+        rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+        register_web_fetch(lambda url, **_kw: {"url": url, "status": 404,
+                                               "content": "", "error": "404"},
+                           overwrite=True)
+        register_github_read(overwrite=True)
+        g = rt.graph
+        mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+        rt.run_until_idle()
+        bspec = spec["branch"]
+        branch = create_branch_fn(g, mission.id, bspec["title"],
+                                  bspec["intent"].strip(), status="active")
+        rt.run_until_idle()
+        task = next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch.id), None)
+        c.that(task is not None and task.data.get("status") == "done",
+               f"worker completed a github-sourced research task "
+               f"({task.data.get('status') if task else 'no task'})")
+        gh_calls = [x for x in g.objects(type="capability_call")
+                    if x.data.get("provider_name") == "github"]
+        c.that(len(gh_calls) == 1
+               and gh_calls[0].data.get("capability_name") == "get_file",
+               f"the github URL routed to github.get_file via tool_gateway "
+               f"({len(gh_calls)})")
+        findings = [o for o in _lab_obs(g, "research_finding")
+                    if (o.data.get("metadata") or {}).get("lab_branch_id")
+                    == branch.id]
+        c.that(bool(findings) and all(
+            any("github.com" in u for u in
+                (o.data.get("metadata") or {}).get("source_urls") or [])
+            for o in findings),
+            f"findings attribute the github source ({len(findings)})")
+        print("  research worker: github URL → gateway call → attributed findings")
+    finally:
+        set_transport(None)
+    return c.done("github_read")
+
+
+def run_seam_proposal() -> bool:
+    spec = _load("seam_proposal.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seam_proposal — chat intent → seam artifact + pending decision")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    # Evidence on the record: a rejected publish decision over a draft.
+    rejected_artifact = g.add_object("artifact", {
+        "kind": "blog_draft", "title": "A draft the operator rejected",
+        "content": "## rejected body", "format": "markdown", "status": "draft",
+        "metadata": {"lab": "blog_draft", "slug": "rejected-one"},
+    })
+    rejected_decision = g.add_object("decision", {
+        "subject_ref": rejected_artifact.id, "kind": "publish",
+        "status": "pending", "rationale": "fixture: publish?",
+        "evidence_refs": [], "metadata": {},
+    })
+    rt.run_until_idle()
+    approve_decision_fn(g, rejected_decision.id, False, "fixture: rejected")
+    rt.run_until_idle()
+
+    file_default = lb._file_default_description("draft_writer")
+
+    # ── the chat intent ──────────────────────────────────────────────────────
+    _, msg = send_branch_message_fn(g, branch.id, spec["message"].strip())
+    rt.run_until_idle()
+
+    requests = _lab_obs(g, "seam_proposal_request")
+    c.that(len(requests) == 1
+           and (requests[0].data.get("metadata") or {}).get("seam_name")
+           == exp["seam_name"],
+           f"steering intent assembled a seam proposal request ({len(requests)})")
+    req_meta = (requests[0].data.get("metadata") or {}) if requests else {}
+    c.that(req_meta.get("current_version") == 0
+           and exp["seam_name"].split(".", 1)[1] in str(req_meta.get("current_body"))
+           or bool(req_meta.get("current_body")),
+           "request carries the current version body verbatim")
+    cands = [x for x in g.objects(type="comm_response_candidate")
+             if x.data.get("message_id") == msg.id]
+    c.that(len(cands) == 1 and "seam proposal requested"
+           in (cands[0].data.get("content") or ""),
+           "answer acknowledges the proposal request")
+
+    # ── seam artifact + PENDING decision, evidence recorded ────────────────
+    seams_ = [a for a in g.objects(type="artifact")
+              if a.data.get("kind") == "seam"
+              and (a.data.get("metadata") or {}).get("seam_name") == exp["seam_name"]]
+    c.that(len(seams_) == 1, f"one seam artifact authored ({len(seams_)})")
+    a_meta = (seams_[0].data.get("metadata") or {}) if seams_ else {}
+    c.that(a_meta.get("version") == exp["proposal_version"]
+           and a_meta.get("request_id") == (requests[0].id if requests else None),
+           f"artifact is the next version, tied to the request ({a_meta.get('version')})")
+    pend = [d for d in g.objects(type="decision")
+            if d.data.get("kind") == "self_modify"
+            and d.data.get("status") == "pending"
+            and d.data.get("subject_ref") == (seams_[0].id if seams_ else None)]
+    c.that(len(pend) == exp["pending_self_modify"],
+           f"pending self_modify decision opened ({len(pend)})")
+    if pend:
+        refs = pend[0].data.get("evidence_refs") or []
+        c.that(msg.id in refs and rejected_decision.id in refs,
+               f"the proposal records the evidence ids that informed it ({refs})")
+    c.that((seams_[0].data.get("status") if seams_ else None) == "draft",
+           "the proposal is a draft — nothing auto-applies")
+    live = next(b for b in lb.BEHAVIORS if b.name == "draft_writer")
+    reg_desc = rt.get_behavior("lab.draft_writer").description
+    # The loader appends the pack prompt to the registered copy, so compare
+    # by prefix and by absence of the proposed body — not exact equality.
+    proposed_body = (seams_[0].data.get("content") or "") if seams_ else "@"
+    c.that(live.description == file_default
+           and reg_desc.startswith(file_default)
+           and proposed_body not in reg_desc,
+           "draft_writer's live prompt is untouched (gate not passed)")
+    print(f"  chat → request → {exp['seam_name']} v{a_meta.get('version')} "
+          f"+ pending self_modify; evidence: msg + rejected decision")
+    return c.done("seam_proposal")
+
+
+def run_research_worker() -> bool:
+    spec = _load("research_worker.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: research_worker — claim → fetch → attributed synthesis → "
+          "complete; failure, cap, gap")
+    print("=" * 64)
+
+    pages = spec["pages"]
+
+    def canned_fetch(url: str, **_kw) -> dict:
+        clean = url.rstrip("/")
+        for key, html in pages.items():
+            if key.rstrip("/") == clean:
+                return {"url": url, "status": 200, "content": html}
+        return {"url": url, "status": 503, "content": "",
+                "error": "HTTPError: 503 fixture outage"}
+
+    rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+    register_web_fetch(canned_fetch, overwrite=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def calls_for(task_id):
+        return [x for x in g.objects(type="capability_call")
+                if (x.data.get("metadata") or {}).get("task_id") == task_id]
+
+    def make(key, status="active"):
+        b = spec["branches"][key]
+        branch = create_branch_fn(g, mission.id, b["title"],
+                                  b["intent"].strip(), status=status)
+        rt.run_until_idle()
+        return branch
+
+    # ── success: routed task → canned fetches → attributed findings ────────
+    b_ok = make("success")
+    t_ok = task_for(b_ok.id)
+    c.that(t_ok is not None and t_ok.data.get("status") == "done",
+           f"research task claimed and completed "
+           f"({t_ok.data.get('status') if t_ok else 'no task'})")
+    claims = [o for o in _lab_obs(g, "research_progress")
+              if (o.data.get("metadata") or {}).get("task_id") == (t_ok.id if t_ok else None)]
+    c.that(len(claims) == 1, f"claim observation recorded ({len(claims)})")
+    findings = [o for o in _lab_obs(g, "research_finding")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id]
+    c.that(len(findings) >= exp["success_findings_min"],
+           f"attributed findings written ({len(findings)})")
+    fetched_urls = {"https://example.com/replay", "https://example.com/forks"}
+    c.that(all(set((o.data.get("metadata") or {}).get("source_urls") or [])
+               <= fetched_urls
+               and o.data.get("source_ids") for o in findings),
+           "every finding attributes fetched source URLs + source ids")
+    c.that(all(any(str(r.type) == "supported_by" and str(r.source) == b_ok.id
+                   and str(r.target) == o.id for r in g.relations())
+               for o in findings),
+           "findings linked supported_by to the branch")
+    evals = [e for e in g.objects(type="evaluation")
+             if (e.data.get("metadata") or {}).get("lab") == "research_synthesis"
+             and (e.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id]
+    c.that(len(evals) == 1 and any(
+        str(r.type) == "supported_by" and str(r.source) == b_ok.id
+        and str(r.target) == evals[0].id for r in g.relations()),
+        f"synthesis evaluation written and linked to the branch ({len(evals)})")
+    outcome = [e for e in g.objects(type="evaluation")
+               if (e.data.get("metadata") or {}).get("lab") == "task_outcome"
+               and (e.data.get("metadata") or {}).get("task_id") == t_ok.id]
+    c.that(len(outcome) == 1
+           and outcome[0].data.get("judgment") == "completed_successfully",
+           "existing outcome path fired: task_outcome evaluation → interpret")
+    c.that(not [o for o in _lab_obs(g, "capability_gap")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id],
+           "no capability gap for the claimed research task")
+    print(f"  success: task done, {len(findings)} attributed finding(s), "
+          "evaluation linked, no gap")
+
+    # ── failure: every fetch fails → task failed, error in the event ───────
+    b_fail = make("failure")
+    t_fail = task_for(b_fail.id)
+    c.that(t_fail is not None and t_fail.data.get("status") == "rejected",
+           f"all fetches failed → task rejected "
+           f"({t_fail.data.get('status') if t_fail else 'no task'})")
+    err = (t_fail.data.get("metadata") or {}).get("error") if t_fail else None
+    c.that(bool(err) and "503" in err,
+           f"the error is recorded on the task ({err})")
+    c.that(any(str(e.type) == "patch.applied"
+               and e.payload.get("target") == (t_fail.id if t_fail else None)
+               and "error" in str((e.payload.get("diff") or {}))
+               for e in g.events),
+           "the failure event carries the error (errors propagate)")
+    fail_outcome = [e for e in g.objects(type="evaluation")
+                    if (e.data.get("metadata") or {}).get("lab") == "task_outcome"
+                    and (e.data.get("metadata") or {}).get("task_id")
+                    == (t_fail.id if t_fail else None)]
+    c.that(len(fail_outcome) == 1 and fail_outcome[0].data.get("judgment") == "failed",
+           "failure flows into the existing outcome path")
+    print(f"  failure: task rejected, error on the event: {str(err)[:60]}…")
+
+    # ── the per-task fetch cap binds ────────────────────────────────────────
+    b_cap = make("capped")
+    t_cap = task_for(b_cap.id)
+    n_calls = len(calls_for(t_cap.id)) if t_cap else -1
+    c.that(n_calls == exp["capped_calls"],
+           f"fetch cap binds: {n_calls} call(s) for 4 candidate URLs (cap "
+           f"{exp['capped_calls']})")
+    research_meta = ((g.get_object(t_cap.id).data.get("metadata") or {})
+                     .get("research") or {}) if t_cap else {}
+    c.that(research_meta.get("fetched") == exp["capped_calls"],
+           f"progress patches recorded per fetch ({research_meta})")
+    print(f"  cap: {n_calls} fetches for 4 URLs")
+
+    # ── unhandled routing still records a capability gap ────────────────────
+    b_gap = make("unhandled")
+    t_gap = task_for(b_gap.id)
+    gaps = [o for o in _lab_obs(g, "capability_gap")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == b_gap.id]
+    c.that(len(gaps) == exp["gap_observations"]
+           and t_gap is not None and t_gap.data.get("status") == "blocked",
+           f"codebase routing untouched: gap recorded, task blocked "
+           f"({len(gaps)})")
+    print("  unhandled: codebase routing → gap, task blocked")
+    return c.done("research_worker")
+
+
+def run_model_routing() -> bool:
+    spec = _load("model_routing.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: model_routing — per-behavior models, hot reroute, ceiling clamp")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.kernel import ABSOLUTE_DAILY_COST_CEILING_USD
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper,
+                              _lab_prompt_bodies, current_cost_cap,
+                              reset_llm_session)
+    from lab_pack.seams import apply_model_routing, propose_seam_fn
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Routing branch", "talk here",
+                              status="active")
+    rt.run_until_idle()
+    routed = apply_model_routing(g)
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    cases = spec["cases"]
+
+    def behavior(name):
+        # The runtime's REGISTERED copy — the object prompt assembly reads.
+        return rt.get_behavior(f"lab.{name}")
+
+    def llm_requested(behavior_name):
+        return [e for e in g.events if str(e.type) == "llm.requested"
+                and str(e.payload.get("behavior", "")).endswith(behavior_name)]
+
+    # ── two behaviors resolve different models ──────────────────────────────
+    c.that(routed.get("plan") == exp["default_plan_model"]
+           and routed.get("answer") == exp["default_answer_model"],
+           f"plan and answer resolve different models ({routed})")
+    c.that(behavior("plan").model == exp["default_plan_model"]
+           and behavior("answer").model == exp["default_answer_model"],
+           "resolution is stamped onto behavior.model")
+
+    # ── llm.requested records the per-behavior resolution ──────────────────
+    g.add_object("observation", {
+        "text": "Claim: the runtime replays every event deterministically.",
+        "confidence": 0.7, "category": "fact",
+        "metadata": {"lab": "site_claim", "mission_id": mission.id},
+    })
+    rt.run_until_idle()
+    _, msg = send_branch_message_fn(g, branch.id, "what model are you on?")
+    rt.run_until_idle()
+    plan_reqs = llm_requested("plan")
+    answer_reqs = llm_requested("answer")
+    c.that(bool(plan_reqs) and plan_reqs[-1].payload.get("model")
+           == exp["default_plan_model"],
+           f"llm.requested records plan's routed model "
+           f"({plan_reqs[-1].payload.get('model') if plan_reqs else None})")
+    c.that(bool(answer_reqs) and answer_reqs[-1].payload.get("model")
+           == exp["default_answer_model"],
+           f"llm.requested records answer's routed model "
+           f"({answer_reqs[-1].payload.get('model') if answer_reqs else None})")
+    print(f"  plan → {routed.get('plan')}; answer → {routed.get('answer')} "
+          "(both on llm.requested)")
+
+    # ── seam override takes effect without restart ──────────────────────────
+    a = propose_seam_fn(g, "setting.model.answer",
+                        cases["answer_override_model"], "fixture reroute")
+    rt.run_until_idle()
+    d = next(x for x in g.objects(type="decision")
+             if x.data.get("subject_ref") == a.id and x.data.get("status") == "pending")
+    approve_decision_fn(g, d.id, True, "fixture approve")
+    rt.run_until_idle()
+    c.that(behavior("answer").model == cases["answer_override_model"],
+           f"approved model seam hot-reroutes answer "
+           f"({behavior('answer').model})")
+    n_before = len(llm_requested("answer"))
+    send_branch_message_fn(g, branch.id, "and now?")
+    rt.run_until_idle()
+    answer_reqs = llm_requested("answer")
+    c.that(len(answer_reqs) > n_before and answer_reqs[-1].payload.get("model")
+           == cases["answer_override_model"],
+           "post-approval llm.requested records the rerouted model")
+    c.that(behavior("plan").model == exp["default_plan_model"],
+           "other behaviors keep their own routing")
+    print(f"  seam reroute: answer → {behavior('answer').model}, no restart")
+
+    # ── budget defaults + the kernel ceiling clamp ──────────────────────────
+    c.that(LabSettings().daily_cost_cap_usd == exp["daily_cost_cap_default"],
+           f"daily_cost_cap_usd default is {exp['daily_cost_cap_default']}")
+    c.that(ABSOLUTE_DAILY_COST_CEILING_USD == exp["absolute_ceiling"],
+           "kernel ceiling constant present")
+    reset_llm_session()
+    wrapper = LabProviderWrapper(LabMockProvider(), max_daily_cost_usd=500.0,
+                                 prompt_bodies=_lab_prompt_bodies())
+    c.that(wrapper.effective_cost_cap() == exp["absolute_ceiling"],
+           f"settings cap 500 clamps to the ceiling "
+           f"({wrapper.effective_cost_cap()})")
+    _LLM_STATE["cost_cap_override"] = 250.0  # an approved seam body of "250"
+    c.that(wrapper.effective_cost_cap() == exp["absolute_ceiling"],
+           "seam override 250 clamps to the ceiling")
+    c.that(current_cost_cap(500.0) == exp["absolute_ceiling"],
+           "display path clamps identically")
+    _LLM_STATE["cost_cap_override"] = 25.0
+    c.that(wrapper.effective_cost_cap() == 25.0,
+           "caps under the ceiling pass through unclamped")
+    reset_llm_session()
+    print(f"  ceiling: 500/250 → {exp['absolute_ceiling']}; 25 → 25")
+    return c.done("model_routing")
+
+
+def run_charter() -> bool:
+    spec = _load("charter.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: charter — verbatim injection, file v1, graph v2 via the gate")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.seams import (active_charter, apply_approved,
+                                charter_file_default, propose_seam_fn)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    cases = spec["cases"]
+    file_body = charter_file_default()
+
+    def desc(name):
+        # The runtime's REGISTERED copy (the loader registers fresh
+        # canonical-named behaviors; the original is only the template).
+        return rt.get_behavior(f"lab.{name}").description
+
+    def add_claim(i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+        rt.run_until_idle()
+
+    def proposed_branches():
+        return [b for b in g.objects(type="branch")
+                if b.data.get("status") == "proposed"]
+
+    def pending_for(artifact_id):
+        return next((d for d in g.objects(type="decision")
+                     if d.data.get("kind") == "self_modify"
+                     and d.data.get("subject_ref") == artifact_id
+                     and d.data.get("status") == "pending"), None)
+
+    # ── v1 file default injected verbatim into the three behaviors ─────────
+    c.that("CHARTER v1 — activegraph-lab" in file_body,
+           "charter.md body is the operator's v1 charter")
+    for name in exp["charter_behaviors"]:
+        d = desc(name)
+        c.that(file_body in d and "charter.mission v1" in d,
+               f"{name}: charter v1 injected verbatim (delimited block)")
+    for name in exp["uninjected_behaviors"]:
+        c.that("===== CHARTER" not in desc(name),
+               f"{name}: charter NOT injected (answer is excluded by design)")
+    c.that(active_charter(g) == (1, file_body),
+           "active charter is the file default at version 1")
+    print(f"  v1 (file) injected into {exp['charter_behaviors']}; "
+          f"answer untouched")
+
+    # ── behavior outputs record the charter version in force ───────────────
+    add_claim(1)
+    b1 = proposed_branches()[-1]
+    stamp1 = (b1.data.get("metadata") or {}).get("seam_versions") or {}
+    c.that(stamp1.get("charter.mission") == exp["file_default_version"],
+           f"plan output stamps charter.mission v1 ({stamp1})")
+
+    # ── graph v2 supersedes file v1, only through the gate ─────────────────
+    v2_body = cases["charter_v2_body"].strip()
+    a2 = propose_seam_fn(g, "charter.mission", v2_body, "fixture charter v2")
+    rt.run_until_idle()
+    meta2 = a2.data.get("metadata") or {}
+    c.that(meta2.get("version") == exp["first_graph_version"]
+           and meta2.get("parent_version") == exp["file_default_version"],
+           f"first graph charter is v2 with parent v1 ({meta2})")
+    c.that(file_body in desc("plan"),
+           "pending charter does NOT load — v1 stays active pre-approval")
+    approve_decision_fn(g, pending_for(a2.id).id, True, "fixture approve")
+    rt.run_until_idle()
+    for name in exp["charter_behaviors"]:
+        d = desc(name)
+        c.that(v2_body in d and "charter.mission v2" in d and file_body not in d,
+               f"{name}: approved charter v2 supersedes file v1 (hot-loaded)")
+    add_claim(2)
+    b2 = proposed_branches()[-1]
+    stamp2 = (b2.data.get("metadata") or {}).get("seam_versions") or {}
+    c.that(stamp2.get("charter.mission") == exp["first_graph_version"],
+           f"post-approval output stamps charter.mission v2 ({stamp2})")
+    c.that(stamp1.get("charter.mission") != stamp2.get("charter.mission"),
+           "replay record: the two outputs carry the version in force at "
+           "their own execution")
+    print(f"  v2 approved → hot-loaded; stamps: {stamp1.get('charter.mission')}"
+          f" then {stamp2.get('charter.mission')}")
+
+    # ── prompt seam and charter compose ────────────────────────────────────
+    p1_body = cases["prompt_v1_body"].strip()
+    ap = propose_seam_fn(g, "prompt.plan", p1_body, "fixture prompt v1")
+    rt.run_until_idle()
+    approve_decision_fn(g, pending_for(ap.id).id, True)
+    rt.run_until_idle()
+    d = desc("plan")
+    c.that(d.startswith(p1_body) and v2_body in d,
+           "approved prompt seam composes with the active charter")
+
+    # ── whitelist + kernel refusals ─────────────────────────────────────────
+    for ref in cases["refusals"]:
+        r = propose_seam_fn(g, ref["seam_name"], ref["body"])
+        c.that(r is None, f"refused outright: {ref['seam_name']}")
+    refusals = [o for o in g.objects(type="observation")
+                if (o.data.get("metadata") or {}).get("lab") == "seam_refused"]
+    c.that(len(refusals) == exp["refusal_observations"],
+           f"refusals are graph-visible ({len(refusals)})")
+
+    # ── boot/resume recomposes from the log ────────────────────────────────
+    clear_lab_registry()  # simulated restart: file defaults restored
+    c.that(file_body in desc("plan") and v2_body not in desc("plan"),
+           "restart restores file defaults before apply_approved")
+    n = apply_approved(g)
+    d = desc("plan")
+    c.that(n >= 2 and d.startswith(p1_body) and v2_body in d,
+           f"apply_approved recomposes prompt v1 + charter v2 at boot ({n})")
+    print("  restart → apply_approved recomposes graph charter + prompt")
+    return c.done("charter")
 
 
 _GC_GOOD = '''
@@ -1214,6 +1798,11 @@ def run_all() -> None:
         run_operator_controls(),
         run_paused_boot(),
         run_seams(),
+        run_charter(),
+        run_model_routing(),
+        run_research_worker(),
+        run_seam_proposal(),
+        run_github_read(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

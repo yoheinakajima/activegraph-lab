@@ -5,8 +5,6 @@ All fields have defaults — the pack works with zero configuration.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -48,6 +46,30 @@ class LabSettings(BaseModel):
         ge=1,
         le=64,
         description="Plan stops proposing new branches past this many non-archived branches.",
+    )
+    research_worker_enabled: bool = Field(
+        default=False,
+        description=(
+            "If True, the lab-local research worker (ADR-020) claims tasks "
+            "routed research.deep_research and gathers sources through "
+            "tool_gateway. Defaults False so no embedding, fixture, or test "
+            "reaches the network by surprise; the server boot enables it — "
+            "the live lab always runs the worker. Droppable: disabled, the "
+            "capability-gap path takes over unchanged."
+        ),
+    )
+    research_fetch_cap: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Per-task cap on source fetches by the research worker "
+            "(ADR-020). Seam-eligible — tuning research thoroughness is "
+            "self-modification through the gate."
+        ),
+    )
+    model_research_worker: str = Field(
+        default="claude-opus-4-8",
+        description="Model for the research_worker behavior (ADR-019/020).",
     )
     dispatch_gap_check: bool = Field(
         default=True,
@@ -120,12 +142,33 @@ class LabSettings(BaseModel):
             "for easy reading. The graph copy is canonical; the file is a mirror."
         ),
     )
-    model: Optional[str] = Field(
+    # Model routing (ADR-019): per-behavior model selection. Each field is
+    # seam-whitelisted as setting.model.<behavior> (dots map to underscores
+    # here), so rerouting a behavior is self-modification through the gate —
+    # no restart. The resolution is stamped onto behavior.model, which the
+    # runtime records natively on every llm.requested event. Keys come from
+    # env vars only; LAB_LLM_MODEL still overrides the provider default.
+    model_plan: str = Field(
+        default="claude-opus-4-8",
+        description="Model for the plan behavior (ADR-019).",
+    )
+    model_interpret: str = Field(
+        default="claude-opus-4-8",
+        description="Model for the interpret behavior (ADR-019).",
+    )
+    model_draft_writer: str = Field(
+        default="claude-opus-4-8",
+        description="Model for the draft_writer behavior (ADR-019).",
+    )
+    model_answer: str = Field(
+        default="claude-sonnet-4-20250514",
+        description="Model for the answer behavior (fast plane, ADR-019).",
+    )
+    model_default: str = Field(
         default="claude-sonnet-4-20250514",
         description=(
-            "Model for the lab's llm_behaviors when the Anthropic provider is "
-            "active (key from ANTHROPIC_API_KEY env var ONLY — never the graph, "
-            "never logs). Ignored for other providers; LAB_LLM_MODEL overrides."
+            "Model for any lab llm_behavior without its own routing entry, "
+            "and the Anthropic provider default (ADR-019)."
         ),
     )
     max_llm_calls_per_behavior_run: int = Field(
@@ -146,14 +189,16 @@ class LabSettings(BaseModel):
         ),
     )
     daily_cost_cap_usd: float = Field(
-        default=5.0,
+        default=50.0,
         ge=0.0,
         description=(
-            "Daily LLM cost ceiling in USD, UTC reset (ADR-015). Spend is "
+            "Daily LLM cost cap in USD, UTC reset (ADR-015/019). Spend is "
             "rebuilt from the cost_usd activegraph stamps on llm.responded "
-            "events — restart-proof. Blocked-by-cost attempts log like "
-            "blocked-by-count. Seam-eligible: tuning the ceiling is "
-            "self-modification through the gate."
+            "events (native per-model cost reporting — never a hardcoded "
+            "price) — restart-proof. Blocked-by-cost attempts log like "
+            "blocked-by-count. Seam-eligible, but every cap mechanism clamps "
+            "to the kernel ABSOLUTE_DAILY_COST_CEILING_USD (ADR-019), which "
+            "no seam or MCP call can move."
         ),
     )
     max_total_llm_calls_per_session: int = Field(

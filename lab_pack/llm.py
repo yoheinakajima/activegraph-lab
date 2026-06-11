@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from activegraph.llm import AnthropicProvider, LLMResponse, OpenAIProvider
 
+from .kernel import ABSOLUTE_DAILY_COST_CEILING_USD
+
 
 # ---------------------------------------------------------------- schemas
 
@@ -60,6 +62,50 @@ class AnswerReply(BaseModel):
     """Structured output for the answer behavior."""
 
     reply: str = Field(description="The reply to the user's message, grounded in graph state.")
+
+
+class ResearchFinding(BaseModel):
+    """One source-attributed finding from the research worker (ADR-020)."""
+
+    text: str = Field(description="The finding, one or two plain sentences.")
+    source_urls: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The fetched source URL(s) this finding rests on. A finding "
+            "with no valid fetched-source attribution is dropped."
+        ),
+    )
+
+
+class ResearchSynthesis(BaseModel):
+    """Structured output for the research_worker behavior (ADR-020)."""
+
+    summary: str = Field(
+        description="2-4 sentences: what the sources collectively show, "
+                    "including what they fail to show.")
+    findings: list[ResearchFinding] = Field(
+        default_factory=list,
+        description="1-5 source-attributed findings.")
+
+
+class SeamProposal(BaseModel):
+    """Structured output for the seam_writer behavior (Phase 4 rails):
+    the next version of a seam body, argued from cited evidence."""
+
+    body: str = Field(
+        description=(
+            "The COMPLETE next-version body for the seam (full prompt text "
+            "for prompt.* / charter.mission; a bare value for setting.*). "
+            "Never reference kernel modules — such bodies are refused."
+        ),
+    )
+    rationale: str = Field(
+        default="",
+        description=(
+            "Why this change, argued ONLY from the evidence in the request "
+            "(rejected decisions, operator messages) — cite their ids."
+        ),
+    )
 
 
 class BlogDraft(BaseModel):
@@ -158,6 +204,43 @@ class LabMockProvider:
                     + ". Set OPENAI_API_KEY or ANTHROPIC_API_KEY for live answers."
                 ),
             )
+        elif name == "ResearchSynthesis":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            urls = []
+            for u in re.findall(r'"url":\s*"(https?://[^"]+)"', blob):
+                if u not in urls:
+                    urls.append(u)
+            urls = urls[:3]
+            parsed = ResearchSynthesis(
+                summary=(f"Synthesized {len(urls)} fetched source(s) for the "
+                         f"dispatched research task; each finding below cites "
+                         f"the source it rests on. [mock {digest}]"),
+                findings=[ResearchFinding(
+                    text=(f"The page at {u} addresses the claim under "
+                          f"investigation; its excerpt is recorded as the "
+                          f"linked source. [mock {digest}]"),
+                    source_urls=[u]) for u in urls],
+            )
+        elif name == "SeamProposal":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            seam_m = re.findall(
+                r'"seam_name":\s*"((?:prompt|setting|charter|template)[^"]+)"', blob)
+            seam = seam_m[-1] if seam_m else "prompt.unknown"
+            ev = re.findall(r"\b(?:decision|comm_message|artifact)#\d+", blob)
+            cited = ", ".join(dict.fromkeys(ev[:4])) or "the request context"
+            if seam.startswith("setting."):
+                parsed: Any = SeamProposal(
+                    body="4",
+                    rationale=f"Adjusted per the cited evidence ({cited}). [mock {digest}]")
+            else:
+                parsed = SeamProposal(
+                    body=(f"You are the {seam.split('.', 1)[1]} surface of a "
+                          "research lab. Revised per the operator's request: "
+                          "ground every claim in linked evidence, narrate "
+                          "provenance honestly, and treat failures as "
+                          f"findings. [mock proposal {digest}]"),
+                    rationale=(f"Revision argued from the cited evidence "
+                               f"({cited}). [mock {digest}]"))
         elif name == "BlogDraft":
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             refs = re.findall(r"\b(?:observation|evaluation|task|branch)#\d+", blob)
@@ -235,6 +318,12 @@ _LLM_STATE: dict[str, Any] = {
     "daily_cost": Decimal("0"),   # today's spend, from llm.responded events
     "daily_cost_recorded": False,
     "cost_cap_override": None,    # approved setting.daily_cost_cap_usd seam
+    # ADR-021: the MCP set_budget operator control, rebuilt from
+    # lab.budget_set marker events: {"persistent": float|None,
+    # "today_amount": float|None, "today_date": str|None}. A today-only cap
+    # dies at UTC midnight and the latest persistent cap (if any) resumes;
+    # a persistent set clears any standing today-only deviation.
+    "operator_cost_cap": None,
     "paused": False,              # ADR-015; rebuilt from lab.paused/resumed
     "pause_skipped": set(),       # behaviors skipped THIS pause episode
     "last_model": None,
@@ -257,6 +346,7 @@ def sync_daily_budget(rt) -> int:
     cost = Decimal("0")
     paused = _LLM_STATE["paused"]
     saw_marker = False
+    budget_evt = None
     for e in rt.graph.events:
         t = str(e.type)
         ts = str(getattr(e, "timestamp", "") or "")
@@ -271,6 +361,19 @@ def sync_daily_budget(rt) -> int:
             paused, saw_marker = True, True
         elif t == "lab.resumed":
             paused, saw_marker = False, True
+        elif t == "lab.budget_set":
+            if budget_evt is None:
+                budget_evt = {"persistent": None, "today_amount": None,
+                              "today_date": None}
+            amount = float(e.payload.get("new_usd") or 0)
+            if e.payload.get("today_only"):
+                budget_evt["today_amount"] = amount
+                budget_evt["today_date"] = str(e.payload.get("date") or "")
+            else:
+                budget_evt["persistent"] = amount
+                budget_evt["today_amount"] = None  # explicit set supersedes
+                budget_evt["today_date"] = None
+    _LLM_STATE["operator_cost_cap"] = budget_evt
     _LLM_STATE["daily_used"] = used
     _LLM_STATE["daily_cost"] = cost
     if saw_marker and paused != _LLM_STATE["paused"]:
@@ -315,7 +418,56 @@ def reset_llm_session() -> None:
                       budget_recorded=False, daily_used=0,
                       daily_recorded=False, daily_cost=Decimal("0"),
                       daily_cost_recorded=False, cost_cap_override=None,
+                      operator_cost_cap=None,
                       paused=False, pause_skipped=set(), last_model=None)
+
+
+def _operator_cap_now() -> Optional[float]:
+    """The MCP set_budget override in force, if any: a today-only cap dies
+    at UTC midnight and the latest persistent cap (if any) resumes
+    (ADR-021)."""
+    from datetime import datetime, timezone
+    oc = _LLM_STATE.get("operator_cost_cap")
+    if not oc:
+        return None
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if oc.get("today_amount") is not None and oc.get("today_date") == today:
+        return float(oc["today_amount"])
+    if oc.get("persistent") is not None:
+        return float(oc["persistent"])
+    return None
+
+
+def set_operator_budget(rt, amount_usd: float, *, today_only: bool,
+                        by: str = "operator") -> dict:
+    """ADR-021: the reversible budget control. Clamps to the kernel ceiling,
+    appends a public lab.budget_set control event recording old → new and
+    scope (the log is the persistence; sync_daily_budget rebuilds), and
+    updates in-process state."""
+    from datetime import datetime, timezone
+    from .behaviors import emit_lab_event
+    from .settings import LabSettings
+    requested = float(amount_usd)
+    amount = min(requested, ABSOLUTE_DAILY_COST_CEILING_USD)
+    old = current_cost_cap(LabSettings().daily_cost_cap_usd)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    emit_lab_event(rt.graph, "lab.budget_set", {
+        "old_usd": old, "new_usd": amount, "requested_usd": requested,
+        "today_only": bool(today_only), "date": today, "by": by,
+    })
+    oc = _LLM_STATE.get("operator_cost_cap") or {
+        "persistent": None, "today_amount": None, "today_date": None}
+    if today_only:
+        oc["today_amount"], oc["today_date"] = amount, today
+    else:
+        oc["persistent"] = amount
+        oc["today_amount"] = oc["today_date"] = None
+    _LLM_STATE["operator_cost_cap"] = oc
+    return {"old_usd": old, "new_usd": amount, "requested_usd": requested,
+            "clamped": requested > amount,
+            "ceiling_usd": ABSOLUTE_DAILY_COST_CEILING_USD,
+            "scope": "today_only (resets at UTC midnight)" if today_only
+                     else "until changed"}
 
 
 def reset_llm_run_counters() -> None:
@@ -417,6 +569,10 @@ def _inert_output(output_schema: type, note: str) -> Any:
             return output_schema(summary=note, outcome="decided")
         if name == "AnswerReply":
             return output_schema(reply=note)
+        if name == "ResearchSynthesis":
+            return output_schema(summary=note, findings=[])
+        if name == "SeamProposal":
+            return output_schema(body="", rationale=note)
         if name == "BlogDraft":
             return output_schema(title=note, slug="", body_markdown="")
     except Exception:
@@ -443,7 +599,7 @@ class LabProviderWrapper:
     """
 
     def __init__(self, inner: Any, *, max_total: int = 60, max_per_behavior: int = 5,
-                 max_daily: int = 200, max_daily_cost_usd: float = 5.0,
+                 max_daily: int = 200, max_daily_cost_usd: float = 50.0,
                  prompt_bodies: Optional[dict[str, str]] = None) -> None:
         self._inner = inner
         self._max_total = max_total
@@ -454,10 +610,16 @@ class LabProviderWrapper:
         self.default_model = getattr(inner, "default_model", "unknown")
 
     def effective_cost_cap(self) -> float:
-        """ADR-015: the seam-approved override wins, else the settings value.
-        Tuning the ceiling is self-modification through the gate."""
+        """ADR-015/019: the seam-approved override wins, else the settings
+        value — and EVERY result clamps to the kernel's absolute ceiling.
+        Tuning the cap is self-modification through the gate; moving the
+        ceiling is a git change."""
+        operator = _operator_cap_now()
+        if operator is not None:  # the most recent human intent wins (ADR-021)
+            return min(operator, ABSOLUTE_DAILY_COST_CEILING_USD)
         override = _LLM_STATE.get("cost_cap_override")
-        return float(override) if override is not None else self._max_daily_cost
+        cap = float(override) if override is not None else self._max_daily_cost
+        return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)
 
     def _behavior_for(self, system: str) -> Optional[str]:
         for name, body in self._prompts.items():
@@ -585,6 +747,28 @@ class LabProviderWrapper:
 
 # ---------------------------------------------------------------- selection
 
+# The provider this process runs (set by select_lab_provider). Model routing
+# (ADR-019) consults it so a seam-routed model the active provider does not
+# recognize never reaches the wire.
+_ACTIVE_PROVIDER: dict[str, Any] = {"provider": None}
+
+
+def active_provider() -> Any:
+    return _ACTIVE_PROVIDER["provider"]
+
+
+def current_cost_cap(settings_default: float) -> float:
+    """The daily cost cap in force for display paths: operator control, else
+    seam override, else the settings value — clamped to the kernel ceiling
+    (ADR-019/021)."""
+    operator = _operator_cap_now()
+    if operator is not None:
+        return min(operator, ABSOLUTE_DAILY_COST_CEILING_USD)
+    override = _LLM_STATE.get("cost_cap_override")
+    cap = float(override) if override is not None else float(settings_default)
+    return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)
+
+
 _PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 _AUTODETECT_ORDER = ["anthropic", "openai"]
 _DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-sonnet-4-20250514"}
@@ -595,7 +779,11 @@ def _lab_prompt_bodies() -> dict[str, str]:
     from activegraph.packs import load_prompts_from_dir
     d = Path(__file__).parent / "prompts"
     try:
-        return {p.name: p.body for p in load_prompts_from_dir(d)}
+        # "charter" is not a behavior: its body is injected into SEVERAL
+        # behaviors' contexts (ADR-018), so probing it would misidentify
+        # every charter behavior as "charter" in _behavior_for.
+        return {p.name: p.body for p in load_prompts_from_dir(d)
+                if p.name != "charter"}
     except Exception:
         return {}
 
@@ -630,10 +818,12 @@ def select_lab_provider(
                 break
 
     if chosen is None or pref == "mock":
-        return LabMockProvider(), {"mode": "mock", "provider": "mock", "model": None}
+        mock = LabMockProvider()
+        _ACTIVE_PROVIDER["provider"] = mock
+        return mock, {"mode": "mock", "provider": "mock", "model": None}
 
     if chosen == "anthropic" and model is None and settings is not None:
-        model = getattr(settings, "model", None)
+        model = getattr(settings, "model_default", None)
 
     inst: Any = OpenAIProvider() if chosen == "openai" else AnthropicProvider()
     inst.default_model = model or _DEFAULT_MODELS[chosen]
@@ -642,7 +832,8 @@ def select_lab_provider(
         max_total=getattr(settings, "max_total_llm_calls_per_session", 60),
         max_per_behavior=getattr(settings, "max_llm_calls_per_behavior_run", 5),
         max_daily=getattr(settings, "max_llm_calls_per_day", 200),
-        max_daily_cost_usd=getattr(settings, "daily_cost_cap_usd", 5.0),
+        max_daily_cost_usd=getattr(settings, "daily_cost_cap_usd", 50.0),
         prompt_bodies=_lab_prompt_bodies(),
     )
+    _ACTIVE_PROVIDER["provider"] = wrapped
     return wrapped, {"mode": "live", "provider": chosen, "model": inst.default_model}

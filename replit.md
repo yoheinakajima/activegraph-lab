@@ -32,7 +32,7 @@ needed in this environment anymore.
 | `/lab` | the open-workshop notebook (everything, live) |
 | `/healthz` | backend, events, paused, calls/cost vs caps |
 | `POST /lab/pause` / `POST /lab/resume` | operator token; global pause (ADR-015) |
-| `POST /mcp` | MCP server, streamable HTTP (ADR-016); auth: OAuth bearer (ADR-017), legacy `LAB_MCP_TOKEN` bearer, or `/mcp/<LAB_MCP_TOKEN>` path token — identical authority in all three; read tools + `send_chat`, never decisions or pause |
+| `POST /mcp` | MCP server, streamable HTTP (ADR-016/021); auth: OAuth bearer (ADR-017), legacy `LAB_MCP_TOKEN` bearer, or `/mcp/<LAB_MCP_TOKEN>` path token — identical authority in all three; read tools (incl. `get_log`, `get_entity`, `github_read`) + `send_chat` + the reversible controls `set_budget`/`pause_lab`/`resume_lab` — never decision approval or seam promotion |
 | `/.well-known/oauth-*`, `POST /register`, `GET+POST /authorize`, `POST /token` | OAuth 2.1 + DCR for claude.ai's connector (ADR-017) — STATELESS: tokens are HMAC-signed payloads keyed from `LAB_MCP_TOKEN`, verified by recomputation; the operator pastes `LAB_MCP_TOKEN` once on the `/authorize` page |
 
 ## Run
@@ -50,6 +50,8 @@ boot log).
 | `LAB_OPERATOR_TOKEN` | bearer token for mutations; unset → read-only mode |
 | `LAB_MCP_TOKEN` | the one secret behind `/mcp` (ADR-016/017): legacy bearer, the OAuth signing root, AND the password the operator pastes on `/authorize`; permits MCP reads + `send_chat` but NEVER decisions or pause, and the operator token never opens `/mcp`; unset → MCP + OAuth disabled; rotating it revokes every OAuth client/token at once (nothing is stored) |
 | `LAB_ENV` | `prod` (disables /reset; set by .replit) |
+| `GITHUB_TOKEN` | OPTIONAL (ADR-022): raises the GitHub API rate limit for the read-only github tools. A fine-grained read-only token; it rides only in request headers, never payloads, and is sentinel-audited. Absent → unauthenticated reads still work. |
+| `GITHUB_REPO_ALLOWLIST` | OPTIONAL (ADR-022): comma-separated repos the read tools may touch (bare names default to `yoheinakajima/<name>`). Default: `yoheinakajima/activegraph-lab,activegraph,activegraph-packs,ag-coder`. |
 | `LAB_DATABASE_URL` | the production database: the Replit-managed Neon cluster, accessed via its **writable primary** endpoint, supplied as this secret. Replit reserves the name `DATABASE_URL` when its managed-Postgres module is present (it collides with explicit secrets at publish time), so the lab reads `LAB_DATABASE_URL` first and falls back to `DATABASE_URL` (ADR-009 note). The **`postgresql-16` module must NOT be removed** — it owns that cluster; removing it destroys the production database. |
 
 `LAB_ALLOW_GRAPH_CODE` is **intentionally absent**: approved graph-code
@@ -62,10 +64,12 @@ act, not a deploy default.
   approved decision (and graph code additionally needs the flag).
 - No secrets in any event payload, log line, or error path — enforced by
   `python scripts/test_public_safety.py`.
-- LLM spend: 5 calls/behavior-run, 60/session, 200/day, $5.00/day cost
-  ceiling (UTC reset, counted/summed from the event log — restart-proof;
-  ADR-015). The global pause is also an event: bouncing the process resets
-  neither.
+- LLM spend: 5 calls/behavior-run, 60/session, 200/day, $50.00/day cost
+  cap (default; seam- or MCP-adjustable) under the ABSOLUTE kernel ceiling
+  of $100.00/day that nothing graph- or MCP-side can move (ADR-019/021).
+  All of it UTC-reset and counted/summed from the event log —
+  restart-proof; the global pause is also an event: bouncing the process
+  resets nothing.
 
 ## Verify a deploy
 

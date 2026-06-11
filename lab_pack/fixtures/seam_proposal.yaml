@@ -1,0 +1,26 @@
+# Chat-triggered seam proposal fixture (Phase 4 rails): the operator asks
+# the lab to propose a seam change in a branch thread; the lab assembles the
+# request (current version verbatim + cited evidence), authors the next
+# version, and opens a seam artifact + PENDING self_modify decision through
+# the existing gate. Nothing auto-applies; the proposal records the evidence
+# ids that informed it. The reserved draft_writer voice episode is NOT
+# performed here — these are the rails.
+
+settings:
+  crawl_enabled: false
+
+mission:
+  title: Seam proposal mission
+
+branch:
+  title: Editorial steering branch
+  intent: Talk to the lab about its own drafts here.
+
+message: >
+  Please propose an improved draft_writer prompt addressing the rejected
+  drafts.
+
+expected_outputs:
+  seam_name: prompt.draft_writer
+  proposal_version: 1
+  pending_self_modify: 1

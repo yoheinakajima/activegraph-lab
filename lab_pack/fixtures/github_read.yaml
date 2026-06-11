@@ -1,0 +1,25 @@
+# GitHub read fixture (ADR-022, rung 1): the read-only tools against canned
+# API responses, the allowlist refusal path, MCP passthrough parity with the
+# gateway handlers, and the research worker consuming a github.com source
+# through tool_gateway. No network; rung 2 (submit_pr) is design-only.
+
+settings:
+  crawl_enabled: false
+  research_worker_enabled: true
+  research_fetch_cap: 4
+  dispatch_gap_check: true
+
+mission:
+  title: GitHub read mission
+
+branch:
+  title: Verify the runtime claim from the repo
+  intent: >
+    Verify the replay claim using
+    https://github.com/yoheinakajima/activegraph-lab/blob/main/README.md
+    as a primary source.
+
+expected_outputs:
+  allowed_repo: yoheinakajima/activegraph-lab
+  refused_repo: somebody-else/private-stuff
+  file_text: "# canned README: replay, fork, and diff any run."
