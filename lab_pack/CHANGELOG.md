@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- ADR-023 (the evt_1847/evt_1934 incident): the chat path's failure domain
+  is now explicit — the message append is the only step that may fail a
+  request, post-commit failures degrade to reply_pending + a
+  chat_path_degraded observation, and storage.repair_sequences realigns a
+  restored Postgres lineage's events sequence at boot (a row-level
+  pg_restore leaves BIGSERIAL behind the rows; once nextval reached the
+  restored block every append died with UniqueViolation AFTER the event
+  entered the in-memory log). tools.py gains ensure_branch_thread_fn /
+  append_branch_message_fn primitives; send_branch_message_fn composes
+  them unchanged. Diagnostics: /lab/errors + MCP get_errors ring buffer,
+  structured error responses (class + sanitized message). ADR-024: the
+  server binds before the boot drain; /healthz reports the phase.
+
 - MCP send_chat's reply wait is now a setting, `mcp_reply_wait_seconds`
   (default 15, seam-whitelisted): the fixed 60s wait exceeded claude.ai's
   client-side tool timeout, so the client errored before the structured

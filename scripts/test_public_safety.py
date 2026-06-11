@@ -270,6 +270,20 @@ def _run() -> int:
             oauth_outputs.append({"status": s, "body": body})
         oauth_secrets["oauth_signing_key_hex"] = \
             oauth.derive_key(os.environ["LAB_MCP_TOKEN"]).hex()
+
+        # ── errors projection (ADR-023): the ring buffer is public, so its
+        # sanitizer joins the audit — exceptions carrying every sentinel,
+        # a DSN, and a path are recorded, then the projection is grepped.
+        lab_server._ERRORS.clear()
+        lab_server._record_error("audit.synthetic", RuntimeError(
+            "connection to " + os.environ["LAB_DATABASE_URL"] + " failed; "
+            "token=" + os.environ["LAB_MCP_TOKEN"] + " op="
+            + os.environ["LAB_OPERATOR_TOKEN"] + " key="
+            + os.environ["ANTHROPIC_API_KEY"] + " cfg=/etc/lab/secret/conf"))
+        with urllib.request.urlopen(base + "/lab/errors", timeout=10) as r:
+            errors_projection = json.loads(r.read())
+        errors_tool = mcp_call("tools/call", {"name": "get_errors",
+                                              "arguments": {}})
     finally:
         httpd.shutdown()
         lab_server._rt = None
@@ -292,6 +306,8 @@ def _run() -> int:
         "mcp": mcp_outputs,
         "mcp_url_path": url_outputs,
         "oauth": oauth_outputs,
+        "errors_projection": errors_projection,
+        "errors_tool": errors_tool,
         "http_log": http_log.getvalue(),
         "boot_log": boot_log.getvalue(),
     }
@@ -326,9 +342,16 @@ def _run() -> int:
                  "pw-SENTINEL-mK6tE9"):
         check(frag not in blob, f"credential fragment '{frag}' absent")
 
-    print("== exception hygiene (3b) ==")
+    print("== exception hygiene (3b + ADR-023 errors projection) ==")
     check("Traceback (most recent call last)" not in blob,
           "no tracebacks in any event/observation/feed payload")
+    audit_entries = [e for e in errors_projection.get("errors", [])
+                     if e.get("kind") == "audit.synthetic"]
+    check(len(audit_entries) == 1
+          and audit_entries[0]["class"] == "RuntimeError"
+          and "<LAB_MCP_TOKEN>" in audit_entries[0]["message"]
+          and "<path>" in audit_entries[0]["message"],
+          "errors projection keeps class + sanitized message, redacts the rest")
     fetch_fails = [o for o in g.objects(type="observation")
                    if (o.data.get("metadata") or {}).get("lab") == "fetch_failure"]
     check(len(fetch_fails) >= 1, f"fetch-failure path exercised ({len(fetch_fails)})")

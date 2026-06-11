@@ -13,6 +13,11 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 - All user-visible state derives from the event log. The UI is a projection.
 - No side database.
+- One scoped exception (ADR-023): the `/lab/errors` diagnostics projection is a volatile in-process ring buffer — it exists precisely for the failure domain where appending to the log is the thing that broke. Memory only, lost on restart, never authoritative.
+
+## Chat path
+
+- In any chat path, the message append is the ONLY step whose failure may fail the request (ADR-023). Post-commit failures degrade to `reply_pending` with the committed message ids — never an error after a successful append. The reply runs on the worker regardless of the client's fate.
 
 ## Authority
 

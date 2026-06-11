@@ -136,4 +136,6 @@ Verification (replace `$URL` and `$TOK`):
 - MCP surface: `python scripts/test_mcp.py`
 - OAuth 2.1 + DCR (ADR-017): `python scripts/test_oauth.py`
 - Public-safety sentinel audit: `python scripts/test_public_safety.py`
+- Chat-path robustness (ADR-023; add `LAB_TEST_PG_URL=...scratch...` for the real leaf): `python scripts/test_chat_robustness.py`
+- Boot readiness (ADR-024): `python scripts/test_readiness.py`
 - UI render (jsdom, static fallback): `python scripts/check_ui.py`

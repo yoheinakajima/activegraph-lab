@@ -37,6 +37,56 @@ _lock = threading.Lock()
 _rt = None
 _llm_info: dict = {}
 _BOOT_TIME = None  # set in main()
+# ADR-024: boot phase for /healthz while the socket is already bound.
+# starting → loading → draining → ready | failed
+_BOOT_PHASE: dict = {"phase": "starting"}
+
+
+# ─── error diagnostics (ADR-023) ──────────────────────────────────────────────
+# A volatile in-process ring buffer of the last N unhandled/degraded
+# exceptions, served read-only at GET /lab/errors and the MCP get_errors
+# tool. Deliberately NOT log-derived: its job is to stay readable when
+# appending to the log itself is the thing that failed. Lost on restart,
+# never authoritative — the exception to the projection rule is recorded in
+# CONTRACT.md and ADR-023.
+
+import re as _err_re
+from collections import deque as _deque
+
+_ERRORS_MAX = 50
+_ERRORS: _deque = _deque(maxlen=_ERRORS_MAX)
+
+_SECRET_ENV_KEYS = ("LAB_MCP_TOKEN", "LAB_OPERATOR_TOKEN", "LAB_DATABASE_URL",
+                    "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+
+def _sanitize_error_text(text: str) -> str:
+    """One public-safe line (ADR-011 amendment): the exception class and a
+    sanitized message are not secrets; env values, URLs/DSNs (credentials
+    ride in them), and filesystem paths still are."""
+    line = " ".join(str(text or "").split())
+    for key in _SECRET_ENV_KEYS:
+        val = os.environ.get(key, "").strip()
+        if val and val in line:
+            line = line.replace(val, f"<{key}>")
+    line = _err_re.sub(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+", "<url>", line)
+    line = _err_re.sub(r"(?:/[\w.\-]+){2,}/?", "<path>", line)
+    return line[:200]
+
+
+def _record_error(kind: str, exc: BaseException,
+                  event_ids: Optional[list] = None) -> dict:
+    """Push one sanitized entry onto the diagnostics ring buffer and return
+    it (callers reuse class+message for structured error responses)."""
+    entry = {
+        "ts": _ts(),
+        "class": type(exc).__name__,
+        "message": _sanitize_error_text(str(exc)),
+        "kind": kind,
+        "event_ids": [str(i) for i in (event_ids or [])],
+    }
+    _ERRORS.append(entry)
+    return entry
 
 
 # ─── auth (KERNEL — ADR-010/012) ──────────────────────────────────────────────
@@ -255,8 +305,18 @@ def _build_runtime():
     # ADR-009: backend selection lives in lab_pack/storage.py only. The URL
     # is a credential (ADR-011) — log the backend name, never the URL.
     db = storage.store_url()
+    _BOOT_PHASE["phase"] = "loading"
     if storage.store_has_run(db):
         mode = "resumed"
+        # ADR-023 leaf fix: a row-level pg restore leaves the BIGSERIAL
+        # sequence behind the restored rows; once nextval reaches the
+        # restored block, EVERY append dies (committed in memory, never
+        # durable). Realign before the runtime opens the store.
+        n_fix = storage.repair_sequences(db)
+        if n_fix:
+            print(f"[lab_server] storage: events sequence realigned "
+                  f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
+                  flush=True)
         rt = Runtime.load(db, llm_provider=provider)
         load_lab_packs(rt, memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
@@ -290,6 +350,7 @@ def _build_runtime():
         # this drain a process that boots into paused=true parks that backlog
         # — and any backfilled findings — until the next unrelated mutation.
         reset_llm_run_counters()
+        _BOOT_PHASE["phase"] = "draining"
         rt.run_until_idle()
         rt.save_state()
     else:
@@ -300,6 +361,7 @@ def _build_runtime():
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
+        _BOOT_PHASE["phase"] = "draining"
         rt.run_until_idle()
         rt.save_state()
     from lab_pack import graph_code
@@ -339,8 +401,11 @@ class _RuntimeWorker(threading.Thread):
                 _rt = _build_runtime()
         except BaseException as exc:  # boot failure must surface, not hang
             self.boot_error = exc
+            _BOOT_PHASE["phase"] = "failed"
+            _record_error("boot", exc)
             self.ready.set()
             return
+        _BOOT_PHASE["phase"] = "ready"
         self.ready.set()
         while True:
             fn, fut = self.jobs.get()
@@ -372,7 +437,9 @@ def _get_rt():
 
 def _run_on_worker(fn, timeout: float = 180):
     """Execute a runtime mutation on the owning thread (store affinity).
-    Test mode (no worker): run inline under the lock."""
+    Test mode (no worker): run inline under the lock. On timeout the job
+    stays queued and the worker still executes it — callers that time out
+    have triggered the work, not cancelled it (ADR-023 decoupling)."""
     if _worker is None or not _worker.is_alive():
         with _lock:
             return fn(_rt)
@@ -383,6 +450,31 @@ def _run_on_worker(fn, timeout: float = 180):
     if fut["error"] is not None:
         raise fut["error"]
     return fut["result"]
+
+
+def _submit_to_worker(fn) -> None:
+    """Queue a runtime job without waiting on its result (ADR-023: the reply
+    phase must run on the worker whenever the append succeeded, regardless of
+    the client's fate). Test mode: run inline, errors to the ring buffer."""
+    if _worker is None or not _worker.is_alive():
+        try:
+            with _lock:
+                fn(_rt)
+        except Exception as exc:
+            _record_error("worker.inline", exc)
+        return
+    _worker.jobs.put((fn, {"done": threading.Event(),
+                           "result": None, "error": None}))
+
+
+def _ready() -> bool:
+    """ADR-024: the socket binds before the boot drain; requests other than
+    /healthz are refused with 503 until the runtime is ready. Test mode
+    (injected _rt, no worker) is always ready."""
+    if _rt is not None and _worker is None:
+        return True
+    return (_worker is not None and _worker.ready.is_set()
+            and _worker.boot_error is None)
 
 
 # ─── serialization (projection helpers) ───────────────────────────────────────
@@ -459,6 +551,7 @@ DEFAULT_TEMPLATES = {
     "draft_request":    "Draft requested: {short_text}",
     "drafting_idle":    "{short_text}",
     "behavior_skipped": "{short_text}",
+    "chat_path_degraded": "{short_text}",
 }
 
 
@@ -970,6 +1063,26 @@ def _status_line() -> str:
 # ─── the chat path ────────────────────────────────────────────────────────────
 
 
+def _append_degraded_observation(rt, branch_id: str, degraded: list[dict],
+                                 message_id: str) -> None:
+    """Best-effort log record of a degraded chat path (ADR-023): exception
+    class + sanitized message only — never payloads (ADR-011). The ring
+    buffer already holds the entries; this puts them on the public record
+    when the log is still writable."""
+    kinds = ", ".join(f"{d['kind']} ({d['class']})" for d in degraded)
+    rt.graph.add_object("observation", {
+        "text": (f"Chat path degraded while posting to {branch_id}: {kinds}. "
+                 "The message committed; see /lab/errors for the sanitized "
+                 "details."),
+        "confidence": 1.0,
+        "category": "risk",
+        "metadata": {"lab": "chat_path_degraded", "lab_branch_id": branch_id,
+                     "message_id": message_id,
+                     "steps": [{"kind": d["kind"], "class": d["class"],
+                                "message": d["message"]} for d in degraded]},
+    })
+
+
 def _chat_post_message(rt, branch_id: str, content: str,
                        source: Optional[str] = None):
     """Phase 1 of the one chat code path: append the operator's message (and
@@ -979,24 +1092,77 @@ def _chat_post_message(rt, branch_id: str, content: str,
     (e.g. operator_via_mcp) so the public log distinguishes the human from
     their assistant; either way the sender IS the operator (2b: a valid
     token is the operator — no anonymous write path, and the client does not
-    get to choose its identity)."""
+    get to choose its identity).
+
+    ADR-023: the comm_message append is the ONLY step here whose failure may
+    fail the request. Pre-append upkeep (budget sync, thread resolution) and
+    post-commit upkeep (discusses relation, registry cache, save, response
+    assembly) are individually guarded — their failures go to the
+    diagnostics ring buffer plus a best-effort chat_path_degraded
+    observation, and the caller still gets the committed message ids."""
     from lab_pack.behaviors import _THREAD_TO_BRANCH
     from lab_pack.llm import sync_daily_budget
-    from lab_pack.tools import send_branch_message_fn
+    from lab_pack.tools import (append_branch_message_fn,
+                                ensure_branch_thread_fn,
+                                link_thread_to_branch_fn)
 
-    sync_daily_budget(rt)  # 7b: authoritative used-today from the log
+    degraded: list[dict] = []
+
+    def guard(step: str, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            degraded.append(_record_error(f"chat.{step}", exc))
+            return None
+
+    guard("budget_sync", lambda: sync_daily_budget(rt))  # 7b: bookkeeping
     if rt.graph.get_object(branch_id) is None:
         return None
     events_before = len(rt.graph.events)
+    # Thread resolution: the registry cache first; on a miss the log itself
+    # is the truth (the cache is rebuilt on resume and may diverge).
     thread_id = next((t for t, b in _THREAD_TO_BRANCH.items() if b == branch_id), None)
-    thread_id, msg = send_branch_message_fn(
-        rt.graph, branch_id, content,
-        user_ref="operator", thread_id=thread_id, source=source,
-    )
-    _save(rt)
-    return {"branch_id": branch_id, "thread_id": thread_id,
-            "message_id": str(msg.id),
-            "message_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
+    if thread_id is None:
+        def _thread_from_log():
+            for r in rt.graph.relations():
+                rel_type, src, tgt = _decode_relation(r)
+                if rel_type == "discusses" and tgt == branch_id:
+                    return src
+            return None
+        thread_id = guard("thread_lookup", _thread_from_log)
+    created_thread = False
+    if thread_id is None:
+        # Part of the append phase: the message cannot commit without a
+        # thread, so a failure here fails the request (nothing user-visible
+        # has committed yet).
+        thread_id, created_thread = ensure_branch_thread_fn(rt.graph, branch_id)
+    # THE append — the one step whose failure may fail the request (ADR-023).
+    msg = append_branch_message_fn(rt.graph, branch_id, content,
+                                   user_ref="operator", thread_id=thread_id,
+                                   source=source)
+    # Post-commit upkeep: individually guarded, never fails the request.
+    if created_thread:
+        guard("thread_link",
+              lambda: link_thread_to_branch_fn(rt.graph, thread_id, branch_id))
+    else:
+        guard("registry_cache",
+              lambda: _THREAD_TO_BRANCH.__setitem__(str(thread_id), branch_id))
+    # save_state is meaningless on ephemeral (storeless) test runtimes —
+    # only a store-backed failure is a real degradation.
+    guard("save", lambda: rt.save_state() if rt.graph.store is not None else None)
+    out = guard("response_assembly", lambda: {
+        "branch_id": branch_id, "thread_id": str(thread_id),
+        "message_id": str(msg.id),
+        "message_event_ids": [str(e.id) for e in rt.graph.events[events_before:]],
+    }) or {"branch_id": branch_id, "thread_id": str(thread_id),
+           "message_id": str(msg.id), "message_event_ids": []}
+    if degraded:
+        out["degraded"] = [{"kind": d["kind"], "class": d["class"],
+                            "message": d["message"]} for d in degraded]
+        guard("degraded_observation",
+              lambda: _append_degraded_observation(rt, branch_id, degraded,
+                                                   str(msg.id)))
+    return out
 
 
 def _chat_collect_reply(rt, message_id: str):
@@ -1016,23 +1182,38 @@ def _chat_collect_reply(rt, message_id: str):
             "reply_event_ids": [str(e.id) for e in rt.graph.events[events_before:]]}
 
 
+def _chat_collect_reply_safe(rt, message_id: str):
+    """Phase 2 with ADR-023 guarantees: a reply-phase failure can never fail
+    a request whose message already committed — it degrades to None and the
+    sanitized exception lands on the diagnostics ring buffer."""
+    try:
+        return _chat_collect_reply(rt, message_id)
+    except Exception as exc:
+        _record_error("chat.reply_drain", exc, [message_id])
+        return None
+
+
 def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
     """The one chat code path: POST /chat and the MCP send_chat tool both land
     here (ADR-016), composed from the two phases above so MCP can bound the
     reply wait separately from the message append. Runs on the runtime
-    worker."""
+    worker. Only the message append may raise (ADR-023)."""
     posted = _chat_post_message(rt, branch_id, content, source)
     if posted is None:
         return None
-    reply = _chat_collect_reply(rt, posted["message_id"])
-    return {"content": reply["content"] if reply else "No reply produced.",
-            "thread_id": posted["thread_id"],
-            "branch_id": posted["branch_id"],
-            "event_horizon": reply["event_horizon"] if reply else None,
-            "message_id": posted["message_id"],
-            "message_event_ids": posted["message_event_ids"],
-            "created_event_ids": posted["message_event_ids"]
-            + (reply["reply_event_ids"] if reply else [])}
+    reply = _chat_collect_reply_safe(rt, posted["message_id"])
+    out = {"content": reply["content"] if reply else "No reply produced.",
+           "status": "ok" if reply else "reply_pending",
+           "thread_id": posted["thread_id"],
+           "branch_id": posted["branch_id"],
+           "event_horizon": reply["event_horizon"] if reply else None,
+           "message_id": posted["message_id"],
+           "message_event_ids": posted["message_event_ids"],
+           "created_event_ids": posted["message_event_ids"]
+           + (reply["reply_event_ids"] if reply else [])}
+    if posted.get("degraded"):
+        out["degraded"] = posted["degraded"]
+    return out
 
 
 def _pause_job(rt, paused: bool) -> dict:
@@ -1122,9 +1303,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_unavailable(self):
+        """ADR-024: the socket is bound but the runtime is still booting (or
+        boot failed) — everything except /healthz gets 503 + Retry-After."""
+        body = json.dumps({"error": "the lab is starting",
+                           "ready": False,
+                           "phase": _BOOT_PHASE["phase"]}).encode()
+        self.send_response(503)
+        self.send_header("Retry-After", "5")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = urlparse(self.path).path
         qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        # ADR-024: health answers from bind time; everything else waits for
+        # the boot drain. /lab/errors is also boot-independent by design —
+        # it must stay readable when the runtime is the thing that broke.
+        if path in ("/health", "/healthz"):
+            self._handle_healthz()
+            return
+        if path == "/lab/errors":
+            self._handle_errors()
+            return
+        if not _ready():
+            self._send_unavailable()
+            return
         try:
             # ── the public blog (ADR-013): / is the front door ──────────────
             if path == "/":
@@ -1189,8 +1395,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_packs()
             elif path == "/frames":
                 self._send_json({"frames": [], "total": 0})
-            elif path in ("/health", "/healthz"):
-                self._handle_healthz()
             # ── OAuth 2.1 for the MCP surface (ADR-017) ─────────────────────
             elif path in ("/.well-known/oauth-authorization-server",
                           "/.well-known/oauth-authorization-server/mcp"):
@@ -1221,14 +1425,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self._send_error_json("Not found", 404)
-        except Exception:
-            traceback.print_exc()  # details to stderr only (ADR-011)
-            self._send_error_json("internal error", 500)
+        except (BrokenPipeError, ConnectionResetError):
+            return  # the client vanished; the work is done (ADR-023)
+        except Exception as exc:
+            traceback.print_exc()  # full detail to stderr only (ADR-011)
+            e = _record_error(f"http.GET {path}", exc)
+            self._send_error_json(
+                f"internal error: {e['class']}: {e['message']}", 500)
 
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
+        if not _ready():  # ADR-024
+            self._send_unavailable()
+            return
         if path == "/mcp" or path.startswith("/mcp/"):
             # ADR-016: MCP authorizes with LAB_MCP_TOKEN only — the operator
             # token is refused here, and LAB_MCP_TOKEN is refused everywhere
@@ -1259,18 +1470,25 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                 else:
                     self._send_json(payload, http_status)
-            except Exception:
-                traceback.print_exc()  # details to stderr only (ADR-011)
-                self._send_error_json("internal error", 500)
+            except (BrokenPipeError, ConnectionResetError):
+                return  # the client vanished; the work is done (ADR-023)
+            except Exception as exc:
+                traceback.print_exc()  # full detail to stderr only (ADR-011)
+                e = _record_error("mcp.post", exc)
+                self._send_error_json(
+                    f"internal error: {e['class']}: {e['message']}", 500)
             return
         if path in ("/register", "/token", "/authorize"):
             # ADR-017: form-encoded bodies, so they route before the JSON
             # parse below. Same fixed-message discipline as /mcp: no supplied
-            # value, code, or token-derived value in any error body.
+            # value, code, or token-derived value in any error body — the
+            # OAuth surface keeps its fixed bodies (no class/message: an
+            # unauthenticated guessing surface gets no oracle, ADR-023).
             try:
                 self._handle_oauth_post(path, raw)
-            except Exception:
+            except Exception as exc:
                 traceback.print_exc()  # details to stderr only (ADR-011)
+                _record_error(f"oauth.{path.lstrip('/')}", exc)
                 self._send_error_json("internal error", 500)
             return
         body = json.loads(raw) if raw else {}
@@ -1307,9 +1525,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_pause(path == "/lab/pause")
             else:
                 self._send_error_json("Not found", 404)
-        except Exception as e:
-            traceback.print_exc()
-            self._send_error_json("internal error", 500)
+        except (BrokenPipeError, ConnectionResetError):
+            return  # the client vanished; the work is done (ADR-023)
+        except Exception as exc:
+            traceback.print_exc()  # full detail to stderr only (ADR-011)
+            e = _record_error(f"http.POST {path}", exc)
+            self._send_error_json(
+                f"internal error: {e['class']}: {e['message']}", 500)
 
     # ── GET /lab/entries (6b: "load older") ─────────────────────────────────
 
@@ -1411,11 +1633,41 @@ class Handler(BaseHTTPRequestHandler):
             status.update(graph_code.status(rt.graph))
         self._send_json(status)
 
+    # ── GET /lab/errors (ADR-023 diagnostics projection) ────────────────────
+
+    def _handle_errors(self):
+        """The last N unhandled/degraded exceptions: ts, class, sanitized
+        message, request kind, related event ids. Volatile and in-process by
+        design — it must stay readable when appending to the log is the
+        thing that failed. Public-safe: every message passed through
+        _sanitize_error_text; sentinel-audited like every projection."""
+        self._send_json({
+            "errors": list(reversed(_ERRORS)),
+            "max": _ERRORS_MAX,
+            "note": ("volatile in-process diagnostics (ADR-023): lost on "
+                     "restart, never authoritative — the event log is"),
+        })
+
     # ── GET /healthz ────────────────────────────────────────────────────────
 
     def _handle_healthz(self):
         import time
         from lab_pack import storage
+        uptime = int(time.monotonic() - _BOOT_TIME) if _BOOT_TIME else 0
+        if not _ready():
+            # ADR-024: answer from bind time, without touching the runtime.
+            phase = _BOOT_PHASE["phase"]
+            out = {"status": "error" if phase == "failed" else "starting",
+                   "ready": False, "phase": phase,
+                   "backend": storage.backend(),
+                   "uptime_seconds": uptime}
+            if phase == "failed" and _worker is not None \
+                    and _worker.boot_error is not None:
+                exc = _worker.boot_error
+                out["boot_error"] = (f"{type(exc).__name__}: "
+                                     f"{_sanitize_error_text(str(exc))}")
+            self._send_json(out)
+            return
         rt = _get_rt()
         with _lock:
             events = rt.graph.events
@@ -1425,11 +1677,13 @@ class Handler(BaseHTTPRequestHandler):
             n = len(events)
         self._send_json({
             "status": "ok",
+            "ready": True,
+            "phase": "ready",
             "backend": storage.backend(),
             "event_count": n,
             "last_event_ts": last_ts,
             "pending_decisions": pending,
-            "uptime_seconds": int(time.monotonic() - _BOOT_TIME) if _BOOT_TIME else 0,
+            "uptime_seconds": uptime,
             "read_only": not _operator_token(),
             "llm": _llm_info,
             **_operator_status(),  # 6c: paused, calls today/cap, cost today/cap
@@ -1582,7 +1836,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json("content and branch_id are required", 400)
             return
 
-        out = _run_on_worker(lambda rt: _chat_job(rt, branch_id, content))
+        try:
+            out = _run_on_worker(lambda rt: _chat_job(rt, branch_id, content))
+        except Exception as exc:
+            # Only the message append may raise (ADR-023) — nothing
+            # committed; the error is structured and diagnosable (ADR-011
+            # amendment), never a bare "internal error".
+            traceback.print_exc()
+            e = _record_error("chat.append", exc)
+            self._send_error_json(
+                f"message append failed: {e['class']}: {e['message']}", 500)
+            return
         if out is None:
             self._send_error_json(f"no such branch: {branch_id}", 404)
             return
@@ -1677,21 +1941,29 @@ def _save(rt) -> None:
 
 def main() -> None:
     import time
-    global _BOOT_TIME
+    global _BOOT_TIME, _worker
     _BOOT_TIME = time.monotonic()
     port = int(os.environ.get("PORT") or os.environ.get("LAB_PORT") or "7799")
     if not _operator_token():
         print("[lab_server] WARNING: LAB_OPERATOR_TOKEN is not set — the lab is "
               "READ-ONLY. All mutations (chat, decisions) will be refused until "
               "the token is configured.", flush=True)
-    _get_rt()  # build/resume before accepting requests
+    # ADR-024: bind FIRST, boot in the background. As the log grows, the
+    # resumed-boot drain outlasts deploy health-grace windows; /healthz must
+    # answer from bind time (ready=false + phase) and everything else gets
+    # 503 + Retry-After until the worker finishes the drain.
+    if _worker is None:
+        _worker = _RuntimeWorker()
+        _worker.start()
     # ThreadingHTTPServer so SSE streams can hold connections open (6a);
     # store thread-affinity is preserved by the runtime worker, which owns
     # the runtime and executes every mutation.
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.daemon_threads = True
     print(f"[lab_server] listening on http://localhost:{port}  "
-          f"(feed UI at /, API: /lab/feed /graph /trace /chat /lab/decision /reset)",
+          f"(boot continues in the background — /healthz reports the phase; "
+          f"feed UI at /, API: /lab/feed /graph /trace /chat /lab/decision "
+          f"/lab/errors /reset)",
           flush=True)
     server.serve_forever()
 
