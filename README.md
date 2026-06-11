@@ -25,6 +25,28 @@ data/        SQLite event log + memory store (created at first run)
 | `/feed.xml` | RSS 2.0, published posts only |
 | `/lab` | the open workshop: every branch (incl. proposed/decided/archived), every chat, every decision, filter row, deep links via `#branch=<id>` |
 | `/healthz` | backend, event count, pending decisions, paused, LLM calls/cost vs caps |
+| `POST /mcp` | MCP server, streamable HTTP (ADR-016) — read tools + `send_chat`, never decisions/pause/seams |
+| `/.well-known/oauth-*`, `/register`, `/authorize`, `/token` | OAuth 2.1 + DCR for the MCP surface (ADR-017), stateless |
+
+## MCP surface + claude.ai connector (ADR-016/017)
+
+`/mcp` accepts three equivalent credentials, all rooted in `LAB_MCP_TOKEN` (a separate secret from the operator token, revocable independently): an OAuth 2.1 bearer token, the legacy `Authorization: Bearer $LAB_MCP_TOKEN` header, or the legacy `/mcp/<LAB_MCP_TOKEN>` path token. Identical authority in all three — read tools plus `send_chat`; approving decisions, pause/resume, and seam promotion are excluded by design (the inbox is the one place only the human operator exists).
+
+The OAuth server is **stateless**: client ids, codes, and access/refresh tokens are HMAC-signed payloads keyed from `LAB_MCP_TOKEN`, verified by recomputation — nothing is stored, so rotating `LAB_MCP_TOKEN` revokes everything at once.
+
+**Connect claude.ai** (web/desktop — Settings → Connectors → Add custom connector):
+
+1. Enter the plain MCP URL: `https://<your-host>/mcp` — no token in it.
+2. Click Connect. claude.ai discovers the OAuth metadata, registers itself, and opens the lab's `/authorize` page.
+3. Paste `LAB_MCP_TOKEN` into the password field once. You're redirected back and the connector is live (24h access tokens, refreshed automatically for 30 days).
+
+Verification (zsh, single lines — replace `$URL`):
+
+- Metadata: `curl -s $URL/.well-known/oauth-authorization-server | python3 -m json.tool`
+- Resource metadata: `curl -s $URL/.well-known/oauth-protected-resource/mcp | python3 -m json.tool`
+- Discovery challenge: `curl -s -i -X POST $URL/mcp -d '{}' | grep -i www-authenticate` → `Bearer resource_metadata=...`
+- DCR (deterministic client_id): `curl -s -X POST $URL/register -H 'Content-Type: application/json' -d '{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}'`
+- Bad grant is a fixed body: `curl -s -X POST $URL/token -d 'grant_type=authorization_code&code=x&code_verifier=y&client_id=z&redirect_uri=w'` → `{"error": "invalid_grant"}`
 
 ## Operator controls (ADR-015)
 
@@ -108,5 +130,7 @@ Verification (replace `$URL` and `$TOK`):
 - Fixtures: `python lab_pack/fixtures/run_fixtures.py`
 - Smoke (regression bar): `python scripts/smoke.py`
 - Auth: `python scripts/test_auth.py`
+- MCP surface: `python scripts/test_mcp.py`
+- OAuth 2.1 + DCR (ADR-017): `python scripts/test_oauth.py`
 - Public-safety sentinel audit: `python scripts/test_public_safety.py`
 - UI render (jsdom, static fallback): `python scripts/check_ui.py`

@@ -80,8 +80,28 @@ def _check_bearer(headers) -> tuple[int, str]:
 
 
 def _check_mcp_bearer(headers) -> tuple[int, str]:
-    return _check_token(headers, _mcp_token(),
-                        "mcp disabled: LAB_MCP_TOKEN is not set on the server")
+    """/mcp bearer: the legacy LAB_MCP_TOKEN compare runs FIRST (so a token
+    that happens to look like a signed blob still authorizes), then ADR-017
+    OAuth verification — an HMAC-signed access token minted by /token, keyed
+    from LAB_MCP_TOKEN, verified by recomputation (stateless; rotation of
+    LAB_MCP_TOKEN revokes everything). A credential shaped like one of our
+    signed blobs that fails verification → 401 invalid_token (clients refresh);
+    anything else wrong keeps the legacy 403."""
+    token = _mcp_token()
+    if not token:
+        return 403, "mcp disabled: LAB_MCP_TOKEN is not set on the server"
+    supplied = (headers.get("Authorization") or "").strip()
+    if not supplied.startswith("Bearer ") or not supplied[7:].strip():
+        return 401, "missing bearer token"
+    supplied = supplied[7:].strip()
+    if hmac.compare_digest(supplied, token):
+        return 0, ""
+    from server import oauth
+    if oauth.looks_signed(supplied):
+        if oauth.verify_access_token(oauth.derive_key(token), supplied):
+            return 0, ""
+        return 401, "invalid or expired token"
+    return 403, "invalid token"
 
 
 def _check_mcp_auth(headers, path: str) -> tuple[int, str]:
@@ -852,6 +872,17 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error_json(self, msg: str, status: int = 500):
         self._send_json({"error": msg}, status)
 
+    def _base_url(self) -> str:
+        proto = self.headers.get("X-Forwarded-Proto", "http").split(",")[0].strip()
+        return f"{proto}://{self.headers.get('Host', 'localhost')}"
+
+    def _mcp_challenge(self) -> str:
+        """WWW-Authenticate for /mcp 401s: the Bearer challenge plus the
+        RFC 9728 resource_metadata pointer (MCP auth spec) so clients can
+        discover the ADR-017 OAuth flow."""
+        return ('Bearer resource_metadata='
+                f'"{self._base_url()}/.well-known/oauth-protected-resource/mcp"')
+
     def _send_static(self, rel: str):
         path = (_UI_DIR / rel.lstrip("/")).resolve()
         if not str(path).startswith(str(_UI_DIR)) or not path.is_file():
@@ -946,6 +977,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"frames": [], "total": 0})
             elif path in ("/health", "/healthz"):
                 self._handle_healthz()
+            # ── OAuth 2.1 for the MCP surface (ADR-017) ─────────────────────
+            elif path in ("/.well-known/oauth-authorization-server",
+                          "/.well-known/oauth-authorization-server/mcp"):
+                from server import oauth
+                self._send_json(oauth.metadata_authorization_server(self._base_url()))
+            elif path in ("/.well-known/oauth-protected-resource",
+                          "/.well-known/oauth-protected-resource/mcp"):
+                from server import oauth
+                self._send_json(oauth.metadata_protected_resource(self._base_url()))
+            elif path == "/authorize":
+                from server import oauth
+                if not _mcp_token():
+                    self._send_html("<h1>403</h1><p>mcp disabled: LAB_MCP_TOKEN "
+                                    "is not set on the server</p>", 403)
+                else:
+                    status, page = oauth.authorize_page(qs)
+                    self._send_html(page, status)
             elif path == "/mcp" or path.startswith("/mcp/"):
                 # Streamable HTTP without an SSE channel: GET is declined,
                 # which the MCP spec permits (server-initiated messages are
@@ -977,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
             if status:
                 if status == 401:
                     self.send_response(401)
-                    self.send_header("WWW-Authenticate", "Bearer")
+                    self.send_header("WWW-Authenticate", self._mcp_challenge())
                     body_b = json.dumps({"error": msg}).encode()
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body_b)))
@@ -997,6 +1045,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                 else:
                     self._send_json(payload, http_status)
+            except Exception:
+                traceback.print_exc()  # details to stderr only (ADR-011)
+                self._send_error_json("internal error", 500)
+            return
+        if path in ("/register", "/token", "/authorize"):
+            # ADR-017: form-encoded bodies, so they route before the JSON
+            # parse below. Same fixed-message discipline as /mcp: no supplied
+            # value, code, or token-derived value in any error body.
+            try:
+                self._handle_oauth_post(path, raw)
             except Exception:
                 traceback.print_exc()  # details to stderr only (ADR-011)
                 self._send_error_json("internal error", 500)
@@ -1229,6 +1287,47 @@ class Handler(BaseHTTPRequestHandler):
                                   for b in p.behaviors],
                 })
         self._send_json({"packs": packs, "total": len(packs)})
+
+    # ── POST /register, /token, /authorize (OAuth 2.1, ADR-017) ─────────────
+
+    def _handle_oauth_post(self, path: str, raw: bytes):
+        """Stateless OAuth: server/oauth.py holds the protocol but no secret —
+        the signing key (derived from LAB_MCP_TOKEN) is handed in per call,
+        here and only here (kernel). Nothing minted is ever stored or logged;
+        the redirect Location and the /token response body are the intended
+        delivery channels and the only places a credential appears."""
+        from server import oauth
+        token = _mcp_token()
+        if not token:
+            self._send_error_json("mcp disabled: LAB_MCP_TOKEN is not set "
+                                  "on the server", 403)
+            return
+        if _rate_limited():
+            self._send_error_json("rate limited (30 mutations/min)", 429)
+            return
+        key = oauth.derive_key(token)
+        if path == "/register":
+            status, body = oauth.handle_register(key, raw)
+            self._send_json(body, status)
+        elif path == "/token":
+            status, body = oauth.handle_token(key, oauth.parse_form(raw))
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")  # RFC 6749 §5.1
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:  # /authorize form submit
+            status, location, page = oauth.handle_authorize_post(
+                key, token, oauth.parse_form(raw))
+            if status == 302:
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_html(page, status)
 
     # ── POST /chat ──────────────────────────────────────────────────────────
 

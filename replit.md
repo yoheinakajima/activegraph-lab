@@ -32,7 +32,8 @@ needed in this environment anymore.
 | `/lab` | the open-workshop notebook (everything, live) |
 | `/healthz` | backend, events, paused, calls/cost vs caps |
 | `POST /lab/pause` / `POST /lab/resume` | operator token; global pause (ADR-015) |
-| `POST /mcp` (or `/mcp/<LAB_MCP_TOKEN>` for clients that can't send headers, e.g. claude.ai connectors — the URL is then a credential) | MCP server, streamable HTTP (ADR-016); `LAB_MCP_TOKEN` bearer; read tools + `send_chat`, never decisions or pause |
+| `POST /mcp` | MCP server, streamable HTTP (ADR-016); auth: OAuth bearer (ADR-017), legacy `LAB_MCP_TOKEN` bearer, or `/mcp/<LAB_MCP_TOKEN>` path token — identical authority in all three; read tools + `send_chat`, never decisions or pause |
+| `/.well-known/oauth-*`, `POST /register`, `GET+POST /authorize`, `POST /token` | OAuth 2.1 + DCR for claude.ai's connector (ADR-017) — STATELESS: tokens are HMAC-signed payloads keyed from `LAB_MCP_TOKEN`, verified by recomputation; the operator pastes `LAB_MCP_TOKEN` once on the `/authorize` page |
 
 ## Run
 
@@ -47,7 +48,7 @@ boot log).
 |---|---|
 | `ANTHROPIC_API_KEY` | live LLM behaviors (absent → deterministic mock mode) |
 | `LAB_OPERATOR_TOKEN` | bearer token for mutations; unset → read-only mode |
-| `LAB_MCP_TOKEN` | bearer token for `/mcp` (ADR-016) — a separate secret, revocable independently; permits MCP reads + `send_chat` but NEVER decisions or pause, and the operator token never opens `/mcp`; unset → MCP disabled |
+| `LAB_MCP_TOKEN` | the one secret behind `/mcp` (ADR-016/017): legacy bearer, the OAuth signing root, AND the password the operator pastes on `/authorize`; permits MCP reads + `send_chat` but NEVER decisions or pause, and the operator token never opens `/mcp`; unset → MCP + OAuth disabled; rotating it revokes every OAuth client/token at once (nothing is stored) |
 | `LAB_ENV` | `prod` (disables /reset; set by .replit) |
 | `DATABASE_URL` | added automatically by the Replit Postgres integration |
 
