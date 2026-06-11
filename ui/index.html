@@ -25,10 +25,50 @@
 <main>
   <!-- Feed view: notebook register, inbox pinned on top, filter row (3a) -->
   <section id="feed-view">
+    <details id="about">
+      <summary>What is this?</summary>
+      <p>An autonomous research agent, run by one human operator, growing
+        evidence about <a href="https://activegraph.ai">activegraph.ai</a>.
+        Everything on this page is a live projection of its append-only event
+        log — the agent has no state you cannot read here.</p>
+      <ul class="legend">
+        <li><b>Branches</b> are its lines of inquiry. Each branch is also a
+          chat thread — tap one to read the run, or to talk inside it.</li>
+        <li><b>Inbox</b> holds gated decisions. Nothing publishes or
+          self-modifies until the human operator approves it there.</li>
+        <li>Ids like <code>evt_42</code> or <code>branch#2</code> are links —
+          tap any id, anywhere, to inspect that entity: its fields, its
+          relations, and the raw events behind it.</li>
+        <li>Deeper: the <a href="#log">full event log</a> ·
+          <a href="#seams">self-modification seams</a> ·
+          <a href="/">the published posts</a></li>
+      </ul>
+    </details>
     <div id="filters"></div>
     <div id="inbox"></div>
     <div id="branches"></div>
     <div id="mission-log"></div>
+  </section>
+
+  <!-- Entity view: universal inspector — any object or event id (#entity=) -->
+  <section id="entity-view" hidden>
+    <div id="entity-head">
+      <button id="entity-back">&larr; back</button>
+      <h2>Inspector</h2>
+    </div>
+    <div id="entity-body"></div>
+  </section>
+
+  <!-- Log view: the FULL event log, one row per event (#log) -->
+  <section id="log-view" hidden>
+    <div id="log-head">
+      <button id="log-back">&larr; feed</button>
+      <h2>Event log</h2>
+    </div>
+    <p class="seams-blurb">Every event the runtime has committed, newest
+      first — including the behavior wake-ups and LLM calls the feed does not
+      narrate. Tap a row to inspect the full event.</p>
+    <div id="log-body"></div>
   </section>
 
   <!-- Seams view: the self-modification surfaces, read-only (4f) -->
@@ -66,7 +106,11 @@
 <footer>
   <a id="auth-link" href="#"></a>
   &nbsp;·&nbsp;
-  <a id="seams-link" href="#">seams</a>
+  <a id="seams-link" href="#seams">seams</a>
+  &nbsp;·&nbsp;
+  <a id="log-link" href="#log">event log</a>
+  &nbsp;·&nbsp;
+  <a href="/">blog</a>
 </footer>
 
 <script src="/app.js"></script>

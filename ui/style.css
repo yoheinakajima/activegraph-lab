@@ -172,3 +172,109 @@ details.branch-section > summary, details.history > summary {
   background: none; border: 1px solid var(--warn); color: var(--warn);
   border-radius: 4px; padding: 1px 10px; cursor: pointer;
 }
+
+/* universal id links — any evt_N / type#N is clickable, everywhere */
+a.id-link {
+  font-family: ui-monospace, Menlo, monospace; font-size: .92em;
+  color: var(--accent); text-decoration: none;
+  border-bottom: 1px dotted var(--accent);
+  overflow-wrap: anywhere;
+}
+a.id-link:hover { border-bottom-style: solid; }
+.entry .when a.id-link { color: var(--dim); border-bottom-color: var(--dim); }
+.dim { color: var(--dim); }
+
+/* orientation strip */
+#about { margin: 14px 0 4px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); padding: 8px 14px; }
+#about > summary {
+  cursor: pointer; color: var(--dim); font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace;
+  letter-spacing: .1em; text-transform: uppercase;
+}
+#about p, #about li { font-size: 14px; color: var(--ink); }
+#about ul.legend { padding-left: 18px; margin: 6px 0 4px; }
+#about ul.legend li { margin: 4px 0; }
+#about a { color: var(--accent); }
+#about code {
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  background: var(--panel-2); padding: 0 4px; border-radius: 3px;
+}
+
+/* the inspector (#entity=<id>) */
+#entity-head, #log-head { display: flex; gap: 14px; align-items: center; margin: 14px 0; }
+#entity-head h2, #log-head h2 { margin: 0; font-size: 20px; }
+#entity-back, #log-back {
+  font: inherit; font-size: 13px; background: none; border: 1px solid var(--line);
+  color: var(--dim); border-radius: 4px; padding: 4px 10px; cursor: pointer;
+}
+.entity-id { margin: 4px 0 8px; }
+.entity-id code {
+  font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--ink);
+  overflow-wrap: anywhere;
+}
+h3.entity-title { margin: 4px 0 8px; font-size: 18px; }
+.entity-narration { color: var(--accent); margin: 6px 0; }
+.entity-links { margin: 8px 0; font-size: 14px; }
+.entity-links a { color: var(--accent); }
+h4.register {
+  font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--dim); border-bottom: 1px solid var(--line);
+  padding-bottom: 3px; margin: 18px 0 8px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+table.fields { width: 100%; border-collapse: collapse; font-size: 13px;
+  table-layout: fixed; }
+table.fields th {
+  text-align: left; vertical-align: top; padding: 5px 8px 5px 0;
+  color: var(--dim); font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px; font-weight: normal; width: 32%;
+  overflow-wrap: anywhere; border-bottom: 1px dotted var(--line);
+}
+table.fields td { padding: 5px 0; border-bottom: 1px dotted var(--line);
+  overflow-wrap: anywhere; }
+pre.json {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 10px; font-size: 11px; line-height: 1.45;
+  overflow-x: auto; max-width: 100%; margin: 4px 0;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.rel-row { padding: 4px 0; border-bottom: 1px dotted var(--line); font-size: 13px;
+  overflow-wrap: anywhere; }
+details.raw { margin: 18px 0; }
+details.raw > summary {
+  cursor: pointer; color: var(--dim); font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace;
+  letter-spacing: .1em; text-transform: uppercase;
+}
+.entity-nav { display: flex; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+.nav-btn {
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px;
+  color: var(--accent); text-decoration: none;
+}
+.nav-btn.dim { color: var(--dim); }
+
+/* the full event log (#log) */
+.log-row .chip { margin-right: 6px; }
+.log-row { overflow-wrap: anywhere; }
+.log-total { font-size: 12px; margin: 8px 0;
+  font-family: ui-monospace, Menlo, monospace; }
+#log-older {
+  font: inherit; font-size: 13px; margin: 10px 0; padding: 4px 14px;
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  border-radius: 4px; cursor: pointer;
+}
+
+/* mobile (~390px): everything wraps, nothing overflows */
+#filters { flex-wrap: wrap; }
+#meta { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+#meta span { margin-right: 0; }
+.entry .when { overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  main { padding: 14px 12px 80px; }
+  header { padding: 12px 12px 8px; }
+  #error-banner { padding: 8px 12px; }
+  footer { padding: 0 12px; }
+  table.fields th { width: 38%; }
+}

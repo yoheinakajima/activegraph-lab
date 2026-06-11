@@ -5,7 +5,7 @@
    Feed pagination: cursor on event id (/lab/entries), 'load older'. */
 
 let FEED = null;
-let VIEW = { mode: "feed", branchId: null };
+let VIEW = { mode: "feed", branchId: null, entityId: null };
 let LAST_ERROR = null;
 /* 3a: the open-workshop filter row. Client-side only — the feed stays one
    projection; filters narrow what is rendered, never what exists. */
@@ -83,12 +83,23 @@ function entryClass(sentence) {
   return "entry";
 }
 
+/* Universal id links: any evt_N / type#N token rendered anywhere becomes a
+   link into the inspector (#entity=<id>). Input must already be escaped. */
+const ID_RE = /\b(evt_\d+|[a-z][a-z0-9_]*#\d+)\b/g;
+function linkifyIds(escaped) {
+  return escaped.replace(ID_RE,
+    (m) => `<a class="id-link" href="#entity=${m}">${m}</a>`);
+}
+function idLink(id) {
+  return `<a class="id-link" href="#entity=${escapeHtml(id)}">${escapeHtml(id)}</a>`;
+}
+
 function entryNode(e) {
   const div = document.createElement("div");
   div.className = entryClass(e.sentence);
-  div.innerHTML = `<span class="when">${relTime(e.timestamp)} · ${e.event_id}</span>` +
+  div.innerHTML = `<span class="when">${relTime(e.timestamp)} · ${idLink(e.event_id)}</span>` +
                   `<span class="text"></span>`;
-  div.querySelector(".text").textContent = e.sentence;
+  div.querySelector(".text").innerHTML = linkifyIds(escapeHtml(e.sentence));
   if (e.post_url) {
     /* 3b: a publish event links straight to the public post. */
     const a = document.createElement("div");
@@ -123,11 +134,15 @@ function decisionCard(d) {
   card.className = "decision-card";
   card.dataset.decisionId = d.id;
   const ev = (d.evidence || [])
-    .map(x => `<li>[${x.type}] ${escapeHtml(x.text)}</li>`).join("");
+    .map(x => `<li>${idLink(x.id)} ${linkifyIds(escapeHtml(x.text))}</li>`).join("");
   card.innerHTML =
-    `<div class="kind"><span class="chip kind-${d.kind}">${d.kind}</span> awaiting approval</div>` +
-    `<div class="rationale">${escapeHtml(d.rationale || "")}</div>` +
-    (d.subject_title ? `<div class="evidence">subject: ${escapeHtml(d.subject_title)}</div>` : "") +
+    `<div class="kind"><span class="chip kind-${d.kind}">${d.kind}</span> awaiting approval` +
+    ` · ${idLink(d.id)}</div>` +
+    `<div class="rationale">${linkifyIds(escapeHtml(d.rationale || ""))}</div>` +
+    (d.subject_ref
+      ? `<div class="evidence">subject: ${idLink(d.subject_ref)}` +
+        (d.subject_title ? ` — ${escapeHtml(d.subject_title)}` : "") + `</div>`
+      : "") +
     (ev ? `<ul class="evidence">${ev}</ul>` : "") +
     (isOperator()
       ? `<button class="approve">Approve</button><button class="reject">Reject</button>`
@@ -176,6 +191,11 @@ function render() {
     if (!LAST_ERROR) {
       $("mission-title").textContent = "loading…";
     }
+    // entity/log deep links don't need the feed — render them immediately
+    if (VIEW.mode === "entity" || VIEW.mode === "log") {
+      if (VIEW.mode === "entity") renderEntity(); else renderLog();
+      showSections();
+    }
     return;
   }
 
@@ -184,13 +204,17 @@ function render() {
   document.title = pending ? `(${pending}) activegraph-lab` : "activegraph-lab";
 
   /* C3: before mission boot. */
-  $("mission-title").textContent = FEED.mission
-    ? FEED.mission.data.title
-    : "No mission yet — the lab boots one on first run.";
+  if (FEED.mission) {
+    $("mission-title").innerHTML =
+      `${escapeHtml(FEED.mission.data.title)} · ${idLink(FEED.mission.id)}`;
+  } else {
+    $("mission-title").textContent = "No mission yet — the lab boots one on first run.";
+  }
   const crawl = FEED.mission && FEED.mission.data.metadata.crawl;
   $("crawl").textContent = crawl ? `crawl ${crawl.fetched}/${crawl.page_cap} pages` : "";
   $("llm").textContent = `llm: ${FEED.llm.mode}${FEED.llm.model ? " · " + FEED.llm.model : ""}`;
-  $("horizon").textContent = `as of ${FEED.as_of_event || "—"}`;
+  $("horizon").innerHTML = FEED.as_of_event
+    ? `as of ${idLink(FEED.as_of_event)}` : "as of —";
 
   /* 6c: live|paused · $today/$cap, pause toggle for the operator only. */
   const st = FEED.status || {};
@@ -211,17 +235,208 @@ function render() {
   $("composer").style.display = isOperator() ? "" : "none";
   if (VIEW.mode === "feed") renderFeed();
   else if (VIEW.mode === "thread") renderThread();
+  else if (VIEW.mode === "entity") renderEntity();
+  else if (VIEW.mode === "log") renderLog();
+  showSections();
+}
+
+function showSections() {
   $("feed-view").hidden = VIEW.mode !== "feed";
   $("thread-view").hidden = VIEW.mode !== "thread";
   $("seams-view").hidden = VIEW.mode !== "seams";
+  $("entity-view").hidden = VIEW.mode !== "entity";
+  $("log-view").hidden = VIEW.mode !== "log";
+}
+
+/* ── the inspector: one view for ANY object or event id (#entity=<id>) ────── */
+
+let RENDERED_ENTITY = null; // refetch only when the id changes, not per poll
+
+function fieldValueHtml(v) {
+  if (v === null || v === undefined || v === "") return `<span class="dim">—</span>`;
+  if (typeof v === "string") return linkifyIds(escapeHtml(v));
+  if (typeof v === "number" || typeof v === "boolean") return escapeHtml(String(v));
+  return `<pre class="json">${linkifyIds(escapeHtml(JSON.stringify(v, null, 2)))}</pre>`;
+}
+
+function relationListHtml(rels, arrow) {
+  return rels.map(r =>
+    `<div class="rel-row"><span class="chip">${escapeHtml(r.type)}</span> ${arrow} ` +
+    `${idLink(r.other_id)}` +
+    (r.other_title ? ` <span class="dim">${escapeHtml(r.other_title)}</span>` : "") +
+    `</div>`).join("");
+}
+
+function entityObjectHtml(d) {
+  const o = d.object;
+  const status = o.data && o.data.status;
+  const parts = [];
+  parts.push(
+    `<div class="entity-id"><span class="chip">${escapeHtml(o.type)}</span> ` +
+    (status ? `<span class="chip ${escapeHtml(status)}">${escapeHtml(status)}</span> ` : "") +
+    `<code>${escapeHtml(o.id)}</code></div>`);
+  if (d.title) parts.push(`<h3 class="entity-title">${escapeHtml(d.title)}</h3>`);
+  if (d.narration) {
+    parts.push(`<p class="entity-narration">${linkifyIds(escapeHtml(d.narration))}</p>`);
+  }
+  // type-specific affordances: every chain walkable both ways
+  const links = [];
+  if (o.type === "branch") links.push(`<a href="#branch=${escapeHtml(o.id)}">open this branch's thread →</a>`);
+  if (d.post_url) links.push(`<a href="${escapeHtml(d.post_url)}">read the published post →</a>`);
+  else if (d.slug) links.push(`<a href="/lab/draft?slug=${encodeURIComponent(d.slug)}" target="_blank">read the draft markdown →</a>`);
+  if (links.length) parts.push(`<div class="entity-links">${links.join(" · ")}</div>`);
+  // provenance: the events that made and changed this object
+  const prov = [];
+  if (d.created) {
+    prov.push(`created by ${idLink(d.created.event_id)}` +
+      (d.created.actor ? ` <span class="dim">(${escapeHtml(d.created.actor)})</span>` : "") +
+      (d.created.timestamp ? ` <span class="dim">${relTime(d.created.timestamp)}</span>` : ""));
+  }
+  (d.patches || []).forEach(p => {
+    const keys = Object.keys(p.diff || {}).join(", ");
+    prov.push(`patched by ${idLink(p.event_id)}` +
+      (keys ? ` <span class="dim">(${escapeHtml(keys)})</span>` : "") +
+      (p.actor ? ` <span class="dim">${escapeHtml(p.actor)}</span>` : ""));
+  });
+  if (prov.length) {
+    parts.push(`<h4 class="register">Place in time</h4>` +
+      prov.map(x => `<div class="rel-row">${x}</div>`).join(""));
+  }
+  // fields
+  const rows = Object.entries(o.data || {})
+    .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${fieldValueHtml(v)}</td></tr>`);
+  if (rows.length) {
+    parts.push(`<h4 class="register">Fields</h4><table class="fields">${rows.join("")}</table>`);
+  }
+  // relations, both directions, every endpoint a link
+  if ((d.relations_out || []).length) {
+    parts.push(`<h4 class="register">Relations out</h4>` + relationListHtml(d.relations_out, "→"));
+  }
+  if ((d.relations_in || []).length) {
+    parts.push(`<h4 class="register">Relations in</h4>` + relationListHtml(d.relations_in, "←"));
+  }
+  if (!(d.relations_out || []).length && !(d.relations_in || []).length) {
+    parts.push(`<h4 class="register">Relations</h4><div class="empty">No relations recorded.</div>`);
+  }
+  parts.push(
+    `<details class="raw"><summary>raw object JSON</summary>` +
+    `<pre class="json">${linkifyIds(escapeHtml(JSON.stringify(o, null, 2)))}</pre></details>`);
+  return parts.join("\n");
+}
+
+function entityEventHtml(d) {
+  const e = d.event;
+  const parts = [];
+  parts.push(
+    `<div class="entity-id"><span class="chip">event</span> ` +
+    `<span class="chip">${escapeHtml(e.event_type)}</span> <code>${escapeHtml(e.id)}</code></div>`);
+  parts.push(`<p class="entity-narration">${linkifyIds(escapeHtml(d.summary || e.event_type))}</p>`);
+  parts.push(
+    `<div class="rel-row dim">${e.actor ? `actor ${escapeHtml(e.actor)} · ` : ""}` +
+    `${e.timestamp ? `${escapeHtml(e.timestamp)} · ` : ""}event ${d.index + 1} of ${d.total}</div>`);
+  parts.push(
+    `<div class="entity-nav">` +
+    (d.prev_id ? `<a class="nav-btn" href="#entity=${d.prev_id}">← ${d.prev_id}</a>` : `<span class="nav-btn dim">← start of log</span>`) +
+    (d.next_id ? `<a class="nav-btn" href="#entity=${d.next_id}">${d.next_id} →</a>` : `<span class="nav-btn dim">end of log →</span>`) +
+    `</div>`);
+  if ((d.refs || []).length) {
+    parts.push(`<h4 class="register">Referenced entities</h4>` +
+      d.refs.map(r => `<div class="rel-row">${idLink(r)}</div>`).join(""));
+  }
+  parts.push(
+    `<details class="raw" open><summary>raw event JSON</summary>` +
+    `<pre class="json">${linkifyIds(escapeHtml(JSON.stringify(e, null, 2)))}</pre></details>`);
+  return parts.join("\n");
+}
+
+async function renderEntity() {
+  const id = VIEW.entityId;
+  if (!id || RENDERED_ENTITY === id) return;
+  RENDERED_ENTITY = id;
+  const box = $("entity-body");
+  box.innerHTML = `<div class="empty">loading ${escapeHtml(id)}…</div>`;
+  let d;
+  try {
+    const r = await fetch(`/lab/entity?id=${encodeURIComponent(id)}`);
+    if (r.status === 404) {
+      box.innerHTML = `<div class="empty">No such entity: ${escapeHtml(id)}</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`server returned ${r.status}`);
+    d = await r.json();
+  } catch (e) {
+    RENDERED_ENTITY = null; // retry on next render
+    box.innerHTML = `<div class="empty">Could not load ${escapeHtml(id)} — ${escapeHtml(e.message)}.</div>`;
+    return;
+  }
+  if (id !== VIEW.entityId) return; // user already navigated on
+  box.innerHTML = d.kind === "event" ? entityEventHtml(d) : entityObjectHtml(d);
+}
+
+/* ── the full event log (#log): every committed event, one row each ───────── */
+
+let LOG_LOADED = false;
+let LOG_CURSOR = null;
+
+function logRowNode(r) {
+  const div = document.createElement("div");
+  div.className = "entry log-row";
+  div.innerHTML =
+    `<span class="when">${relTime(r.timestamp)} · ${idLink(r.event_id)}</span>` +
+    `<span class="chip">${escapeHtml(r.event_type)}</span> ` +
+    `<span class="text">${linkifyIds(escapeHtml(r.summary || r.event_type))}</span>`;
+  return div;
+}
+
+async function fetchLogPage(before) {
+  const q = before ? `?before=${encodeURIComponent(before)}&limit=100` : "?limit=100";
+  const r = await fetch(`/lab/log${q}`);
+  if (!r.ok) throw new Error(`server returned ${r.status}`);
+  return r.json();
+}
+
+async function renderLog() {
+  if (LOG_LOADED) return; // pagination state lives in the DOM; no refetch per poll
+  LOG_LOADED = true;
+  const box = $("log-body");
+  box.innerHTML = `<div class="empty">loading the log…</div>`;
+  let d;
+  try {
+    d = await fetchLogPage(null);
+  } catch (e) {
+    LOG_LOADED = false;
+    box.innerHTML = `<div class="empty">Could not load the log — ${escapeHtml(e.message)}.</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="dim log-total">${d.total} events committed</div>`;
+  (d.rows || []).forEach(r => box.appendChild(logRowNode(r)));
+  LOG_CURSOR = d.oldest_rendered;
+  if (d.more) {
+    const btn = document.createElement("button");
+    btn.id = "log-older";
+    btn.textContent = "load older";
+    btn.onclick = async () => {
+      try {
+        const page = await fetchLogPage(LOG_CURSOR);
+        (page.rows || []).forEach(r => box.insertBefore(logRowNode(r), btn));
+        LOG_CURSOR = page.oldest_rendered;
+        if (!page.more) btn.remove();
+      } catch (e) { /* next click retries */ }
+    };
+    box.appendChild(btn);
+  }
 }
 
 /* 4f: the Seams view — read-only projection of /lab/seams. */
+let SEAMS_LOADED = false;
 async function renderSeams() {
+  if (SEAMS_LOADED) return;
+  SEAMS_LOADED = true;
   let data;
   try {
     data = await (await fetch("/lab/seams")).json();
   } catch (e) {
+    SEAMS_LOADED = false;
     $("seams-table").textContent = "Could not load /lab/seams.";
     return;
   }
@@ -230,7 +445,8 @@ async function renderSeams() {
     `<td class="src-${s.source}">${s.source}` +
     (s.active_version ? ` v${s.active_version}` : "") + `</td>` +
     `<td>${"effective_value" in s ? escapeHtml(String(s.effective_value)) : ""}</td>` +
-    `<td>${(s.pending || []).length ? (s.pending || []).join(", ") + " pending" : ""}</td></tr>`
+    `<td>${(s.pending || []).length
+        ? (s.pending || []).map(idLink).join(", ") + " pending" : ""}</td></tr>`
   ).join("");
   $("seams-table").innerHTML =
     `<h3 class="register">Self-modification surfaces</h3>` +
@@ -278,9 +494,9 @@ function resolvedRow(d) {
   div.innerHTML =
     `<span class="chip kind-${d.kind}">${d.kind}</span> ` +
     `<span class="chip ${d.status === "approved" ? "active" : "paused"}">${d.status}</span> ` +
-    `<span class="text"></span>`;
-  div.querySelector(".text").textContent =
-    (d.subject_title ? d.subject_title + " — " : "") + (d.rationale || "");
+    `${idLink(d.id)} <span class="text"></span>`;
+  div.querySelector(".text").innerHTML = linkifyIds(escapeHtml(
+    (d.subject_title ? d.subject_title + " — " : "") + (d.rationale || "")));
   return div;
 }
 
@@ -298,7 +514,10 @@ function branchGroupNode(b) {
   if (!shown.length) {
     g.insertAdjacentHTML("beforeend", `<div class="empty">No activity yet.</div>`);
   }
-  g.onclick = () => { openThread(b.branch.id); };
+  g.onclick = (ev) => {
+    if (ev.target.closest("a")) return; // id links navigate to the inspector
+    openThread(b.branch.id);
+  };
   return g;
 }
 
@@ -403,7 +622,9 @@ function renderThread() {
   $("thread-title").textContent = d.title;
   $("thread-sub").innerHTML =
     `<span class="chip ${d.status}">${d.status}</span> ` +
-    `<span class="chip">${d.authority}</span> ${escapeHtml(d.intent || "")}`;
+    `<span class="chip">${d.authority}</span> ` +
+    `${idLink(b.branch.id)} ` +
+    linkifyIds(escapeHtml(d.intent || ""));
 
   const ti = $("thread-inbox");
   ti.innerHTML = "";
@@ -419,14 +640,16 @@ function renderThread() {
   }
 }
 
-/* 3b: hash routing — /lab#branch=<id> deep-links a thread (post provenance
-   links land here); the hash tracks navigation so links are shareable. */
+/* 3b: hash routing — every view is a shareable URL: /lab#branch=<id> (post
+   provenance points here), /lab#entity=<id> (the inspector), /lab#seams,
+   /lab#log. The hash tracks all navigation, so the browser back button walks
+   the chain the visitor just clicked through. */
 function openThread(branchId) {
-  VIEW = { mode: "thread", branchId };
   if (location.hash !== `#branch=${branchId}`) {
     location.hash = `branch=${branchId}`;
+  } else {
+    applyHash();
   }
-  render();
 }
 
 function closeThread() {
@@ -438,23 +661,36 @@ function closeThread() {
 }
 
 function applyHash() {
-  const m = (location.hash || "").match(/^#branch=(.+)$/);
-  if (m) {
+  const h = location.hash || "";
+  let m;
+  if ((m = h.match(/^#branch=(.+)$/))) {
     VIEW = { mode: "thread", branchId: decodeURIComponent(m[1]) };
-  } else if (VIEW.mode === "thread") {
+  } else if ((m = h.match(/^#entity=(.+)$/))) {
+    VIEW = { mode: "entity", entityId: decodeURIComponent(m[1]) };
+  } else if (h === "#seams") {
+    VIEW = { mode: "seams" };
+  } else if (h === "#log") {
+    VIEW = { mode: "log" };
+  } else {
     VIEW = { mode: "feed", branchId: null };
   }
+  // leaving a lazily-loaded view resets its guard so it reloads fresh next time
+  if (VIEW.mode !== "entity") RENDERED_ENTITY = null;
+  if (VIEW.mode !== "log") LOG_LOADED = false;
+  if (VIEW.mode !== "seams") SEAMS_LOADED = false;
+  if (VIEW.mode === "seams") renderSeams();
   render();
 }
 window.addEventListener("hashchange", applyHash);
 
 $("back").onclick = () => closeThread();
-$("seams-back").onclick = () => { VIEW = { mode: "feed", branchId: null }; render(); };
-$("seams-link").onclick = (e) => {
-  e.preventDefault();
-  VIEW = { mode: "seams", branchId: null };
-  render();
-  renderSeams();
+$("seams-back").onclick = () => closeThread();
+$("log-back").onclick = () => closeThread();
+$("entity-back").onclick = () => {
+  // walking a provenance chain, back should retrace it; fall out to the feed
+  // when the inspector was the entry point.
+  if (history.length > 1) history.back();
+  else closeThread();
 };
 
 $("composer").onsubmit = async (ev) => {
