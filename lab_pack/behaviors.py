@@ -168,6 +168,8 @@ def clear_lab_registry() -> None:
     _DECIDED_THIN.clear()
     _PENDING_PUBLISH.clear()
     _IDLE_LOGGED["capped"] = False
+    from .research_worker import clear_research_worker_registry
+    clear_research_worker_registry()
     clear_seam_cache()
     # Seam hot-loads mutate live behavior descriptions (module originals AND
     # the bound runtime copies); restore file defaults (prompt body + CHARTER
@@ -600,8 +602,12 @@ def _task_reacted(graph, task_id: str) -> bool:
     """Did any pack react to the task? Reaction = a relation linking work
     products to the task (core convention: executes/generates), in either
     relation-argument convention (ADR-008, lab_pack/compat.py), or a status
-    change away from 'active'."""
+    change away from 'active'. The lab's own research worker claims through
+    a registry too (BehaviorGraph cannot iterate relations — ADR-020)."""
     from .compat import decode_relation, relation_touches
+    from .research_worker import task_claimed
+    if task_claimed(task_id):
+        return True
     try:
         for r in graph.relations():
             rel_type, _, _ = decode_relation(r)
@@ -1575,5 +1581,11 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
     graph.add_relation(candidate.id, msg_id, "response_to")
 
 
-# Registration order is execution order within an event batch.
-BEHAVIORS = [ingest, plan, work, interpret, digest, gate, draft_writer, answer]
+# Registration order is execution order within an event batch. The research
+# worker stages (ADR-020) live in lab_pack/research_worker.py — droppable
+# plumbing; this import is the only registration point. It must come last:
+# research_worker.py imports nothing from this module at import time.
+from .research_worker import research_intake, research_worker  # noqa: E402
+
+BEHAVIORS = [ingest, plan, work, research_intake, interpret, digest, gate,
+             draft_writer, research_worker, answer]

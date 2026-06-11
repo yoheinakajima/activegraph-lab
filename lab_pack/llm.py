@@ -64,6 +64,30 @@ class AnswerReply(BaseModel):
     reply: str = Field(description="The reply to the user's message, grounded in graph state.")
 
 
+class ResearchFinding(BaseModel):
+    """One source-attributed finding from the research worker (ADR-020)."""
+
+    text: str = Field(description="The finding, one or two plain sentences.")
+    source_urls: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The fetched source URL(s) this finding rests on. A finding "
+            "with no valid fetched-source attribution is dropped."
+        ),
+    )
+
+
+class ResearchSynthesis(BaseModel):
+    """Structured output for the research_worker behavior (ADR-020)."""
+
+    summary: str = Field(
+        description="2-4 sentences: what the sources collectively show, "
+                    "including what they fail to show.")
+    findings: list[ResearchFinding] = Field(
+        default_factory=list,
+        description="1-5 source-attributed findings.")
+
+
 class BlogDraft(BaseModel):
     """Structured output for the draft_writer behavior."""
 
@@ -159,6 +183,23 @@ class LabMockProvider:
                     + (f", in response to: '{asked[:120]}'" if asked else "")
                     + ". Set OPENAI_API_KEY or ANTHROPIC_API_KEY for live answers."
                 ),
+            )
+        elif name == "ResearchSynthesis":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            urls = []
+            for u in re.findall(r'"url":\s*"(https?://[^"]+)"', blob):
+                if u not in urls:
+                    urls.append(u)
+            urls = urls[:3]
+            parsed = ResearchSynthesis(
+                summary=(f"Synthesized {len(urls)} fetched source(s) for the "
+                         f"dispatched research task; each finding below cites "
+                         f"the source it rests on. [mock {digest}]"),
+                findings=[ResearchFinding(
+                    text=(f"The page at {u} addresses the claim under "
+                          f"investigation; its excerpt is recorded as the "
+                          f"linked source. [mock {digest}]"),
+                    source_urls=[u]) for u in urls],
             )
         elif name == "BlogDraft":
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
@@ -419,6 +460,8 @@ def _inert_output(output_schema: type, note: str) -> Any:
             return output_schema(summary=note, outcome="decided")
         if name == "AnswerReply":
             return output_schema(reply=note)
+        if name == "ResearchSynthesis":
+            return output_schema(summary=note, findings=[])
         if name == "BlogDraft":
             return output_schema(title=note, slug="", body_markdown="")
     except Exception:

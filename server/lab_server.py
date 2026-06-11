@@ -261,6 +261,20 @@ def _rebuild_lab_registries(rt) -> None:
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
             lb._EVALUATED.add(meta["task_id"])
+    # Research worker (ADR-020): claimed/synthesized task ids rebuild from
+    # their observations and evaluations; in-flight fetches do not survive a
+    # restart — the stall watchdog releases those tasks.
+    from lab_pack import research_worker as rw
+    for o in g.objects(type="observation"):
+        meta = o.data.get("metadata") or {}
+        if meta.get("lab") == "research_progress" and meta.get("task_id"):
+            rw._CLAIMED.add(str(meta["task_id"]))
+        elif meta.get("lab") == "research_synthesis_request" and meta.get("task_id"):
+            rw._SYNTH_REQUESTED.add(str(meta["task_id"]))
+    for e in g.objects(type="evaluation"):
+        meta = e.data.get("metadata") or {}
+        if meta.get("lab") == "research_synthesis" and meta.get("task_id"):
+            rw._SYNTHESIZED.add(str(meta["task_id"]))
     for a in g.objects(type="artifact"):
         meta = a.data.get("metadata") or {}
         if meta.get("lab") == "blog_draft":
@@ -318,7 +332,10 @@ def _build_runtime():
                   f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
                   flush=True)
         rt = Runtime.load(db, llm_provider=provider)
-        load_lab_packs(rt, memory_backend_url=_memory_db_path())
+        # ADR-020: the worker defaults dark in the pack; the server boot is
+        # the one place that turns it on — the live lab always runs it.
+        load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
+                       memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
         _rebuild_lab_registries(rt)
@@ -357,7 +374,7 @@ def _build_runtime():
         mode = "fresh"
         rt = build_lab(
             llm_provider=provider,
-            lab_settings=LabSettings(),
+            lab_settings=LabSettings(research_worker_enabled=True),  # ADR-020
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
@@ -552,6 +569,9 @@ DEFAULT_TEMPLATES = {
     "drafting_idle":    "{short_text}",
     "behavior_skipped": "{short_text}",
     "chat_path_degraded": "{short_text}",
+    "research_progress": "{short_text}",
+    "research_synthesis_request": "{short_text}",
+    "research_finding": "Research finding: “{short_text}”",
 }
 
 

@@ -47,6 +47,30 @@ class LabSettings(BaseModel):
         le=64,
         description="Plan stops proposing new branches past this many non-archived branches.",
     )
+    research_worker_enabled: bool = Field(
+        default=False,
+        description=(
+            "If True, the lab-local research worker (ADR-020) claims tasks "
+            "routed research.deep_research and gathers sources through "
+            "tool_gateway. Defaults False so no embedding, fixture, or test "
+            "reaches the network by surprise; the server boot enables it — "
+            "the live lab always runs the worker. Droppable: disabled, the "
+            "capability-gap path takes over unchanged."
+        ),
+    )
+    research_fetch_cap: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Per-task cap on source fetches by the research worker "
+            "(ADR-020). Seam-eligible — tuning research thoroughness is "
+            "self-modification through the gate."
+        ),
+    )
+    model_research_worker: str = Field(
+        default="claude-opus-4-8",
+        description="Model for the research_worker behavior (ADR-019/020).",
+    )
     dispatch_gap_check: bool = Field(
         default=True,
         description=(

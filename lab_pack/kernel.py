@@ -73,7 +73,10 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "model.interpret",
     "model.draft_writer",
     "model.answer",
+    "model.research_worker",
     "model.default",
+    # Research worker (ADR-020): per-task source-fetch cap.
+    "research_fetch_cap",
     # MCP surface (ADR-016): send_chat's bounded reply wait — client-facing
     # latency policy, not auth, gating, or budget.
     "mcp_reply_wait_seconds",

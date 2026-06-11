@@ -33,7 +33,8 @@ from typing import Any, Optional
 
 from .kernel import SEAM_ELIGIBLE_SETTINGS, kernel_reference
 
-_PROMPT_BEHAVIORS = ("plan", "interpret", "answer", "draft_writer")
+_PROMPT_BEHAVIORS = ("plan", "interpret", "answer", "draft_writer",
+                     "research_worker")
 
 # ── the charter (ADR-018) ────────────────────────────────────────────────────
 # An operator-authored mission charter, itself a seam: versioned, gated,
@@ -108,7 +109,8 @@ def composed_description(behavior_name: str, prompt_body: str,
 # log without any lab-side event plumbing. Cost accounting stays the
 # runtime's native per-model reporting (cost_usd on llm.responded).
 
-MODEL_ROUTED_BEHAVIORS = ("plan", "interpret", "draft_writer", "answer")
+MODEL_ROUTED_BEHAVIORS = ("plan", "interpret", "draft_writer", "answer",
+                          "research_worker")
 
 
 def resolve_behavior_model(graph, behavior_name: str) -> str:

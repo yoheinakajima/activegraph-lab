@@ -1016,6 +1016,137 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_research_worker() -> bool:
+    spec = _load("research_worker.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: research_worker — claim → fetch → attributed synthesis → "
+          "complete; failure, cap, gap")
+    print("=" * 64)
+
+    pages = spec["pages"]
+
+    def canned_fetch(url: str, **_kw) -> dict:
+        clean = url.rstrip("/")
+        for key, html in pages.items():
+            if key.rstrip("/") == clean:
+                return {"url": url, "status": 200, "content": html}
+        return {"url": url, "status": 503, "content": "",
+                "error": "HTTPError: 503 fixture outage"}
+
+    rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+    register_web_fetch(canned_fetch, overwrite=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def calls_for(task_id):
+        return [x for x in g.objects(type="capability_call")
+                if (x.data.get("metadata") or {}).get("task_id") == task_id]
+
+    def make(key, status="active"):
+        b = spec["branches"][key]
+        branch = create_branch_fn(g, mission.id, b["title"],
+                                  b["intent"].strip(), status=status)
+        rt.run_until_idle()
+        return branch
+
+    # ── success: routed task → canned fetches → attributed findings ────────
+    b_ok = make("success")
+    t_ok = task_for(b_ok.id)
+    c.that(t_ok is not None and t_ok.data.get("status") == "done",
+           f"research task claimed and completed "
+           f"({t_ok.data.get('status') if t_ok else 'no task'})")
+    claims = [o for o in _lab_obs(g, "research_progress")
+              if (o.data.get("metadata") or {}).get("task_id") == (t_ok.id if t_ok else None)]
+    c.that(len(claims) == 1, f"claim observation recorded ({len(claims)})")
+    findings = [o for o in _lab_obs(g, "research_finding")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id]
+    c.that(len(findings) >= exp["success_findings_min"],
+           f"attributed findings written ({len(findings)})")
+    fetched_urls = {"https://example.com/replay", "https://example.com/forks"}
+    c.that(all(set((o.data.get("metadata") or {}).get("source_urls") or [])
+               <= fetched_urls
+               and o.data.get("source_ids") for o in findings),
+           "every finding attributes fetched source URLs + source ids")
+    c.that(all(any(str(r.type) == "supported_by" and str(r.source) == b_ok.id
+                   and str(r.target) == o.id for r in g.relations())
+               for o in findings),
+           "findings linked supported_by to the branch")
+    evals = [e for e in g.objects(type="evaluation")
+             if (e.data.get("metadata") or {}).get("lab") == "research_synthesis"
+             and (e.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id]
+    c.that(len(evals) == 1 and any(
+        str(r.type) == "supported_by" and str(r.source) == b_ok.id
+        and str(r.target) == evals[0].id for r in g.relations()),
+        f"synthesis evaluation written and linked to the branch ({len(evals)})")
+    outcome = [e for e in g.objects(type="evaluation")
+               if (e.data.get("metadata") or {}).get("lab") == "task_outcome"
+               and (e.data.get("metadata") or {}).get("task_id") == t_ok.id]
+    c.that(len(outcome) == 1
+           and outcome[0].data.get("judgment") == "completed_successfully",
+           "existing outcome path fired: task_outcome evaluation → interpret")
+    c.that(not [o for o in _lab_obs(g, "capability_gap")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_ok.id],
+           "no capability gap for the claimed research task")
+    print(f"  success: task done, {len(findings)} attributed finding(s), "
+          "evaluation linked, no gap")
+
+    # ── failure: every fetch fails → task failed, error in the event ───────
+    b_fail = make("failure")
+    t_fail = task_for(b_fail.id)
+    c.that(t_fail is not None and t_fail.data.get("status") == "rejected",
+           f"all fetches failed → task rejected "
+           f"({t_fail.data.get('status') if t_fail else 'no task'})")
+    err = (t_fail.data.get("metadata") or {}).get("error") if t_fail else None
+    c.that(bool(err) and "503" in err,
+           f"the error is recorded on the task ({err})")
+    c.that(any(str(e.type) == "patch.applied"
+               and e.payload.get("target") == (t_fail.id if t_fail else None)
+               and "error" in str((e.payload.get("diff") or {}))
+               for e in g.events),
+           "the failure event carries the error (errors propagate)")
+    fail_outcome = [e for e in g.objects(type="evaluation")
+                    if (e.data.get("metadata") or {}).get("lab") == "task_outcome"
+                    and (e.data.get("metadata") or {}).get("task_id")
+                    == (t_fail.id if t_fail else None)]
+    c.that(len(fail_outcome) == 1 and fail_outcome[0].data.get("judgment") == "failed",
+           "failure flows into the existing outcome path")
+    print(f"  failure: task rejected, error on the event: {str(err)[:60]}…")
+
+    # ── the per-task fetch cap binds ────────────────────────────────────────
+    b_cap = make("capped")
+    t_cap = task_for(b_cap.id)
+    n_calls = len(calls_for(t_cap.id)) if t_cap else -1
+    c.that(n_calls == exp["capped_calls"],
+           f"fetch cap binds: {n_calls} call(s) for 4 candidate URLs (cap "
+           f"{exp['capped_calls']})")
+    research_meta = ((g.get_object(t_cap.id).data.get("metadata") or {})
+                     .get("research") or {}) if t_cap else {}
+    c.that(research_meta.get("fetched") == exp["capped_calls"],
+           f"progress patches recorded per fetch ({research_meta})")
+    print(f"  cap: {n_calls} fetches for 4 URLs")
+
+    # ── unhandled routing still records a capability gap ────────────────────
+    b_gap = make("unhandled")
+    t_gap = task_for(b_gap.id)
+    gaps = [o for o in _lab_obs(g, "capability_gap")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == b_gap.id]
+    c.that(len(gaps) == exp["gap_observations"]
+           and t_gap is not None and t_gap.data.get("status") == "blocked",
+           f"codebase routing untouched: gap recorded, task blocked "
+           f"({len(gaps)})")
+    print("  unhandled: codebase routing → gap, task blocked")
+    return c.done("research_worker")
+
+
 def run_model_routing() -> bool:
     spec = _load("model_routing.yaml")
     print("\n" + "=" * 64)
@@ -1458,6 +1589,7 @@ def run_all() -> None:
         run_seams(),
         run_charter(),
         run_model_routing(),
+        run_research_worker(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

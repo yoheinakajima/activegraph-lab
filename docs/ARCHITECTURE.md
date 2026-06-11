@@ -14,7 +14,7 @@ Relation call convention: this repo writes relations per the actual `Graph.add_r
 
 ## Behaviors
 
-Eight small reactive behaviors, no orchestrator:
+Ten small reactive behaviors, no orchestrator:
 
 - `ingest` — on mission.created or source-request events: fetch target_url and same-domain links through tool_gateway (registering a `fetch_url` capability if absent), create core sources, then observations for extracted claims. Depth ≤ 2, page cap ≤ 30, a progress event per page.
 - `plan` — llm_behavior. On new observations under a mission: identify weakly evidenced claims, create proposed branch objects. Reasoning is narrated in the event payload, never scored by formula.
@@ -23,6 +23,7 @@ Eight small reactive behaviors, no orchestrator:
 - `gate` — on decision.created (pending): emit an approval-request event. Nothing publishes or self-modifies without an approved decision. No exceptions, including fixtures. An approved publish decision is the publishing last mile: artifact patched to status=published with published_at, slug uniqueness enforced (collision → numeric suffix), and an `artifact.published` marker event appended (ADR-013). An approved promote decision on a branch with ≥ research_min_evidence linked evidence objects yields ONE research draft_request; thinner decided branches wait until ≥2 of them can be synthesized over the same combined bar (ADR-014).
 - `digest` — editorial accumulator (ADR-014). Finding-tagged observations are QUEUED (a queued_finding relation), never drafted directly; when unpublished queued findings reach digest_min_findings, one note-kind draft_request covers them all. Also captures per-observation provenance (actor + timestamp from the creation event) and feeds the branch-evidence registry from relation.created events — BehaviorGraph cannot iterate relations, so evidence counting inside behaviors is registry-backed, rebuilt from the graph on resume.
 - `draft_writer` — llm_behavior. On draft_request observations ONLY (ADR-014): write a core artifact (kind=blog_draft, metadata.post_kind note|research|build, markdown with evidence footnotes, claims-coverage + process-claims review notes, provenance block), mirror it to drafts/<slug>.md (graph copy canonical), and open a pending publish decision. The request's data carries the code-injected draft context: classification guidance and, per item, the originating branch title, when and by what behavior the observation was created, and whether it was seeded or arose from live work — the model can no longer not know where a finding came from. OPEN: spec asked rejected drafts to become status `archived`, but the core artifact enum has no such value and core is not ours to change (ADR-005) — rejected drafts map to `rejected` plus a REJECTED header on the mirror file.
+- `research_intake` + `research_worker` — the lab-local research worker (ADR-020, `lab_pack/research_worker.py`, plumbing, droppable). Intake claims tasks routed research.deep_research and gathers sources through tool_gateway (per-task cap `setting.research_fetch_cap`); the llm_behavior synthesizes with per-claim source attribution, writes observations + a branch-linked evaluation, and completes the task — or fails it with the error in the event. Dark by default (`research_worker_enabled`); the server boot enables it. Non-research routing still records capability gaps.
 - `answer` — llm_behavior, active only when communication is loaded. On message intents in threads that discuss a branch: answer from current graph state, stamp the event horizon, include provenance refs. Steering messages also write the corresponding object mutation.
 
 ## Event taxonomy
@@ -31,7 +32,7 @@ The runtime owns the taxonomy: `object.created` / `object.patched` / relation ev
 
 ## Worker coordination (ADR-006)
 
-No adapters. `work` writes core tasks with routing tags (OPEN: exact tag convention — currently `task.metadata.routing` + tags in metadata). Verified against the packs repo at the current pin: no research or codebase behavior reacts to core task objects (research reacts to `source(kind=research_paper)`), so until upstream adds task-reactive behaviors, dispatch produces capability-gap observations — which is the honest state of the evidence base.
+No adapters. `work` writes core tasks with routing tags (OPEN: exact tag convention — currently `task.metadata.routing` + tags in metadata). Verified against the packs repo at the current pin: no research or codebase behavior reacts to core task objects (research reacts to `source(kind=research_paper)`). The lab-local research worker (ADR-020) now fills the research.deep_research gap from inside the lab — implementing the same routing contract a future upstream pack would, and droppable the day one does. All other routing still produces capability-gap observations.
 
 ## Two-plane latency model
 

@@ -72,6 +72,7 @@ def main() -> int:
     reset_llm_session()
     tmp = tempfile.mkdtemp(prefix="lab-smoke-")
     settings = LabSettings(crawl_page_cap=10, max_claims_per_page=3,
+                           research_worker_enabled=True,  # ADR-020: live config
                            drafts_dir=str(Path(tmp) / "drafts"))
     rt = build_lab(llm_provider=LabProviderWrapper(
                        LabMockProvider(), max_total=60, max_per_behavior=10,
@@ -92,9 +93,26 @@ def main() -> int:
     check(all((b.data.get('metadata') or {}).get("reasoning") for b in proposed),
           "every proposal carries narrated reasoning")
 
-    print("== seed branch -> work -> gap ==")
+    print("== seed branch -> work -> research worker (ADR-020) ==")
+    check(len(lab_obs("research_progress")) >= 1,
+          f"research worker claimed the seed-branch task "
+          f"({len(lab_obs('research_progress'))})")
+    rfind = lab_obs("research_finding")
+    check(bool(rfind) and all((o.data.get("metadata") or {}).get("source_urls")
+                              for o in rfind),
+          f"research findings carry source attribution ({len(rfind)})")
+    check(len(lab_obs("capability_gap")) == 0,
+          "no capability gap for research routing — the worker reacted")
+
+    print("== unhandled routing still gaps (ADR-006) ==")
+    from lab_pack.tools import create_branch_fn
+    mission = g.objects(type="mission")[0]
+    create_branch_fn(g, mission.id, "Implement a code probe",
+                     "Implement code in the repo to test the parser.",
+                     status="active")
+    rt.run_until_idle()
     gaps = lab_obs("capability_gap")
-    check(len(gaps) >= 1, f"capability gap recorded for the seed branch ({len(gaps)})")
+    check(len(gaps) >= 1, f"capability gap recorded for unhandled routing ({len(gaps)})")
 
     print("== activate one proposal -> work -> completion -> interpret -> decision ==")
     reset_llm_run_counters()
