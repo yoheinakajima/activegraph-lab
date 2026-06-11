@@ -916,7 +916,9 @@ def run_seams() -> bool:
     rt.run_until_idle()
     c.that(g.get_object(a1.id).data.get("status") == "approved",
            "approved seam artifact patched to approved")
-    c.that(plan_b.description == case["v1_body"],
+    # ADR-018: descriptions compose prompt body + charter block, so the
+    # approved body is the PREFIX of the live description.
+    c.that(plan_b.description.startswith(case["v1_body"]),
            "hot-load: live behavior uses the approved body without restart")
 
     # ── version monotonicity: v2 supersedes ────────────────────────────────
@@ -928,7 +930,7 @@ def run_seams() -> bool:
            f"versions monotonic per seam_name ({versions})")
     approve_decision_fn(g, pending_for(a2.id).id, True)
     rt.run_until_idle()
-    c.that(plan_b.description == case["v2_body"] and
+    c.that(plan_b.description.startswith(case["v2_body"]) and
            resolve(g, case["seam_name"], None) == (2, case["v2_body"]),
            "v2 supersedes v1 after approval")
 
@@ -1004,6 +1006,127 @@ def run_seams() -> bool:
            "recorded version matches the active version at execution")
 
     return c.done("seams")
+
+
+def run_charter() -> bool:
+    spec = _load("charter.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: charter — verbatim injection, file v1, graph v2 via the gate")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.seams import (active_charter, apply_approved,
+                                charter_file_default, propose_seam_fn)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    cases = spec["cases"]
+    file_body = charter_file_default()
+
+    def desc(name):
+        return next(b for b in lb.BEHAVIORS if b.name == name).description
+
+    def add_claim(i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+        rt.run_until_idle()
+
+    def proposed_branches():
+        return [b for b in g.objects(type="branch")
+                if b.data.get("status") == "proposed"]
+
+    def pending_for(artifact_id):
+        return next((d for d in g.objects(type="decision")
+                     if d.data.get("kind") == "self_modify"
+                     and d.data.get("subject_ref") == artifact_id
+                     and d.data.get("status") == "pending"), None)
+
+    # ── v1 file default injected verbatim into the three behaviors ─────────
+    c.that("CHARTER v1 — activegraph-lab" in file_body,
+           "charter.md body is the operator's v1 charter")
+    for name in exp["charter_behaviors"]:
+        d = desc(name)
+        c.that(file_body in d and "charter.mission v1" in d,
+               f"{name}: charter v1 injected verbatim (delimited block)")
+    for name in exp["uninjected_behaviors"]:
+        c.that("===== CHARTER" not in desc(name),
+               f"{name}: charter NOT injected (answer is excluded by design)")
+    c.that(active_charter(g) == (1, file_body),
+           "active charter is the file default at version 1")
+    print(f"  v1 (file) injected into {exp['charter_behaviors']}; "
+          f"answer untouched")
+
+    # ── behavior outputs record the charter version in force ───────────────
+    add_claim(1)
+    b1 = proposed_branches()[-1]
+    stamp1 = (b1.data.get("metadata") or {}).get("seam_versions") or {}
+    c.that(stamp1.get("charter.mission") == exp["file_default_version"],
+           f"plan output stamps charter.mission v1 ({stamp1})")
+
+    # ── graph v2 supersedes file v1, only through the gate ─────────────────
+    v2_body = cases["charter_v2_body"].strip()
+    a2 = propose_seam_fn(g, "charter.mission", v2_body, "fixture charter v2")
+    rt.run_until_idle()
+    meta2 = a2.data.get("metadata") or {}
+    c.that(meta2.get("version") == exp["first_graph_version"]
+           and meta2.get("parent_version") == exp["file_default_version"],
+           f"first graph charter is v2 with parent v1 ({meta2})")
+    c.that(file_body in desc("plan"),
+           "pending charter does NOT load — v1 stays active pre-approval")
+    approve_decision_fn(g, pending_for(a2.id).id, True, "fixture approve")
+    rt.run_until_idle()
+    for name in exp["charter_behaviors"]:
+        d = desc(name)
+        c.that(v2_body in d and "charter.mission v2" in d and file_body not in d,
+               f"{name}: approved charter v2 supersedes file v1 (hot-loaded)")
+    add_claim(2)
+    b2 = proposed_branches()[-1]
+    stamp2 = (b2.data.get("metadata") or {}).get("seam_versions") or {}
+    c.that(stamp2.get("charter.mission") == exp["first_graph_version"],
+           f"post-approval output stamps charter.mission v2 ({stamp2})")
+    c.that(stamp1.get("charter.mission") != stamp2.get("charter.mission"),
+           "replay record: the two outputs carry the version in force at "
+           "their own execution")
+    print(f"  v2 approved → hot-loaded; stamps: {stamp1.get('charter.mission')}"
+          f" then {stamp2.get('charter.mission')}")
+
+    # ── prompt seam and charter compose ────────────────────────────────────
+    p1_body = cases["prompt_v1_body"].strip()
+    ap = propose_seam_fn(g, "prompt.plan", p1_body, "fixture prompt v1")
+    rt.run_until_idle()
+    approve_decision_fn(g, pending_for(ap.id).id, True)
+    rt.run_until_idle()
+    d = desc("plan")
+    c.that(d.startswith(p1_body) and v2_body in d,
+           "approved prompt seam composes with the active charter")
+
+    # ── whitelist + kernel refusals ─────────────────────────────────────────
+    for ref in cases["refusals"]:
+        r = propose_seam_fn(g, ref["seam_name"], ref["body"])
+        c.that(r is None, f"refused outright: {ref['seam_name']}")
+    refusals = [o for o in g.objects(type="observation")
+                if (o.data.get("metadata") or {}).get("lab") == "seam_refused"]
+    c.that(len(refusals) == exp["refusal_observations"],
+           f"refusals are graph-visible ({len(refusals)})")
+
+    # ── boot/resume recomposes from the log ────────────────────────────────
+    clear_lab_registry()  # simulated restart: file defaults restored
+    c.that(file_body in desc("plan") and v2_body not in desc("plan"),
+           "restart restores file defaults before apply_approved")
+    n = apply_approved(g)
+    d = desc("plan")
+    c.that(n >= 2 and d.startswith(p1_body) and v2_body in d,
+           f"apply_approved recomposes prompt v1 + charter v2 at boot ({n})")
+    print("  restart → apply_approved recomposes graph charter + prompt")
+    return c.done("charter")
 
 
 _GC_GOOD = '''
@@ -1214,6 +1337,7 @@ def run_all() -> None:
         run_operator_controls(),
         run_paused_boot(),
         run_seams(),
+        run_charter(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

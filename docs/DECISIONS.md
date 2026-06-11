@@ -149,7 +149,17 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Accepted trade: statelessness means an authorization code cannot be marked used — replay inside its 60-second window with the same PKCE verifier mints a token. The code only ever transits the operator-initiated redirect to an allowlisted claude.ai/claude.com/localhost callback, the verifier never leaves the client, and the alternative is a token table — the thing this design exists to avoid. Likewise individual tokens cannot be revoked: revocation is rotation, which is already the lab's story.
 - Rationale: the URL-token bridge made the connector URL itself a credential; OAuth removes the secret from the URL entirely (the operator authenticates once on the authorize page) without adding storage, a framework, or any new authority. One secret still rules the surface, and the human gate (ADR-016's excluded-by-design list) is untouched.
 
-ADR-018–022: reserved for the in-flight consolidation session (charter, model routing, research worker, MCP expansion, GitHub read).
+## ADR-018: The charter is a seam — operator-authored, versioned, injected verbatim
+
+- Status: accepted
+- Date: 2026-06-11
+- Decision: the lab gains an operator-authored mission charter as seam `charter.mission` — versioned, gated, hot-loaded, replay-recorded, and injected VERBATIM (a delimited CHARTER block) into the context assembly of exactly three behaviors: plan, interpret, and draft_writer. v1 ships as the FILE DEFAULT (`lab_pack/prompts/charter.md` — operator-authored content, committed by the operator's own build pipeline), so unlike every other seam the file default counts as version 1, not 0: the first graph-stored proposal is v2, parented on the file's v1, and it activates only through the self_modify gate like any seam. `charter.mission` is the only whitelisted charter surface; the kernel-manifest body scan applies to charter bodies exactly as to prompts.
+- Replay fidelity: the three behaviors stamp `charter.mission` alongside their prompt version in `seam_versions` on every output, so the log records which charter was in force for each decision the model made — and since replay never re-fires behaviors, those records replay verbatim (the same mechanism as prompt seams, ADR-012 Phase 4).
+- Exclusions: answer does NOT receive the charter — it reports graph state to the operator and must not restate portfolio priorities as if they were findings. The charter composes WITH prompt seams (description = active prompt body + active charter block), so promoting either surface independently recomposes the live context without restart.
+- Mechanical note: the upstream prompt loader (`load_prompts_from_dir`) refuses any `prompts/*.md` without TOML frontmatter, so charter.md carries the standard two-line frontmatter; the BODY — the thing injected, resolved, and versioned — is exactly the operator's charter text. The charter prompt name is excluded from provider-side behavior identification (its body appears inside three behaviors' contexts).
+- Rationale: the lab's portfolio judgment (what to verify, build, measure; how much introspection is too much; what voice is honest) is policy, not plumbing — it belongs in an inspectable, versioned, gated surface the lab can eventually propose changes to itself, not scattered through prompt prose the operator would have to diff by hand.
+
+ADR-019–022: reserved for the in-flight consolidation session (model routing, research worker, MCP expansion, GitHub read).
 
 ## ADR-023: Chat path failure domain — the append is the only fail point; everything else degrades, diagnosably
 

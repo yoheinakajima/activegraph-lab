@@ -595,7 +595,11 @@ def _lab_prompt_bodies() -> dict[str, str]:
     from activegraph.packs import load_prompts_from_dir
     d = Path(__file__).parent / "prompts"
     try:
-        return {p.name: p.body for p in load_prompts_from_dir(d)}
+        # "charter" is not a behavior: its body is injected into SEVERAL
+        # behaviors' contexts (ADR-018), so probing it would misidentify
+        # every charter behavior as "charter" in _behavior_for.
+        return {p.name: p.body for p in load_prompts_from_dir(d)
+                if p.name != "charter"}
     except Exception:
         return {}
 

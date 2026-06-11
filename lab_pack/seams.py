@@ -28,11 +28,76 @@ log, so old entries keep rendering with the version that was active then.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 from .kernel import SEAM_ELIGIBLE_SETTINGS, kernel_reference
 
 _PROMPT_BEHAVIORS = ("plan", "interpret", "answer", "draft_writer")
+
+# ── the charter (ADR-018) ────────────────────────────────────────────────────
+# An operator-authored mission charter, itself a seam: versioned, gated,
+# hot-loaded, replay-recorded (behaviors stamp charter.mission alongside
+# their prompt versions). v1 ships as the FILE DEFAULT — operator-authored
+# content committed through the operator's own build pipeline — so unlike
+# other seams the file default is version 1, not 0; future versions arrive
+# only through the gate. The body is injected VERBATIM as a delimited
+# CHARTER block into the context assembly (the behavior description) of
+# plan, interpret, and draft_writer. answer is excluded: it speaks to the
+# operator from graph state and must not narrate charter priorities as if
+# they were its own findings.
+CHARTER_SEAM = "charter.mission"
+CHARTER_BEHAVIORS = ("plan", "interpret", "draft_writer")
+
+_CHARTER_FILE = Path(__file__).parent / "prompts" / "charter.md"
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.S)
+
+
+def charter_file_default() -> str:
+    """The operator's charter body, verbatim (the file's TOML frontmatter is
+    loader metadata required by load_prompts_from_dir, not charter content)."""
+    try:
+        text = _CHARTER_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return _FRONTMATTER_RE.sub("", text).strip("\n")
+
+
+def charter_block(version: int, body: str) -> str:
+    """The delimited CHARTER block appended to a charter behavior's context."""
+    return (f"\n\n===== CHARTER (charter.mission v{version} — "
+            "operator-authored, injected verbatim) =====\n"
+            f"{body}\n===== END CHARTER =====")
+
+
+def _cached_charter() -> tuple[int, str]:
+    """Cache-only charter resolution (behaviors and hot_load run with a
+    restricted graph): the approved override if one was ever loaded, else
+    the file default at version 1."""
+    hit = _CACHE.get(CHARTER_SEAM)
+    if hit is not None:
+        return hit
+    return 1, charter_file_default()
+
+
+def active_charter(graph) -> tuple[int, str]:
+    """(version, body) of the charter in force: highest approved
+    charter.mission seam, else the file default as version 1 (ADR-018)."""
+    version, body = resolve(graph, CHARTER_SEAM, None)
+    if version == 0 or body is None:
+        return 1, charter_file_default()
+    return version, body
+
+
+def composed_description(behavior_name: str, prompt_body: str,
+                         charter_version: int, charter_text: str) -> str:
+    """A behavior's full context-assembly description: the prompt body, plus
+    the verbatim CHARTER block for the charter behaviors. The prompt body
+    stays the PREFIX so provider-side behavior identification (which probes
+    prompt prefixes) is unaffected."""
+    if behavior_name not in CHARTER_BEHAVIORS:
+        return prompt_body
+    return prompt_body + charter_block(charter_version, charter_text)
 
 # resolve() cache: seam_name -> (version, body) | None (= file default).
 # Invalidated by hot_load on approval and by clear_seam_cache().
@@ -49,6 +114,11 @@ def _valid_name(seam_name: str) -> Optional[str]:
         if seam_name.split(".", 1)[1] not in _PROMPT_BEHAVIORS:
             return f"unknown prompt seam (known: {', '.join(_PROMPT_BEHAVIORS)})"
         return None
+    if seam_name.startswith("charter."):
+        # ADR-018: exactly one charter surface is whitelisted.
+        if seam_name != CHARTER_SEAM:
+            return f"unknown charter seam (known: {CHARTER_SEAM})"
+        return None
     if seam_name.startswith("template.feed."):
         return None  # projection-only; kernel scan still applies to the body
     if seam_name.startswith("setting."):
@@ -57,7 +127,7 @@ def _valid_name(seam_name: str) -> Optional[str]:
             return (f"setting '{name}' is not seam-eligible "
                     f"(whitelist: {', '.join(sorted(SEAM_ELIGIBLE_SETTINGS))})")
         return None
-    return "seam_name must be prompt.* | template.feed.* | setting.*"
+    return "seam_name must be prompt.* | charter.mission | template.feed.* | setting.*"
 
 
 def _seam_artifacts(graph, seam_name: str) -> list:
@@ -89,7 +159,10 @@ def propose_seam_fn(graph, seam_name: str, body: str, rationale: str = ""):
 
     existing = _seam_artifacts(graph, seam_name)
     versions = [int((a.data.get("metadata") or {}).get("version") or 0) for a in existing]
-    version = (max(versions) + 1) if versions else 1
+    # ADR-018: the charter's file default IS version 1 (operator-authored),
+    # so the first graph-stored proposal is v2; every other seam starts at 1.
+    base = 1 if seam_name == CHARTER_SEAM else 0
+    version = max(versions + [base]) + 1
     active = active_version(graph, seam_name)
 
     artifact = graph.add_object("artifact", {
@@ -142,6 +215,8 @@ def resolve(graph, seam_name: str, default: Optional[str] = None) -> tuple[int, 
 
 
 def active_version(graph, seam_name: str) -> int:
+    if seam_name == CHARTER_SEAM:
+        return active_charter(graph)[0]  # file default is v1 (ADR-018)
     return resolve(graph, seam_name, None)[0]
 
 
@@ -203,16 +278,25 @@ def hot_load(graph, artifact_id: str) -> None:
 
     if seam_name.startswith("prompt."):
         _apply_prompt(seam_name.split(".", 1)[1], body)
+    elif seam_name == CHARTER_SEAM:
+        # ADR-018: a new charter recomposes every charter behavior's context
+        # with its active prompt body (cache-only, like everything in here).
+        from . import behaviors as lb
+        for name in CHARTER_BEHAVIORS:
+            hit = _CACHE.get(f"prompt.{name}")
+            _apply_prompt(name, hit[1] if hit else lb._PROMPTS.get(name, ""))
 
 
 def _apply_prompt(behavior_name: str, body: str) -> None:
     from . import behaviors as lb  # late import — seams is kernel, no cycle
+    version, charter = _cached_charter()
+    text = composed_description(behavior_name, body, version, charter)
     for b in lb.BEHAVIORS:
         if getattr(b, "name", None) == behavior_name:
             try:
-                setattr(b, "description", body)
+                setattr(b, "description", text)
             except Exception:
-                object.__setattr__(b, "description", body)
+                object.__setattr__(b, "description", text)
             return
 
 
@@ -224,9 +308,19 @@ def apply_approved(graph) -> int:
     names = {(a.data.get("metadata") or {}).get("seam_name")
              for a in graph.objects(type="artifact")
              if a.data.get("kind") == "seam" and a.data.get("status") == "approved"}
+    # charter.mission sorts before prompt.*, so an approved charter is cached
+    # before any prompt recomposition reads it (ADR-018).
     for name in sorted(n for n in names if n):
         version, body = resolve(graph, name, None)
-        if version and name.startswith("prompt.") and body is not None:
+        if not version or body is None:
+            continue
+        if name == CHARTER_SEAM:
+            from . import behaviors as lb
+            for b_name in CHARTER_BEHAVIORS:
+                hit = _CACHE.get(f"prompt.{b_name}")
+                _apply_prompt(b_name, hit[1] if hit else lb._PROMPTS.get(b_name, ""))
+            applied += 1
+        elif name.startswith("prompt."):
             _apply_prompt(name.split(".", 1)[1], body)
             applied += 1
     return applied
@@ -237,7 +331,8 @@ def seam_status(graph) -> dict:
     source (file|graph), plus pending proposals."""
     from .settings import LabSettings
     surfaces: list[dict] = []
-    known = [f"prompt.{b}" for b in _PROMPT_BEHAVIORS]
+    known = [CHARTER_SEAM]
+    known += [f"prompt.{b}" for b in _PROMPT_BEHAVIORS]
     known += [f"setting.{s}" for s in sorted(SEAM_ELIGIBLE_SETTINGS)]
     template_names = {(a.data.get("metadata") or {}).get("seam_name")
                       for a in graph.objects(type="artifact")
@@ -256,6 +351,12 @@ def seam_status(graph) -> dict:
     defaults = LabSettings()
     for name in known:
         version, _ = resolve(graph, name, None)
+        # ADR-018: the charter's file default is itself v1 (operator-authored).
+        if name == CHARTER_SEAM and version == 0:
+            entry = {"seam_name": name, "active_version": 1, "source": "file",
+                     "pending": pending.get(name, [])}
+            surfaces.append(entry)
+            continue
         entry = {
             "seam_name": name,
             "active_version": version,

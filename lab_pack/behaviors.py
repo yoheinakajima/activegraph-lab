@@ -62,13 +62,22 @@ from .llm import (
     llm_usage,
 )
 from .seams import (
+    charter_file_default,
     clear_seam_cache,
+    composed_description,
     effective_setting,
     seam_versions_stamp,
 )
 from .settings import LabSettings
 
 _PROMPTS = {p.name: p.body for p in load_prompts_from_dir(Path(__file__).parent / "prompts")}
+
+
+def _file_default_description(name: str) -> str:
+    """A behavior's file-default context: its prompt body, plus the verbatim
+    CHARTER v1 block for the charter behaviors (ADR-018). Approved seams
+    recompose this through lab_pack/seams.py at hot-load and boot."""
+    return composed_description(name, _PROMPTS[name], 1, charter_file_default())
 
 # ---------------------------------------------------------------- registries
 
@@ -128,14 +137,18 @@ def clear_lab_registry() -> None:
     _IDLE_LOGGED["capped"] = False
     clear_seam_cache()
     # Seam hot-loads mutate live behavior descriptions; restore file defaults
-    # so fixture runs are isolated from each other.
+    # (prompt body + CHARTER v1 block for the charter behaviors, ADR-018) so
+    # fixture runs are isolated from each other.
     for b in BEHAVIORS:
         name = getattr(b, "name", "")
-        if name in _PROMPTS and getattr(b, "description", None) != _PROMPTS[name]:
+        if name not in _PROMPTS:
+            continue
+        default = _file_default_description(name)
+        if getattr(b, "description", None) != default:
             try:
-                setattr(b, "description", _PROMPTS[name])
+                setattr(b, "description", default)
             except Exception:
-                object.__setattr__(b, "description", _PROMPTS[name])
+                object.__setattr__(b, "description", default)
 
 
 def _now() -> str:
@@ -441,7 +454,7 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     name="plan",
     on=["object.created"],
     where={"object.type": "observation", "object.data.metadata.lab": "site_claim"},
-    description=_PROMPTS["plan"],
+    description=_file_default_description("plan"),
     output_schema=PlanProposal,
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
@@ -483,7 +496,8 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
             "reasoning": out.reasoning,
             "claim_observation_id": obs_id,
             "proposed_by": "lab.plan",
-            "seam_versions": seam_versions_stamp(graph, "prompt.plan"),
+            "seam_versions": seam_versions_stamp(graph, "prompt.plan",
+                                                 "charter.mission"),
         },
     })
     _BRANCH_COUNT["open"] += 1
@@ -660,7 +674,7 @@ def work(event, graph, ctx, *, settings: LabSettings):
     name="interpret",
     on=["object.created"],
     where={"object.type": "evaluation", "object.data.metadata.lab": "task_outcome"},
-    description=_PROMPTS["interpret"],
+    description=_file_default_description("interpret"),
     output_schema=InterpretSummary,
     model=None,
     view={
@@ -700,7 +714,8 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
         "category": "fact",
         "metadata": {"lab": "interpretation", "lab_branch_id": branch_id,
                      "task_id": task_id,
-                     "seam_versions": seam_versions_stamp(graph, "prompt.interpret")},
+                     "seam_versions": seam_versions_stamp(graph, "prompt.interpret",
+                                                          "charter.mission")},
     })
     graph.add_relation(branch_id, obs.id, "supported_by")
     graph.patch_object(branch_id, {"status": "interpreting"})
@@ -1242,7 +1257,7 @@ def _coverage_review(body: str) -> Optional[str]:
     name="draft_writer",
     on=["object.created"],
     where={"object.type": "observation", "object.data.metadata.draft_request": True},
-    description=_PROMPTS["draft_writer"],
+    description=_file_default_description("draft_writer"),
     output_schema=BlogDraft,
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
@@ -1347,7 +1362,8 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
                      "finding_id": (finding_ids[0] if finding_ids else obs_id),
                      "finding_ids": finding_ids,
                      "request_id": obs_id,
-                     "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer")},
+                     "seam_versions": seam_versions_stamp(graph, "prompt.draft_writer",
+                                                          "charter.mission")},
     })
     if branch_id:
         graph.add_relation(branch_id, artifact.id, "produced")
