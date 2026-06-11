@@ -24,10 +24,14 @@ paths (resumed boot from a restored-shaped log, runtime worker, HTTP, MCP):
      and the reply still produced on the worker.
   4. DISCONNECT-PROOF REPLY — a client that vanishes after POSTing still
      gets its message answered exactly once.
-  5. RECONNECT — serverless postgres terminates idle connections (Neon
-     suspend); the next write after a killed store connection reconnects
-     and commits (lab_pack/storage.harden_store), recorded on /lab/errors
-     as store_reconnected. Postgres section, same SKIP rule as 1.
+  5. CONNECTION RESILIENCE — serverless Postgres kills idle connections
+     (the Neon idle-suspend incident: AdminShutdown on the first write,
+     then OperationalError 'the connection is closed' forever). The
+     storage adapter reconnects and retries exactly once on
+     connection-class errors, recording store_reconnected on the ring
+     buffer (never the log); constraint violations are NEVER retried; a
+     second failure surfaces structured. Policy is locked everywhere; the
+     end-to-end kill-the-backend path needs LAB_TEST_PG_URL.
 
 No live LLM calls (LAB_LLM_PROVIDER=mock is forced), no network.
 
@@ -346,6 +350,10 @@ def main() -> int:
         lab_server._worker = None
         lab_server._mutation_times.clear()
 
+    print("== 5: store reconnect policy — connection-class only, retry "
+          "exactly once ==")
+    run_reconnect_policy()
+
     print("== 1: leaf cause on the real backend (postgres) ==")
     pg_url = os.environ.get("LAB_TEST_PG_URL", "").strip()
     if not pg_url:
@@ -353,6 +361,8 @@ def main() -> int:
               "database to exercise the real UniqueViolation leaf")
     else:
         run_postgres_leaf(pg_url, str(tmp))
+        print("== 5pg: the Neon idle-suspend kill, end to end ==")
+        run_postgres_reconnect(pg_url)
 
     print(f"\ntest_chat_robustness: {'PASS' if not FAILURES else 'FAIL'} "
           f"({len(FAILURES)} failure(s))")
@@ -405,34 +415,6 @@ def run_postgres_leaf(pg_url: str, tmp: str) -> None:
                 in_memory = len(lab_server._rt.graph.events)
             check(durable == in_memory,
                   f"every in-memory event is durable again ({in_memory} == {durable})")
-
-            # the OTHER production leaf: serverless postgres terminates idle
-            # connections (Neon suspend). Kill the live store's backend the
-            # way the server does, then the next chat must succeed through
-            # the reconnect path, visible at /lab/errors as store_reconnected.
-            store = lab_server._rt.graph.store
-            pid = store._source._conn.info.backend_pid
-            with psycopg.connect(pg_url, autocommit=True) as admin:
-                admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
-            s, is_err, out = mcp_send_chat(base, branch_id,
-                                           "first chat after the idle suspend", 200)
-            check(s == 200 and not is_err
-                  and out.get("status") in ("ok", "reply_pending"),
-                  "send_chat after a killed store connection succeeds via "
-                  f"reconnect ({out.get('status') if isinstance(out, dict) else out})")
-            s, errs = get_json(base, "/lab/errors")
-            recon = [e for e in errs["errors"]
-                     if e["kind"] == "store_reconnected"]
-            check(len(recon) >= 1 and recon[-1]["class"] in
-                  ("AdminShutdown", "OperationalError"),
-                  f"/lab/errors shows store_reconnected with the triggering "
-                  f"class ({[e['class'] for e in recon]})")
-            with psycopg.connect(pg_url, autocommit=True) as conn:
-                durable = conn.execute("SELECT count(*) FROM events").fetchone()[0]
-            with lab_server._lock:
-                in_memory = len(lab_server._rt.graph.events)
-            check(durable == in_memory,
-                  f"post-reconnect writes are durable ({in_memory} == {durable})")
         finally:
             httpd.shutdown()
             lab_server._rt = None
@@ -440,6 +422,169 @@ def run_postgres_leaf(pg_url: str, tmp: str) -> None:
             lab_server._mutation_times.clear()
     finally:
         os.environ.pop("LAB_DATABASE_URL", None)
+
+
+class _DyingStore:
+    """Shaped like a URL-target PostgresEventStore (owned connection) whose
+    every append raises `exc` — the policy tests need failure shapes, not a
+    live backend."""
+
+    class _Source:
+        def __init__(self):
+            self._owned_conn = object()  # owned, close() best-effort
+            self._conn = self._owned_conn
+
+    def __init__(self, exc):
+        self._source = self._Source()
+        self.calls = 0
+        self.exc = exc
+
+    def append(self, event):
+        self.calls += 1
+        raise self.exc
+
+
+def run_reconnect_policy() -> None:
+    """The retry policy, independent of any backend: connection-class errors
+    reconnect + retry exactly once; everything else surfaces untouched."""
+    import psycopg
+    from lab_pack import storage
+
+    # sqlite backend (the env main() set up): harden is a no-op
+    check(storage.harden_store(object()) is False,
+          "sqlite backend: harden_store is a no-op")
+
+    # UniqueViolation is NEVER retried — a retried append whose first
+    # attempt actually committed must surface, not duplicate (ADR-023)
+    recons: list = []
+    st = _DyingStore(psycopg.errors.UniqueViolation(
+        'duplicate key value violates unique constraint "events_pkey"'))
+    check(storage.harden_store(st, url="postgres://scratch.invalid/x",
+                               on_reconnect=recons.append),
+          "harden_store arms an owned postgres-shaped store")
+    check(storage.harden_store(st, url="postgres://scratch.invalid/x") is True,
+          "arming is idempotent (no double-wrap)")
+    try:
+        st.append(None)
+        check(False, "UniqueViolation must surface")
+    except psycopg.errors.UniqueViolation:
+        pass
+    check(st.calls == 1 and not recons,
+          f"constraint violation: no retry, no reconnect ({st.calls} attempt)")
+
+    # a connection-class error whose reconnect also fails: the failure
+    # surfaces structured (class + message for the ring buffer / response),
+    # and no phantom store_reconnected is recorded
+    st2 = _DyingStore(psycopg.OperationalError("the connection is closed"))
+    storage.harden_store(
+        st2, url="postgres://lab@scratch.invalid/x?connect_timeout=2",
+        on_reconnect=recons.append)
+    try:
+        st2.append(None)
+        check(False, "double failure must surface")
+    except psycopg.OperationalError:
+        pass
+    check(st2.calls == 1 and not recons,
+          "failed reconnect surfaces; nothing recorded as reconnected")
+
+
+def run_postgres_reconnect(pg_url: str) -> None:
+    """The production incident, end to end on the real backend: the live
+    store's server-side backend is terminated (what a Neon idle suspend
+    does), and the NEXT chat append must reconnect, retry, succeed — with
+    store_reconnected on the ring buffer and nothing in the event log.
+    Resumes the lineage run_postgres_leaf left in the scratch database."""
+    import psycopg
+    from lab_pack import storage
+    from server import lab_server
+
+    os.environ["LAB_DATABASE_URL"] = pg_url
+    try:
+        rt = resumed_boot()
+        store = lab_server._rt.graph.store
+        check(getattr(store, "_lab_reconnect_armed", False),
+              "resumed boot armed reconnect-on-failure on the postgres store")
+        httpd, base = serve()
+        try:
+            lab_server._mutation_times.clear()
+            branch_id = str(next(b.id for b in rt.graph.objects(type="branch")))
+            # the idle suspend: the server kills the store's backend
+            pid = store._source._conn.info.backend_pid
+            with psycopg.connect(pg_url, autocommit=True) as conn:
+                conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            time.sleep(0.5)
+            s, is_err, out = mcp_send_chat(
+                base, branch_id, "first write after the idle suspend", 201)
+            check(s == 200 and not is_err
+                  and out.get("status") in ("ok", "reply_pending"),
+                  f"first chat after the backend kill succeeds via reconnect "
+                  f"({out if is_err else out.get('status')})")
+            s, errs = get_json(base, "/lab/errors")
+            recon = [e for e in errs["errors"]
+                     if e["kind"] == "store_reconnected"]
+            check(len(recon) >= 1,
+                  f"store_reconnected on the ring buffer "
+                  f"({[e['kind'] for e in errs['errors'][:4]]})")
+            check(bool(recon) and recon[0]["class"] in
+                  ("AdminShutdown", "OperationalError", "InterfaceError"),
+                  f"ring entry names the triggering error class "
+                  f"({recon[0]['class'] if recon else 'none'})")
+            with lab_server._lock:
+                in_log = any(
+                    "store_reconnected" in json.dumps(e.payload, default=str)
+                    for e in lab_server._rt.graph.events)
+            check(not in_log,
+                  "reconnect is ring-buffer-only — nothing in the event log")
+            # durability through the NEW connection: every in-memory event
+            # is on disk once the reply drain settles
+            deadline = time.monotonic() + 30
+            durable = in_memory = -1
+            while time.monotonic() < deadline:
+                with psycopg.connect(pg_url, autocommit=True) as conn:
+                    durable = conn.execute(
+                        "SELECT count(*) FROM events").fetchone()[0]
+                with lab_server._lock:
+                    in_memory = len(lab_server._rt.graph.events)
+                if durable == in_memory:
+                    break
+                time.sleep(0.5)
+            check(durable == in_memory,
+                  f"every in-memory event is durable via the new connection "
+                  f"({in_memory} == {durable})")
+        finally:
+            httpd.shutdown()
+            lab_server._rt = None
+            lab_server._worker = None
+            lab_server._mutation_times.clear()
+    finally:
+        os.environ.pop("LAB_DATABASE_URL", None)
+
+    # retry is bounded on the real backend too: an append that keeps
+    # failing with a connection-class error reconnects ONCE (a real
+    # psycopg.connect against the scratch db), then surfaces
+    from activegraph.store.postgres import PostgresEventStore
+    st = PostgresEventStore(pg_url, run_id="reconnect-policy-fixture")
+    try:
+        calls = {"n": 0}
+
+        def dying_append(event):
+            calls["n"] += 1
+            raise psycopg.OperationalError(
+                "the connection is closed [simulated persistent outage]")
+
+        st.append = dying_append
+        recons: list = []
+        storage.harden_store(st, url=pg_url, on_reconnect=recons.append)
+        try:
+            st.append(None)
+            check(False, "persistent connection failure must surface")
+        except psycopg.OperationalError:
+            pass
+        check(calls["n"] == 2 and len(recons) == 1,
+              f"retried exactly once: {calls['n']} attempts, "
+              f"{len(recons)} reconnect(s) recorded")
+    finally:
+        st.close()
 
 
 if __name__ == "__main__":

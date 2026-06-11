@@ -2,19 +2,21 @@
 
 ## Unreleased
 
-- Store connection resilience (ADR-009 note, ADR-023): serverless
-  Postgres (Neon) terminates idle connections; the upstream
-  PostgresEventStore holds a single boot-lifetime one, so the first
-  post-idle write died AdminShutdown and every later write died
-  OperationalError until restart. storage.harden_store wraps store
-  operations with reconnect-and-retry-once on connection-class errors
-  (constraint violations are never retried; a second failure surfaces
-  structured), records each reconnect on the ring buffer as
-  store_reconnected, and probes long-idle appends with SELECT 1. Armed
-  by the server at boot for both fresh and resumed runtimes; locked by
-  reconnect fixtures in test_postgres and test_chat_robustness. The
-  immortal-connection assumption is seeded as a keyed live finding
-  (upstream candidate: reconnect belongs in the store).
+- Store connection resilience (ADR-009 note; the Neon idle-suspend
+  incident, twice): PostgresEventStore's single boot-lifetime connection
+  dies when serverless Postgres suspends an idle compute — first write
+  fails AdminShutdown, every later one OperationalError until restart.
+  `storage.harden_store` (armed at server boot, idempotent) reconnects
+  and retries exactly once on connection-class errors; constraint
+  violations are never retried (which also makes a retried append
+  double-commit-safe via UNIQUE(id, run_id)); a second failure surfaces
+  structured (ADR-023). Each reconnect records `store_reconnected` on
+  the diagnostics ring buffer, never the event log; long-idle appends
+  get a SELECT 1 probe first. Locked by the reconnect fixtures in
+  test_chat_robustness (policy everywhere; backend-kill end to end under
+  LAB_TEST_PG_URL) and the store-level kill/duplicate/double-failure
+  fixtures in test_postgres; the upstream candidate is queued in
+  LIVE_FINDINGS.
 
 - ADR-023 (the evt_1847/evt_1934 incident): the chat path's failure domain
   is now explicit — the message append is the only step that may fail a

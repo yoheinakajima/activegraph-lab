@@ -108,14 +108,21 @@ def repair_sequences(url: Optional[str] = None) -> int:
 # after >10.
 _LIVENESS_IDLE_SECONDS = 300
 
+# The EventStore protocol surface the runtime exercises (append/iter_events/
+# upsert_run at runtime; the rest for completeness — close stays unwrapped:
+# closing a dead connection must never trigger a reconnect).
+_STORE_OPS = ("append", "iter_events", "get_event", "count",
+              "truncate_after", "get_run", "upsert_run")
+
 
 def _connection_error_classes() -> tuple:
     """Errors that mean 'the connection died', not 'the statement is wrong'.
     AdminShutdown (Neon's idle-suspend kill) subclasses OperationalError;
     'the connection is closed' IS OperationalError; the SSL EOF / connection
-    reset shapes can escape as ssl.SSLError or a builtin ConnectionError.
-    UniqueViolation subclasses IntegrityError and is deliberately NOT here —
-    constraint violations must surface immediately (ADR-023)."""
+    reset shapes usually map onto OperationalError too but can escape as
+    ssl.SSLError or a builtin ConnectionError. UniqueViolation subclasses
+    IntegrityError and is deliberately NOT here — constraint violations
+    must surface immediately (ADR-023)."""
     import ssl
 
     import psycopg
@@ -125,7 +132,7 @@ def _connection_error_classes() -> tuple:
 
 def harden_store(store, *, url: Optional[str] = None,
                  on_reconnect: Optional[Callable] = None) -> bool:
-    """Wrap a PostgresEventStore's operations with reconnect-on-failure.
+    """Reconnect-on-failure for the runtime's PostgresEventStore.
 
     The upstream store owns ONE boot-lifetime connection; serverless
     Postgres guarantees that connection dies at the first idle suspend.
@@ -135,34 +142,36 @@ def harden_store(store, *, url: Optional[str] = None,
     until the process restarts. Nothing commits.
 
     On a connection-class error this re-establishes the connection and
-    retries the operation exactly once; a second failure propagates, so the
-    caller's structured-error path (ADR-023) surfaces it. Non-connection
-    errors are never retried. Every successful reconnect calls
-    `on_reconnect(triggering_exc)` — the server points that at the
-    diagnostics ring buffer (kind=store_reconnected), NOT the event log,
-    because the log is exactly what may be broken. Appends after a long
-    idle additionally get a cheap SELECT 1 probe first, so the stale
-    connection is usually replaced before the write is even attempted.
+    retries the operation exactly once; a second failure — or a failed
+    reconnect — propagates, so the caller's structured-error path
+    (ADR-023) surfaces it. Non-connection errors are never retried. Every
+    successful reconnect calls `on_reconnect(triggering_exc)` — the server
+    points that at the diagnostics ring buffer (kind=store_reconnected),
+    NOT the event log, because the log is exactly what may be broken.
+    Appends after a long idle additionally get a cheap SELECT 1 probe
+    first, so the stale connection is usually replaced before the write is
+    even attempted.
 
     Retrying an append is safe against double-commit: events carry
     UNIQUE(id, run_id), so a write that actually landed before the
     connection died re-raises as UniqueViolation — which is not retried.
 
-    Returns True when the store was wrapped; False (no-op) for SQLite, a
-    borrowed connection, or a pool — lifecycles this module doesn't own.
-    Legal HERE and only here: this is the one backend-aware module
-    (ADR-009)."""
-    try:
-        from activegraph.store.postgres import PostgresEventStore
-    except Exception:
-        return False
-    if not isinstance(store, PostgresEventStore):
-        return False
-    source = store._source
-    if getattr(source, "_owned_conn", None) is None:
-        return False
-    import psycopg
+    Returns True when armed (idempotent — never double-wraps). No-op on
+    SQLite and on stores whose connection the lab does not own
+    (pool-backed or borrowed — upstream defines those lifecycles).
+    Reaching into the store's connection internals is legal HERE and only
+    here: this is the one backend-aware module (ADR-009); the upstream
+    candidate — reconnect-with-bounded-retry belongs in the store itself —
+    is queued in LIVE_FINDINGS."""
     url = url or store_url()
+    if not url.startswith("postgres"):
+        return False
+    source = getattr(store, "_source", None)
+    if source is None or getattr(source, "_owned_conn", None) is None:
+        return False
+    if getattr(store, "_lab_reconnect_armed", False):
+        return True
+    import psycopg
     conn_errors = _connection_error_classes()
     state = {"last_op": time.monotonic()}
 
@@ -172,7 +181,10 @@ def harden_store(store, *, url: Optional[str] = None,
         # connection-class again and gets its own reconnect attempt instead
         # of wedging on a closed source.
         fresh = psycopg.connect(url, autocommit=True)
-        source.close()
+        try:
+            source.close()
+        except Exception:
+            pass
         source._owned_conn = fresh
         source._conn = fresh
         if on_reconnect is not None:
@@ -190,8 +202,11 @@ def harden_store(store, *, url: Optional[str] = None,
         except conn_errors as exc:
             _reconnect(exc)
 
-    def _wrap(name: str, *, probe: bool = False, materialize: bool = False):
-        original = getattr(store, name)
+    def _wrap(name: str, *, probe: bool = False,
+              materialize: bool = False) -> None:
+        original = getattr(store, name, None)
+        if original is None:
+            return
 
         def call(*args, **kwargs):
             if probe:
@@ -210,13 +225,15 @@ def harden_store(store, *, url: Optional[str] = None,
         setattr(store, name, call)
 
     _wrap("append", probe=True)
-    # iter_events is a generator: materialize inside the retry window so a
-    # mid-iteration connection death is retried as a whole operation (the
-    # upstream implementation already fetches all rows before yielding).
+    # iter_events is lazy — the query runs on first next(), outside any
+    # guard. Materialize inside the retry window; upstream already
+    # fetchall()s, so the memory profile is unchanged.
     _wrap("iter_events", materialize=True)
-    for name in ("get_event", "count", "truncate_after", "get_run",
-                 "upsert_run"):
-        _wrap(name)
+    for name in _STORE_OPS:
+        if name not in ("append", "iter_events"):
+            _wrap(name)
+    store._lab_reconnect_armed = True
+    return True
     return True
 
 

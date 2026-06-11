@@ -348,6 +348,7 @@ def _build_runtime():
     # is a credential (ADR-011) — log the backend name, never the URL.
     db = storage.store_url()
     _BOOT_PHASE["phase"] = "loading"
+
     if storage.store_has_run(db):
         mode = "resumed"
         # ADR-023 leaf fix: a row-level pg restore leaves the BIGSERIAL
@@ -360,6 +361,8 @@ def _build_runtime():
                   f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
                   flush=True)
         rt = Runtime.load(db, llm_provider=provider)
+        # Armed before the boot drain: a long resumed drain (LLM calls
+        # between writes) can outlive a serverless idle window too.
         _arm_store_reconnect(rt, db)
         # ADR-020: the worker defaults dark in the pack; the server boot is
         # the one place that turns it on — the live lab always runs it.
