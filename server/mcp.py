@@ -10,9 +10,9 @@ goes through the same code path as POST /chat. Auth (LAB_MCP_TOKEN) and the
 rate limiter live in server/lab_server.py (kernel, ADR-012); this module
 only sees already-authorized messages.
 
-Tool tiers (ADR-016):
+Tool tiers (ADR-016; get_errors added by ADR-023):
   READ:     get_status, get_feed, get_branch, get_pending_decisions,
-            get_post, list_posts, list_seams
+            get_post, list_posts, list_seams, get_errors
   OPERATOR: send_chat (tagged source=operator_via_mcp in the public log)
   EXCLUDED BY DESIGN: decision approval, pause/resume, seam promotion —
             the inbox is the one place only the human operator exists.
@@ -98,6 +98,21 @@ TOOLS: list[dict] = [
         "description": "Every self-modification surface: active seam versions, "
                        "their source (file|graph), and graph-code draft states.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_errors",
+        "description": "Diagnostics: the last unhandled/degraded exceptions "
+                       "(ts, class, sanitized message, request kind, related "
+                       "event ids). Volatile in-process ring buffer (ADR-023) "
+                       "— lost on restart, never authoritative.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer",
+                          "description": "Max entries, newest first (default all)."},
+            },
+            "required": [],
+        },
     },
     {
         "name": "send_chat",
@@ -258,6 +273,20 @@ def _tool_list_seams(rt, args: dict) -> dict:
     return out
 
 
+def _tool_get_errors(rt, args: dict) -> dict:
+    from server.lab_server import _ERRORS, _ERRORS_MAX
+    entries = list(reversed(_ERRORS))
+    try:
+        limit = int(args.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit > 0:
+        entries = entries[:limit]
+    return {"errors": entries, "max": _ERRORS_MAX,
+            "note": ("volatile in-process diagnostics (ADR-023): lost on "
+                     "restart, never authoritative — the event log is")}
+
+
 _READ_TOOLS = {
     "get_status": _tool_get_status,
     "get_feed": _tool_get_feed,
@@ -266,6 +295,7 @@ _READ_TOOLS = {
     "get_post": _tool_get_post,
     "list_posts": _tool_list_posts,
     "list_seams": _tool_list_seams,
+    "get_errors": _tool_get_errors,
 }
 
 
@@ -312,7 +342,9 @@ def _reply_wait_seconds(graph) -> int:
 
 def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     from lab_pack.llm import reset_llm_run_counters
-    from server.lab_server import _chat_collect_reply, _chat_post_message
+    from server.lab_server import (_chat_collect_reply_safe,
+                                   _chat_post_message, _record_error,
+                                   _submit_to_worker)
     branch_id = (args.get("branch_id") or "").strip()
     message = (args.get("message") or "").strip()
     if not branch_id or not message:
@@ -327,20 +359,54 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     if status == "archived":
         return _tool_failure(msg_id, f"branch {branch_id} is archived (not chat-able)")
     reset_llm_run_counters()
-    posted = run_on_worker(
-        lambda rt: _chat_post_message(rt, branch_id, message,
-                                      source="operator_via_mcp"))
+    try:
+        posted = run_on_worker(
+            lambda rt: _chat_post_message(rt, branch_id, message,
+                                          source="operator_via_mcp"))
+    except Exception as exc:
+        # The append phase failed — the ONE failure that may fail the
+        # request (ADR-023). Nothing user-visible committed; the response is
+        # structured and diagnosable (ADR-011 amendment: class + sanitized
+        # message), never a generic 500.
+        import traceback
+        traceback.print_exc()  # full detail to stderr only
+        e = _record_error("mcp.send_chat.append", exc)
+        return _tool_failure(
+            msg_id, f"message append failed: {e['class']}: {e['message']} "
+                    "— nothing was committed; see get_errors / /lab/errors")
     if posted is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
     # The message is committed from here on: whatever happens to the reply
-    # phase, the tool result must say so (never a generic error).
+    # phase, the tool result must say so (NEVER an error — ADR-023).
+    if posted.get("degraded"):
+        # Post-commit upkeep failed — don't block the bounded wait on a
+        # store that is already degrading; the reply job still runs on the
+        # worker (client fate irrelevant) and get_branch shows it landing.
+        _submit_to_worker(
+            lambda rt: _chat_collect_reply_safe(rt, posted["message_id"]))
+        steps = ", ".join(f"{d['kind']} ({d['class']})"
+                          for d in posted["degraded"])
+        return _tool_result(msg_id, {
+            "status": "reply_pending",
+            "detail": (f"message committed but the chat path degraded after "
+                       f"the append: {steps}. The reply is queued on the "
+                       f"worker — poll get_branch for {branch_id}; see "
+                       "get_errors for sanitized details"),
+            "degraded": posted["degraded"],
+            "branch_id": posted["branch_id"],
+            "thread_id": posted["thread_id"],
+            "message_id": posted["message_id"],
+            "message_event_ids": posted["message_event_ids"],
+        })
     try:
         reply = run_on_worker(
-            lambda rt: _chat_collect_reply(rt, posted["message_id"]),
+            lambda rt: _chat_collect_reply_safe(rt, posted["message_id"]),
             reply_wait)
-    except Exception:
-        import traceback
-        traceback.print_exc()  # details to stderr only (ADR-011)
+    except Exception as exc:
+        # Bounded-wait timeout: the job stays queued and the worker still
+        # produces the reply (ADR-023 decoupling) — report partial success.
+        _record_error("mcp.send_chat.reply_wait", exc,
+                      posted["message_event_ids"])
         reply = None
     if reply is None:
         return _tool_result(msg_id, {

@@ -184,8 +184,10 @@ def main() -> int:
         s, b = rpc(base, "tools/list")
         tools = {t["name"] for t in (b.get("result") or {}).get("tools", [])}
         expected = {"get_status", "get_feed", "get_branch", "get_pending_decisions",
-                    "get_post", "list_posts", "list_seams", "send_chat"}
-        check(tools == expected, f"exactly the 8 ADR-016 tools ({sorted(tools)})")
+                    "get_post", "list_posts", "list_seams", "get_errors",
+                    "send_chat"}
+        check(tools == expected,
+              f"exactly the 8 ADR-016 tools + get_errors (ADR-023) ({sorted(tools)})")
         gate_tools = {"approve_decision", "reject_decision", "pause", "resume",
                       "promote_seam"}
         check(not (tools & gate_tools), "no gate authority exposed (excluded by design)")
@@ -238,6 +240,10 @@ def main() -> int:
         s, _, seams = call_tool(base, "list_seams")
         check("seams" in seams or "graph_code" in seams,
               f"list_seams projects the seams view ({list(seams)[:4]})")
+
+        s, _, errs = call_tool(base, "get_errors")
+        check(s == 200 and "errors" in errs and "note" in errs,
+              "get_errors projects the diagnostics ring buffer (ADR-023)")
 
         print("== send_chat round-trip (operator authority via MCP) ==")
         s, _, out = call_tool(base, "send_chat",

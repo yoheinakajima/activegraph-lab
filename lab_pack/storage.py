@@ -63,6 +63,44 @@ def store_has_run(url: Optional[str] = None) -> bool:
         return False
 
 
+def repair_sequences(url: Optional[str] = None) -> int:
+    """Restored-lineage repair (ADR-023). A row-level pg restore (data-only
+    dump, CSV import, partial-run copy) moves the events rows but not the
+    BIGSERIAL sequence behind events.seq. When nextval is at or below
+    max(seq), every subsequent append dies with a UniqueViolation on
+    events_pkey — committed in memory, never durable. Align the sequence
+    past max(seq) before the runtime opens the store.
+
+    Postgres only (SQLite's AUTOINCREMENT derives the next rowid from the
+    table itself and cannot collide). Returns the number of sequence steps
+    skipped forward, 0 when aligned or not applicable. Touching the
+    framework's events table is legal HERE and only here: this module is the
+    one place that knows the backend (ADR-009); projections still never read
+    framework tables directly.
+    """
+    url = url or store_url()
+    if not url.startswith("postgres"):
+        return 0
+    try:
+        import psycopg
+        with psycopg.connect(url, autocommit=True) as conn:
+            max_seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
+            if not max_seq:
+                return 0
+            last, is_called = conn.execute(
+                "SELECT last_value, is_called FROM events_seq_seq").fetchone()
+            next_val = (last + 1) if is_called else last
+            if next_val > max_seq:
+                return 0
+            conn.execute("SELECT setval('events_seq_seq', %s, true)", (max_seq,))
+            return int(max_seq) - int(next_val) + 1
+    except Exception:
+        # A fresh database has no events table yet; anything else surfaces
+        # the moment the runtime opens the store. Never block boot from here.
+        return 0
+
+
 def dev_reset() -> Optional[str]:
     """Wipe the dev store. SQLite only — for Postgres, state is managed and a
     reset is a deliberate manual act (drop the `activegraph` schema), not an

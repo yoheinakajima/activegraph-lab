@@ -129,6 +129,51 @@ def link_thread_to_branch_fn(graph, thread_id: str, branch_id: str):
     return graph.add_relation(thread_id, branch_id, "discusses")
 
 
+def ensure_branch_thread_fn(graph, branch_id: str,
+                            thread_id: Optional[str] = None) -> tuple[str, bool]:
+    """Return (thread_id, created). Creates the comm_thread on first use
+    (requires the communication pack). The discusses relation is NOT written
+    here — it is post-commit upkeep relative to the message append (ADR-023),
+    so callers write it after the message lands (or compose via
+    send_branch_message_fn)."""
+    if thread_id is not None:
+        return thread_id, False
+    thread = graph.add_object("comm_thread", {
+        "channel": "lab",
+        "subject": f"branch:{branch_id}",
+        "status": "open",
+        "created_at": "",
+        "metadata": {"lab_branch_id": branch_id},
+    })
+    return thread.id, True
+
+
+def append_branch_message_fn(
+    graph,
+    branch_id: str,
+    content: str,
+    user_ref: str = "owner",
+    thread_id: str = "",
+    source: Optional[str] = None,
+):
+    """THE message append — in any chat path this is the one step whose
+    failure may fail the request (ADR-023). The message carries
+    metadata.lab_branch_id so the answer behavior's view anchors on the
+    branch. `source` tags metadata.source (ADR-016: operator_via_mcp marks
+    chats the operator's assistant sent on their behalf)."""
+    meta = {"lab_branch_id": branch_id, "thread_id_hint": thread_id}
+    if source:
+        meta["source"] = source
+    return graph.add_object("comm_message", {
+        "channel": "lab",
+        "sender_ref": user_ref,
+        "content": content,
+        "direction": "inbound",
+        "thread_id": thread_id,
+        "metadata": meta,
+    })
+
+
 def send_branch_message_fn(
     graph,
     branch_id: str,
@@ -139,33 +184,18 @@ def send_branch_message_fn(
 ):
     """Post a user message into a branch's thread (channel='lab').
 
-    Creates the comm_thread on first use (requires the communication pack) and
-    links it to the branch via discusses. The message carries
-    metadata.lab_branch_id so the answer behavior's view anchors on the branch.
-    `source` tags metadata.source (ADR-016: operator_via_mcp marks chats the
-    operator's assistant sent on their behalf). Returns (thread_id, comm_message).
+    Composes ensure_branch_thread_fn + append_branch_message_fn and links a
+    new thread to the branch via discusses. Fixtures and tests call this
+    composite; the server chat path composes the same primitives with each
+    post-commit step individually guarded (ADR-023). Returns
+    (thread_id, comm_message).
     """
-    if thread_id is None:
-        thread = graph.add_object("comm_thread", {
-            "channel": "lab",
-            "subject": f"branch:{branch_id}",
-            "status": "open",
-            "created_at": "",
-            "metadata": {"lab_branch_id": branch_id},
-        })
-        thread_id = thread.id
+    thread_id, created = ensure_branch_thread_fn(graph, branch_id, thread_id)
+    if created:
         link_thread_to_branch_fn(graph, thread_id, branch_id)
-    meta = {"lab_branch_id": branch_id, "thread_id_hint": thread_id}
-    if source:
-        meta["source"] = source
-    msg = graph.add_object("comm_message", {
-        "channel": "lab",
-        "sender_ref": user_ref,
-        "content": content,
-        "direction": "inbound",
-        "thread_id": thread_id,
-        "metadata": meta,
-    })
+    msg = append_branch_message_fn(graph, branch_id, content,
+                                   user_ref=user_ref, thread_id=thread_id,
+                                   source=source)
     return thread_id, msg
 
 
