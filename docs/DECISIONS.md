@@ -149,6 +149,8 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Accepted trade: statelessness means an authorization code cannot be marked used — replay inside its 60-second window with the same PKCE verifier mints a token. The code only ever transits the operator-initiated redirect to an allowlisted claude.ai/claude.com/localhost callback, the verifier never leaves the client, and the alternative is a token table — the thing this design exists to avoid. Likewise individual tokens cannot be revoked: revocation is rotation, which is already the lab's story.
 - Rationale: the URL-token bridge made the connector URL itself a credential; OAuth removes the secret from the URL entirely (the operator authenticates once on the authorize page) without adding storage, a framework, or any new authority. One secret still rules the surface, and the human gate (ADR-016's excluded-by-design list) is untouched.
 
+ADR-018–022: reserved for the in-flight consolidation session (charter, model routing, research worker, MCP expansion, GitHub read).
+
 ## ADR-023: Chat path failure domain — the append is the only fail point; everything else degrades, diagnosably
 
 - Status: accepted
