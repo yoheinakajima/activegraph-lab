@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Store connection resilience (ADR-009 note, ADR-023): serverless
+  Postgres (Neon) terminates idle connections; the upstream
+  PostgresEventStore holds a single boot-lifetime one, so the first
+  post-idle write died AdminShutdown and every later write died
+  OperationalError until restart. storage.harden_store wraps store
+  operations with reconnect-and-retry-once on connection-class errors
+  (constraint violations are never retried; a second failure surfaces
+  structured), records each reconnect on the ring buffer as
+  store_reconnected, and probes long-idle appends with SELECT 1. Armed
+  by the server at boot for both fresh and resumed runtimes; locked by
+  reconnect fixtures in test_postgres and test_chat_robustness. The
+  immortal-connection assumption is seeded as a keyed live finding
+  (upstream candidate: reconnect belongs in the store).
+
 - ADR-023 (the evt_1847/evt_1934 incident): the chat path's failure domain
   is now explicit — the message append is the only step that may fail a
   request, post-commit failures degrade to reply_pending + a

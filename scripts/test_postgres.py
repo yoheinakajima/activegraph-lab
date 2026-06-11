@@ -81,6 +81,77 @@ def main() -> int:
                 if d.data.get("status") == "pending"]
     check(pending2 == pending, "pending decisions survive the restart")
 
+    print("== reconnect-on-failure: serverless postgres kills idle "
+          "connections (ADR-009/023) ==")
+    import datetime
+    import uuid
+
+    import psycopg
+    from activegraph.core.event import Event
+
+    store = rt2.graph.store
+    reconnects: list[str] = []
+    check(storage.harden_store(
+              store, url=url,
+              on_reconnect=lambda exc: reconnects.append(type(exc).__name__)),
+          "harden_store wraps the postgres store")
+
+    def probe_event() -> Event:
+        return Event(id=f"evt_fixture_{uuid.uuid4().hex[:10]}",
+                     type="lab.fixture_probe", payload={"fixture": "reconnect"},
+                     timestamp=datetime.datetime.now(
+                         datetime.timezone.utc).isoformat())
+
+    def kill_backend() -> None:
+        """The Neon idle-suspend shape: the server terminates our backend;
+        the client only notices on its next statement (AdminShutdown)."""
+        pid = store._source._conn.info.backend_pid
+        with psycopg.connect(url, autocommit=True) as admin:
+            admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+
+    kill_backend()
+    ev = probe_event()
+    store.append(ev)
+    check(store.get_event(ev.id) is not None,
+          "append after a server-side kill reconnected and committed")
+    check(len(reconnects) == 1 and reconnects[-1] in ("AdminShutdown",
+                                                      "OperationalError"),
+          f"reconnect recorded the triggering error class ({reconnects})")
+
+    n_before = len(reconnects)
+    dup = probe_event()
+    store.append(dup)
+    try:
+        store.append(dup)  # same (id, run_id)
+        check(False, "duplicate append must raise UniqueViolation")
+    except psycopg.errors.UniqueViolation:
+        check(True, "constraint violation surfaces immediately")
+    except Exception as e:  # noqa: BLE001 — the class IS the assertion
+        check(False, f"duplicate append raised {type(e).__name__}, "
+                     "not UniqueViolation")
+    check(len(reconnects) == n_before,
+          "constraint violation did NOT trigger a reconnect")
+
+    kill_backend()
+    real_connect = psycopg.connect
+
+    def refuse(*_a, **_kw):
+        raise psycopg.OperationalError(
+            "connection refused [simulated unreachable database]")
+
+    psycopg.connect = refuse
+    try:
+        store.append(probe_event())
+        check(False, "double failure must surface, not retry forever")
+    except psycopg.OperationalError as e:
+        check(True, f"second failure surfaces structured ({type(e).__name__})")
+    finally:
+        psycopg.connect = real_connect
+    ev = probe_event()
+    store.append(ev)
+    check(store.get_event(ev.id) is not None,
+          "store recovers on the next operation once the database is back")
+
     print(f"\ntest_postgres: {'PASS' if not failures else 'FAIL'} "
           f"({len(failures)} failure(s))")
     return 1 if failures else 0

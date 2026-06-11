@@ -319,6 +319,19 @@ def _rebuild_lab_registries(rt) -> None:
             lb._COVERED_FINDINGS.add(tgt)
 
 
+def _arm_store_reconnect(rt, db: str) -> None:
+    """ADR-009/023: serverless Postgres kills idle connections; the store's
+    single boot-lifetime connection must survive that. Reconnects land on
+    the ring buffer (kind=store_reconnected) — never the event log, which
+    is the thing a dead connection breaks."""
+    from lab_pack import storage
+    armed = storage.harden_store(
+        rt.graph.store, url=db,
+        on_reconnect=lambda exc: _record_error("store_reconnected", exc))
+    if armed:
+        print("[lab_server] storage: reconnect-on-failure armed", flush=True)
+
+
 def _build_runtime():
     from activegraph import Runtime
     from lab_pack import storage
@@ -347,6 +360,7 @@ def _build_runtime():
                   f"(+{n_fix} steps — restored-lineage divergence, ADR-023)",
                   flush=True)
         rt = Runtime.load(db, llm_provider=provider)
+        _arm_store_reconnect(rt, db)
         # ADR-020: the worker defaults dark in the pack; the server boot is
         # the one place that turns it on — the live lab always runs it.
         load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
@@ -395,6 +409,7 @@ def _build_runtime():
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
+        _arm_store_reconnect(rt, db)
         _BOOT_PHASE["phase"] = "draining"
         rt.run_until_idle()
         rt.save_state()

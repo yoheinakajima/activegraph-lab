@@ -24,6 +24,10 @@ paths (resumed boot from a restored-shaped log, runtime worker, HTTP, MCP):
      and the reply still produced on the worker.
   4. DISCONNECT-PROOF REPLY — a client that vanishes after POSTing still
      gets its message answered exactly once.
+  5. RECONNECT — serverless postgres terminates idle connections (Neon
+     suspend); the next write after a killed store connection reconnects
+     and commits (lab_pack/storage.harden_store), recorded on /lab/errors
+     as store_reconnected. Postgres section, same SKIP rule as 1.
 
 No live LLM calls (LAB_LLM_PROVIDER=mock is forced), no network.
 
@@ -401,6 +405,34 @@ def run_postgres_leaf(pg_url: str, tmp: str) -> None:
                 in_memory = len(lab_server._rt.graph.events)
             check(durable == in_memory,
                   f"every in-memory event is durable again ({in_memory} == {durable})")
+
+            # the OTHER production leaf: serverless postgres terminates idle
+            # connections (Neon suspend). Kill the live store's backend the
+            # way the server does, then the next chat must succeed through
+            # the reconnect path, visible at /lab/errors as store_reconnected.
+            store = lab_server._rt.graph.store
+            pid = store._source._conn.info.backend_pid
+            with psycopg.connect(pg_url, autocommit=True) as admin:
+                admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            s, is_err, out = mcp_send_chat(base, branch_id,
+                                           "first chat after the idle suspend", 200)
+            check(s == 200 and not is_err
+                  and out.get("status") in ("ok", "reply_pending"),
+                  "send_chat after a killed store connection succeeds via "
+                  f"reconnect ({out.get('status') if isinstance(out, dict) else out})")
+            s, errs = get_json(base, "/lab/errors")
+            recon = [e for e in errs["errors"]
+                     if e["kind"] == "store_reconnected"]
+            check(len(recon) >= 1 and recon[-1]["class"] in
+                  ("AdminShutdown", "OperationalError"),
+                  f"/lab/errors shows store_reconnected with the triggering "
+                  f"class ({[e['class'] for e in recon]})")
+            with psycopg.connect(pg_url, autocommit=True) as conn:
+                durable = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+            with lab_server._lock:
+                in_memory = len(lab_server._rt.graph.events)
+            check(durable == in_memory,
+                  f"post-reconnect writes are durable ({in_memory} == {durable})")
         finally:
             httpd.shutdown()
             lab_server._rt = None
