@@ -319,6 +319,19 @@ def _rebuild_lab_registries(rt) -> None:
             lb._COVERED_FINDINGS.add(tgt)
 
 
+def _arm_store_reconnect(rt, db: str) -> None:
+    """ADR-009/023: serverless Postgres kills idle connections; the store's
+    single boot-lifetime connection must survive that. Reconnects land on
+    the ring buffer (kind=store_reconnected) — never the event log, which
+    is the thing a dead connection breaks."""
+    from lab_pack import storage
+    armed = storage.harden_store(
+        rt.graph.store, url=db,
+        on_reconnect=lambda exc: _record_error("store_reconnected", exc))
+    if armed:
+        print("[lab_server] storage: reconnect-on-failure armed", flush=True)
+
+
 def _build_runtime():
     from activegraph import Runtime
     from lab_pack import storage
@@ -336,17 +349,6 @@ def _build_runtime():
     db = storage.store_url()
     _BOOT_PHASE["phase"] = "loading"
 
-    def _arm_reconnect(rt_):
-        # Serverless Postgres (Neon) kills idle connections and the store's
-        # is boot-lifetime: reconnect + retry-exactly-once on connection-class
-        # errors. Each reconnect lands on the ring buffer, never the log —
-        # the log may be the thing that broke (ADR-023).
-        if storage.harden_store(rt_.graph.store,
-                                record=lambda exc: _record_error(
-                                    "store_reconnected", exc)):
-            print("[lab_server] storage: reconnect-on-failure armed "
-                  "(serverless pg idle-kills connections)", flush=True)
-
     if storage.store_has_run(db):
         mode = "resumed"
         # ADR-023 leaf fix: a row-level pg restore leaves the BIGSERIAL
@@ -361,7 +363,7 @@ def _build_runtime():
         rt = Runtime.load(db, llm_provider=provider)
         # Armed before the boot drain: a long resumed drain (LLM calls
         # between writes) can outlive a serverless idle window too.
-        _arm_reconnect(rt)
+        _arm_store_reconnect(rt, db)
         # ADR-020: the worker defaults dark in the pack; the server boot is
         # the one place that turns it on — the live lab always runs it.
         load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
@@ -410,7 +412,7 @@ def _build_runtime():
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
-        _arm_reconnect(rt)
+        _arm_store_reconnect(rt, db)
         _BOOT_PHASE["phase"] = "draining"
         rt.run_until_idle()
         rt.save_state()

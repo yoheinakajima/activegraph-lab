@@ -460,7 +460,7 @@ def run_reconnect_policy() -> None:
     st = _DyingStore(psycopg.errors.UniqueViolation(
         'duplicate key value violates unique constraint "events_pkey"'))
     check(storage.harden_store(st, url="postgres://scratch.invalid/x",
-                               record=recons.append),
+                               on_reconnect=recons.append),
           "harden_store arms an owned postgres-shaped store")
     check(storage.harden_store(st, url="postgres://scratch.invalid/x") is True,
           "arming is idempotent (no double-wrap)")
@@ -478,7 +478,7 @@ def run_reconnect_policy() -> None:
     st2 = _DyingStore(psycopg.OperationalError("the connection is closed"))
     storage.harden_store(
         st2, url="postgres://lab@scratch.invalid/x?connect_timeout=2",
-        record=recons.append)
+        on_reconnect=recons.append)
     try:
         st2.append(None)
         check(False, "double failure must surface")
@@ -574,7 +574,7 @@ def run_postgres_reconnect(pg_url: str) -> None:
 
         st.append = dying_append
         recons: list = []
-        storage.harden_store(st, url=pg_url, record=recons.append)
+        storage.harden_store(st, url=pg_url, on_reconnect=recons.append)
         try:
             st.append(None)
             check(False, "persistent connection failure must surface")
