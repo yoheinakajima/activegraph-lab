@@ -35,15 +35,17 @@ def check(cond: bool, msg: str) -> None:
         FAILURES.append(msg)
 
 
-def build_feed() -> dict:
-    """A real feed: boot the lab, leave a promote decision pending, chat once."""
+def build_bundle() -> dict:
+    """A real feed plus inspector/log fixtures: boot the lab, leave a promote
+    decision pending, chat once, then project /lab/entity and /lab/log the
+    same way the server would."""
     from lab_pack import clear_lab_registry
     from lab_pack.bundle import build_lab
     from lab_pack.llm import LabMockProvider, reset_llm_session
     from lab_pack.settings import LabSettings
     from lab_pack.tools import (activate_branch_fn, complete_task_fn,
                                 send_branch_message_fn)
-    from server.lab_server import _feed
+    from server.lab_server import _entity_projection, _feed, _log_page
 
     clear_lab_registry()
     reset_llm_session()
@@ -74,29 +76,64 @@ def build_feed() -> dict:
             rt.run_until_idle()
         send_branch_message_fn(g, proposed[0].id, "what's the state here?")
         rt.run_until_idle()
-    return _feed(rt)
+    feed = _feed(rt)
+
+    # Inspector fixtures: a branch, an observation, an artifact, and the
+    # branch's creation event — the four shapes the entity view renders.
+    branch_id = str(proposed[0].id) if proposed else feed["branches"][0]["branch"]["id"]
+    obs = next(iter(g.objects(type="observation")), None)
+    art = next(iter(g.objects(type="artifact")), None)
+    entities = {}
+    for eid in filter(None, (branch_id,
+                             str(obs.id) if obs is not None else None,
+                             str(art.id) if art is not None else None)):
+        entities[eid] = _entity_projection(g, eid)
+    event_id = (entities[branch_id] or {}).get("created", {}).get("event_id")
+    if event_id:
+        entities[event_id] = _entity_projection(g, event_id)
+    return {"feed": feed, "entities": entities, "log": _log_page(g, None, 100),
+            "branch_id": branch_id, "event_id": event_id}
 
 
-def static_fallback(feed: dict) -> None:
+def static_fallback(bundle: dict) -> None:
     """No jsdom: assert DOM structure statically + the API contract, and say so."""
     print("== check_ui: node/jsdom UNAVAILABLE — static DOM + API contract fallback ==")
+    feed = bundle["feed"]
     html = (REPO / "ui" / "index.html").read_text()
     js = (REPO / "ui" / "app.js").read_text()
     for el in ("id=\"inbox\"", "id=\"branches\"", "id=\"timeline\"",
-               "id=\"composer\"", "id=\"thread-view\"", "id=\"mission-log\""):
+               "id=\"composer\"", "id=\"thread-view\"", "id=\"mission-log\"",
+               "id=\"entity-view\"", "id=\"entity-body\"", "id=\"log-view\"",
+               "id=\"about\""):
         check(el in html, f"index.html declares {el}")
     check("/lab/feed" in js, "app.js polls /lab/feed")
     check("/lab/decision" in js, "app.js posts decisions to /lab/decision")
     check("/chat" in js, "app.js posts messages to /chat")
+    check("/lab/entity" in js, "app.js fetches /lab/entity (the inspector)")
+    check("/lab/log" in js, "app.js fetches /lab/log (the full event log)")
+    check("linkifyIds" in js and "#entity=" in js, "id linkification wired in code")
     check("decisionCard" in js and "approve" in js, "decision buttons wired in code")
     check(isinstance(feed.get("inbox"), list) and feed["inbox"],
           "feed contract: inbox is a non-empty list")
     check(isinstance(feed.get("branches"), list) and feed["branches"],
           "feed contract: branches is a non-empty list")
+    # the projection contract the inspector and log views rely on
+    ents = bundle.get("entities") or {}
+    check(ents and all(v is not None for v in ents.values()),
+          f"entity contract: {len(ents)} sample projections resolved")
+    b = ents.get(bundle.get("branch_id")) or {}
+    check(bool((b.get("relations_in") or []) or (b.get("relations_out") or [])),
+          "entity contract: branch projection carries relations")
+    ev = ents.get(bundle.get("event_id")) or {}
+    check(ev.get("kind") == "event" and bool(ev.get("summary")),
+          "entity contract: event projection has a summary + place in time")
+    rows = (bundle.get("log") or {}).get("rows") or []
+    check(bool(rows) and all((r.get("summary") or "").strip() for r in rows),
+          f"log contract: {len(rows)} rows, no blank summaries")
 
 
 def main() -> int:
-    feed = build_feed()
+    bundle = build_bundle()
     node = shutil.which("node")
     jsdom_dir = None
     if node:
@@ -106,17 +143,17 @@ def main() -> int:
                 break
     if node and jsdom_dir:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump(feed, f, default=str)
-            feed_file = f.name
+            json.dump(bundle, f, default=str)
+            bundle_file = f.name
         proc = subprocess.run(
-            [node, str(REPO / "scripts" / "check_ui.mjs"), feed_file,
+            [node, str(REPO / "scripts" / "check_ui.mjs"), bundle_file,
              str(REPO / "ui"), str(jsdom_dir)],
             capture_output=True, text=True, timeout=120)
         print(proc.stdout, end="")
         if proc.stderr.strip():
             print(proc.stderr, file=sys.stderr, end="")
         return proc.returncode
-    static_fallback(feed)
+    static_fallback(bundle)
     print(f"\ncheck_ui (static fallback): {'PASS' if not FAILURES else 'FAIL'} "
           f"({len(FAILURES)} failure(s))")
     return 1 if FAILURES else 0

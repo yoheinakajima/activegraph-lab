@@ -132,11 +132,18 @@ Both are pure functions of `graph.events` / `graph.objects` / `graph.relations`
   four sentences (mission, branches=threads, inbox=human gate, everything is an
   event; ids are clickable) plus a chip legend. No tour, no modal.
 - **Seams deep link (`#seams`)** and linkified pending decision ids.
-- **Mobile:** filter row and header meta wrap; entity tables and `<pre>` scroll
-  horizontally; all views verified at 390px.
+- **Mobile:** filter row and header meta wrap; entity tables, ids, and `<pre>`
+  blocks use `overflow-wrap: anywhere` / horizontal scroll; nothing in any view
+  has a fixed width wider than the 390px viewport (no headless browser in the
+  test environment — guarded by wrapping rules rather than pixel screenshots).
+- **Header reachability:** the mission title and the "as of evt_N" horizon
+  stamp link to their entities, so the mission object is one tap from anywhere.
 - **check_ui:** extended to render the entity view (object + event), the log
   view, assert linkified ids in the feed, prev/next presence, and that no log
-  row or entity field renders blank.
+  row or entity field renders blank. (Also fixed a latent jsdom-path failure:
+  the interleave assertion picked the first branch with ≥2 entries, which is
+  not necessarily the branch that holds the chat; it now prefers a branch with
+  mixed entry kinds. The assertion itself is unchanged.)
 
 ### Considered and rejected
 

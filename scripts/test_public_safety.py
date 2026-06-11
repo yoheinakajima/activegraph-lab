@@ -275,12 +275,19 @@ def _run() -> int:
         lab_server._mutation_times.clear()
 
     # ── the corpus: every event payload, every object, feed JSON, boot log ──
+    # The /lab/entity and /lab/log projections join it too: one entity page
+    # per object and the FULL log summary listing (pure projections, but the
+    # audit checks the outputs, not the intent).
+    from server.lab_server import _entity_projection, _log_page
     corpus = {
         "events": [{"type": str(e.type), "actor": str(e.actor),
                     "payload": e.payload} for e in g.events],
         "objects": [{"id": str(o.id), "type": str(o.type), "data": o.data}
                     for o in g.all_objects()],
         "feed": _feed(rt),
+        "entity_pages": [_entity_projection(g, str(o.id))
+                         for o in g.all_objects()],
+        "log_rows": _log_page(g, None, len(g.events)),
         "mcp": mcp_outputs,
         "mcp_url_path": url_outputs,
         "oauth": oauth_outputs,

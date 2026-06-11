@@ -662,6 +662,184 @@ def _build_entries(g, timeline=None) -> list[dict]:
     return entries
 
 
+# ─── universal entity / log projections (read-only GETs) ─────────────────────
+# Pure functions of graph state: no new state, no writes, no caches. Their
+# outputs join the sentinel audit corpus in scripts/test_public_safety.py.
+
+import re as _re
+
+_EVT_ID = _re.compile(r"evt_\d+$")
+_REF_TOKEN = _re.compile(r"\b(?:evt_\d+|[a-z][a-z0-9_]*#\d+)\b")
+
+
+def _display_title(o) -> str:
+    d = o.data or {}
+    meta = d.get("metadata") or {}
+    text = (d.get("title") or d.get("text") or d.get("statement")
+            or d.get("rationale") or d.get("content") or d.get("judgment")
+            or meta.get("seam_name") or "")
+    return _shorten(str(text), 120)
+
+
+def _event_summary(g, e) -> str:
+    """One line per event, ANY kind — the full-log view and the entity page
+    must never render blank (unknown kinds fall back to the kind name)."""
+    t = str(e.type)
+    p = e.payload or {}
+
+    def _count(key):
+        v = p.get(key)
+        return len(v) if isinstance(v, (list, tuple)) else (v or 0)
+
+    if t == "object.created":
+        obj = p.get("object") or {}
+        data = obj.get("data") or {}
+        kind = (data.get("metadata") or {}).get("lab") or data.get("kind")
+        head = _shorten(str(data.get("title") or data.get("text")
+                            or data.get("content") or ""), 90)
+        label = f"{obj.get('type')}" + (f" ({kind})" if kind else "")
+        return f"created {obj.get('id')} — {label}" + (f": {head}" if head else "")
+    if t == "patch.applied":
+        diff = p.get("diff") or {}
+        bits = []
+        for k, v in list(diff.items())[:3]:
+            if isinstance(v, dict) and "new" in v:
+                bits.append(f"{k} → {_shorten(str(v.get('new')), 40)}")
+            else:
+                bits.append(str(k))
+        return f"patched {p.get('target')}" + (f" ({'; '.join(bits)})" if bits else "")
+    if t == "relation.created":
+        rel_type, src, tgt = _decode_relation(p.get("relation") or {})
+        return f"linked {src} —{rel_type}→ {tgt}"
+    if t == "behavior.started":
+        return (f"behavior {p.get('behavior')} woke on "
+                f"{p.get('triggering_event_type')} ({p.get('triggering_object_id')})")
+    if t == "behavior.completed":
+        return (f"behavior {p.get('behavior')} finished — "
+                f"{_count('objects_created')} object(s), "
+                f"{_count('relations_created')} relation(s), "
+                f"{_count('patches_applied')} patch(es)")
+    if t == "llm.requested":
+        return f"LLM call requested by {p.get('behavior')} (model {p.get('model')})"
+    if t == "llm.responded":
+        cost = p.get("cost_usd")
+        return (f"LLM replied to {p.get('behavior')} — "
+                f"{p.get('input_tokens')} in / {p.get('output_tokens')} out tokens"
+                + (f", ${float(cost):.4f}" if cost is not None else ""))
+    if t == "pack.loaded":
+        return f"pack {p.get('name')} v{p.get('version')} loaded"
+    if t == "runtime.idle":
+        return "runtime idle — behavior cascade settled"
+    if t == "artifact.published":
+        return f"published “{p.get('title') or p.get('slug')}” → /posts/{p.get('slug')}"
+    if t == "lab.paused":
+        return "lab paused by the operator"
+    if t == "lab.resumed":
+        return "lab resumed by the operator"
+    return t  # unknown kind: labeled, never blank
+
+
+def _payload_refs(e) -> list[str]:
+    """Every object/event id referenced anywhere in the payload, deduped,
+    own id excluded — the event's onward links."""
+    blob = json.dumps(_safe(e.payload), default=str)
+    seen, out = {str(e.id)}, []
+    for m in _REF_TOKEN.findall(blob):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _entity_projection(g, entity_id: str) -> Optional[dict]:
+    """GET /lab/entity — one inspectable view for ANY id. Object ids get
+    fields + creation/patch events + decoded relations both ways; event ids
+    get the full payload + prev/next (place in time) + onward refs."""
+    if _EVT_ID.fullmatch(entity_id or ""):
+        for i, e in enumerate(g.events):
+            if str(e.id) == entity_id:
+                return {
+                    "kind": "event",
+                    "event": _event_to_dict(e),
+                    "summary": _event_summary(g, e),
+                    "index": i,
+                    "total": len(g.events),
+                    "prev_id": str(g.events[i - 1].id) if i > 0 else None,
+                    "next_id": str(g.events[i + 1].id) if i + 1 < len(g.events) else None,
+                    "refs": _payload_refs(e),
+                }
+        return None
+    o = g.get_object(entity_id) if entity_id else None
+    if o is None:
+        return None
+    created = None
+    patches = []
+    for e in g.events:
+        t = str(e.type)
+        if t == "object.created" and (e.payload.get("object") or {}).get("id") == entity_id:
+            created = {"event_id": str(e.id),
+                       "timestamp": str(e.timestamp) if e.timestamp else None,
+                       "actor": str(e.actor) if e.actor else None}
+        elif t == "patch.applied" and e.payload.get("target") == entity_id:
+            patches.append({"event_id": str(e.id),
+                            "timestamp": str(e.timestamp) if e.timestamp else None,
+                            "actor": str(e.actor) if e.actor else None,
+                            "diff": _safe(e.payload.get("diff") or {})})
+    rel_in, rel_out = [], []
+    for r in g.relations():
+        rel_type, src, tgt = _decode_relation(r)
+        if entity_id not in (src, tgt):
+            continue
+        other_id = tgt if src == entity_id else src
+        other = g.get_object(other_id)
+        link = {"type": rel_type, "other_id": other_id,
+                "other_type": str(other.type) if other is not None else None,
+                "other_title": _display_title(other) if other is not None else None}
+        (rel_out if src == entity_id else rel_in).append(link)
+    out = {
+        "kind": "object",
+        "object": _object_to_dict(o),
+        "title": _display_title(o),
+        "narration": _narrate_created(g, str(o.type), o.data, str(o.id)),
+        "created": created,
+        "patches": patches,
+        "relations_in": rel_in,
+        "relations_out": rel_out,
+    }
+    meta = o.data.get("metadata") or {}
+    if str(o.type) == "artifact" and meta.get("slug"):
+        out["slug"] = meta["slug"]
+        out["published"] = o.data.get("status") == "published"
+        if out["published"]:
+            out["post_url"] = f"/posts/{meta['slug']}"
+    return out
+
+
+def _log_page(g, before: Optional[str], limit: int) -> dict:
+    """GET /lab/log — the FULL event log (the feed shows only narrated
+    entries) as lightweight rows, cursor-paginated like /lab/entries.
+    /trace carries complete payloads (LLM prompts included) — too heavy for
+    a phone listing; this projects one line per event instead."""
+    events = g.events
+    if before:
+        cut = _event_index(before)
+        events = [e for e in events if _event_index(str(e.id)) < cut]
+    page = events[-limit:] if limit and limit > 0 else events
+    rows = [{
+        "event_id": str(e.id),
+        "timestamp": str(e.timestamp) if e.timestamp else None,
+        "actor": str(e.actor) if e.actor else None,
+        "event_type": str(e.type),
+        "summary": _event_summary(g, e),
+    } for e in page]
+    return {
+        "rows": list(reversed(rows)),  # newest first, like the feed
+        "oldest_rendered": rows[0]["event_id"] if rows else None,
+        "more": len(events) > len(page),
+        "total": len(g.events),
+    }
+
+
 def _pending_decisions(g) -> list[dict]:
     """The inbox projection: pending decisions with their evidence attached
     inline. Shared by /lab/feed and the MCP get_pending_decisions tool."""
@@ -959,6 +1137,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(_feed(rt, limit=limit))
             elif path == "/lab/entries":
                 self._handle_entries(qs)
+            elif path == "/lab/entity":
+                self._handle_entity(qs)
+            elif path == "/lab/log":
+                self._handle_log(qs)
             elif path == "/lab/stream":
                 self._handle_stream()
             elif path == "/lab/draft":
@@ -1118,6 +1300,29 @@ class Handler(BaseHTTPRequestHandler):
             "oldest_rendered": page[0]["event_id"] if page else None,
             "more": len(entries) > len(page),
         })
+
+    # ── GET /lab/entity?id= (universal inspector projection) ────────────────
+
+    def _handle_entity(self, qs: dict):
+        rt = _get_rt()
+        entity_id = (qs.get("id") or "").strip()
+        if not entity_id:
+            self._send_error_json("id is required", 400)
+            return
+        with _lock:
+            out = _entity_projection(rt.graph, entity_id)
+        if out is None:
+            self._send_error_json(f"no such entity: {entity_id}", 404)
+            return
+        self._send_json(out)
+
+    # ── GET /lab/log (the full event log, lightweight rows) ─────────────────
+
+    def _handle_log(self, qs: dict):
+        rt = _get_rt()
+        limit = max(1, min(int(qs.get("limit", 100)), 500))
+        with _lock:
+            self._send_json(_log_page(rt.graph, qs.get("before"), limit))
 
     # ── GET /lab/stream (6a: SSE) ───────────────────────────────────────────
 

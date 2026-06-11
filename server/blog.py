@@ -364,36 +364,53 @@ def index_page(graph, *, status_line: str = "") -> str:
                    status_line=status_line)
 
 
-def _work_section(prov: dict) -> str:
+def _entity_link(entity_id: str, label: Optional[str] = None) -> str:
+    """An id rendered on the blog links into the notebook's inspector — the
+    provenance chain is walkable by click, not just readable."""
+    eid = html.escape(str(entity_id))
+    return f'<a href="/lab#entity={eid}">{html.escape(label or str(entity_id))}</a>'
+
+
+def _work_section(prov: dict, artifact_id: Optional[str] = None) -> str:
     """2b: 'Show the work' — rendered from the provenance subgraph. Public,
-    server-rendered, no token needed."""
+    server-rendered, no token needed. Every id is a link into the live
+    notebook's inspector (/lab#entity=<id>)."""
     parts = ['<section class="work"><h2>Show the work</h2>']
+    if artifact_id:
+        parts.append(
+            f'<p class="ref">This post is artifact {_entity_link(artifact_id)} '
+            'in the lab’s public event log; every reference below opens '
+            'in the live notebook.</p>')
     b = prov.get("branch")
     if b:
         parts.append(
             f'<p>Originating branch: <a href="/lab#branch={html.escape(b["id"])}">'
             f'{html.escape(b["title"] or b["id"])}</a> '
-            f'<span class="ref">({html.escape(b["status"] or "")})</span></p>')
+            f'<span class="ref">({html.escape(b["status"] or "")} · '
+            f'{_entity_link(b["id"], "inspect " + b["id"])})</span></p>')
     if prov.get("evidence"):
         parts.append("<h3>Evidence</h3>")
         for e in prov["evidence"]:
             parts.append(f'<div class="item">{html.escape(e["text"])}'
-                         f'<div class="ref">{html.escape(e["type"])} {html.escape(e["id"])}</div></div>')
+                         f'<div class="ref">{html.escape(e["type"])} '
+                         f'{_entity_link(e["id"])}</div></div>')
     if prov.get("chat"):
         parts.append("<h3>Conversation on this branch</h3>")
         for m in prov["chat"]:
             parts.append(f'<div class="item"><span class="who">{html.escape(m["who"])}:</span> '
-                         f'{html.escape(m["text"])}</div>')
+                         f'{html.escape(m["text"])}'
+                         f'<div class="ref">{_entity_link(m["id"])}</div></div>')
     d = prov.get("decision")
     if d:
         parts.append(f'<h3>The publish decision</h3><div class="item">'
                      f'{html.escape(d["rationale"] or "")}'
-                     f'<div class="ref">{html.escape(d["id"])}</div></div>')
+                     f'<div class="ref">{_entity_link(d["id"])}</div></div>')
     if prov.get("prior_drafts"):
         parts.append("<h3>Prior draft versions</h3>")
         for p in prov["prior_drafts"]:
             parts.append(f'<div class="item">{html.escape(p["title"] or p["id"])} '
-                         f'<span class="ref">({html.escape(p["status"] or "")})</span></div>')
+                         f'<span class="ref">({html.escape(p["status"] or "")} · '
+                         f'{_entity_link(p["id"])})</span></div>')
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -413,7 +430,7 @@ def post_page(graph, slug: str, *, status_line: str = "") -> Optional[str]:
         f'<h1>{html.escape(artifact.data.get("title") or slug)}</h1>'
         + render_markdown(content)
         + "</article>"
-        + _work_section(provenance(graph, artifact)))
+        + _work_section(provenance(graph, artifact), artifact_id=str(artifact.id)))
     return _layout(artifact.data.get("title") or slug, body, status_line=status_line)
 
 

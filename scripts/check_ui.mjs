@@ -10,12 +10,15 @@ import { readFileSync } from "fs";
 import { createRequire } from "module";
 import path from "path";
 
-const [feedFile, uiDir, jsdomDir] = process.argv.slice(2);
+const [bundleFile, uiDir, jsdomDir] = process.argv.slice(2);
 const require = createRequire(
   jsdomDir ? path.join(jsdomDir, "/") : import.meta.url);
 const { JSDOM } = require("jsdom");
 
-const feed = JSON.parse(readFileSync(feedFile, "utf8"));
+const bundle = JSON.parse(readFileSync(bundleFile, "utf8"));
+const feed = bundle.feed || bundle; // bundle: {feed, entities, log, …}
+const entities = bundle.entities || {};
+const logPage = bundle.log || { rows: [], total: 0, more: false };
 const html = readFileSync(path.join(uiDir, "index.html"), "utf8")
   .replace(/<script src="\/app\.js"><\/script>/, "");
 const appJs = readFileSync(path.join(uiDir, "app.js"), "utf8");
@@ -35,6 +38,13 @@ window.fetch = async (url, opts = {}) => {
     return { ok: true, status: 200, json: async () => ({ status: "ok" }) };
   }
   if (url === "/lab/feed") return { ok: true, json: async () => feed };
+  if (url.startsWith("/lab/entity?id=")) {
+    const id = decodeURIComponent(url.slice("/lab/entity?id=".length));
+    const d = entities[id];
+    if (d) return { ok: true, status: 200, json: async () => d };
+    return { ok: false, status: 404, json: async () => ({ error: "no such entity" }) };
+  }
+  if (url.startsWith("/lab/log")) return { ok: true, status: 200, json: async () => logPage };
   return { ok: false, status: 404, json: async () => ({}) };
 };
 
@@ -76,8 +86,19 @@ const blanks = [...doc.querySelectorAll(".entry .text")]
   .filter((n) => !n.textContent.trim());
 check(blanks.length === 0, `no entry renders blank (${blanks.length} blank)`);
 
+console.log("== universal id links ==");
+check(!!doc.querySelector('a[href^="#entity="]'),
+  "feed renders id links into the inspector");
+const chips = [...doc.querySelectorAll(".entry .when")];
+check(chips.length > 0 && chips.every((n) => n.querySelector('a[href^="#entity="]')),
+  `every entry's event-id chip is a link (${chips.length} chips)`);
+
 console.log("== thread view ==");
-const richBranch = feed.branches.find((b) => b.entries.length >= 2) || feed.branches[0];
+const entryKind = (e) => e.sentence.includes(" said: ") ? "user"
+  : e.sentence.startsWith("Lab replied") ? "lab" : "run";
+const richBranch =
+  feed.branches.find((b) => new Set(b.entries.map(entryKind)).size >= 2)
+  || feed.branches.find((b) => b.entries.length >= 2) || feed.branches[0];
 const group = doc.querySelector(`[data-branch-id="${richBranch.branch.id}"]`);
 group.click();
 await new Promise((r) => setTimeout(r, 50));
@@ -118,6 +139,54 @@ check(!!hit && hit.body.decision_id === decisionId && hit.body.approved === true
   `approve button POSTs {decision_id: ${decisionId}, approved: true} to /lab/decision`);
 check(!!hit && hit.headers && hit.headers.Authorization === "Bearer test-operator-token",
   "mutation carries the Bearer header");
+
+console.log("== inspector: object entity (#entity=<id>) ==");
+const branchId = bundle.branch_id;
+window.location.hash = `#entity=${branchId}`;
+await new Promise((r) => setTimeout(r, 80));
+check(doc.getElementById("entity-view").hidden === false,
+  `#entity=${branchId} deep-links into the inspector`);
+const ebody = doc.getElementById("entity-body");
+check(!!ebody.querySelector(".entity-id"), "inspector shows the entity header");
+check(ebody.querySelectorAll("table.fields tr").length > 0,
+  "inspector renders the object's fields");
+check(!!ebody.querySelector('.rel-row a[href^="#entity="]'),
+  "inspector renders relations as links");
+check(!!ebody.querySelector("details.raw pre.json"),
+  "inspector carries the raw JSON");
+check(!!ebody.querySelector(`a[href="#branch=${branchId}"]`),
+  "branch entity links back to its thread");
+
+console.log("== inspector: event entity (place in time) ==");
+const eventId = bundle.event_id;
+window.location.hash = `#entity=${eventId}`;
+await new Promise((r) => setTimeout(r, 80));
+check(doc.getElementById("entity-view").hidden === false,
+  `#entity=${eventId} renders the event view`);
+const nav = ebody.querySelector(".entity-nav");
+check(!!nav && nav.children.length === 2,
+  "event view has prev/next place-in-time navigation");
+check((ebody.querySelector(".entity-narration") || {}).textContent?.trim().length > 0,
+  "event view narrates a non-blank summary");
+check(!!ebody.querySelector("details.raw pre.json"), "event view carries raw event JSON");
+
+console.log("== the full event log (#log) ==");
+window.location.hash = "#log";
+await new Promise((r) => setTimeout(r, 80));
+check(doc.getElementById("log-view").hidden === false, "#log deep-links the event log");
+const rows = [...doc.querySelectorAll("#log-body .log-row")];
+check(rows.length === logPage.rows.length && rows.length > 0,
+  `log renders one row per event (${rows.length}/${logPage.rows.length})`);
+check(rows.every((n) => n.querySelector(".text").textContent.trim()),
+  "no log row renders blank (unknown kinds fall back to the kind name)");
+check(rows.every((n) => n.querySelector('a[href^="#entity="]')),
+  "every log row links into the inspector");
+
+console.log("== back to the feed ==");
+window.location.hash = "";
+await new Promise((r) => setTimeout(r, 80));
+check(doc.getElementById("feed-view").hidden === false, "clearing the hash returns to the feed");
+check(!!doc.getElementById("about"), "orientation strip present on the feed");
 
 console.log(`\ncheck_ui (jsdom): ${failures.length === 0 ? "PASS" : "FAIL"} (${failures.length} failure(s))`);
 process.exit(failures.length === 0 ? 0 : 1);
