@@ -264,6 +264,24 @@ LIVE_FINDINGS: list[dict] = [
             "a generic error when only the reply phase fails."
         ),
     },
+    {
+        "key": "paused_boot_dead_worker",
+        "text": (
+            "Finding: a process that inherited paused=true from the migrated "
+            "log booted with a dead worker. The resumed-boot path only drained "
+            "the runtime when findings were backfilled, so the replay-requeued "
+            "backlog (every event after the log's last runtime.idle — here the "
+            "pre-migration lab.paused at evt_1702) sat parked from boot "
+            "(evt_1845) onward; the operator's resume (evt_1846) appended a "
+            "marker no run cycle picked up, and the next message (evt_1847) "
+            "drew no reply and no llm.requested, while a process that booted "
+            "unpaused had answered the identical message in seconds the same "
+            "day (evt_1590→evt_1616). Diagnosed entirely from public log "
+            "forensics over MCP. Fix: the boot run cycle always happens and "
+            "resume drains immediately — paused gates which behaviors fire "
+            "(everything but answer idles), never whether the worker runs."
+        ),
+    },
 ]
 
 

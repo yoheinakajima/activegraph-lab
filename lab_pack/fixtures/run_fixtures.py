@@ -756,6 +756,126 @@ def run_operator_controls() -> bool:
     return c.done("operator_controls")
 
 
+def run_paused_boot() -> bool:
+    spec = _load("paused_boot.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: paused_boot — a paused log boots with a live worker")
+    print("=" * 64)
+
+    import os
+    import tempfile
+
+    import lab_pack.llm as llm_mod
+    from lab_pack.bundle import build_lab
+    from lab_pack.llm import (LabProviderWrapper, _lab_prompt_bodies,
+                              lab_paused, reset_llm_run_counters,
+                              reset_llm_session, set_lab_paused)
+    from server import lab_server
+
+    tmp = tempfile.mkdtemp(prefix="lab-paused-boot-")
+    db = os.path.join(tmp, "lab.sqlite")
+
+    def wrapped_mock():
+        return LabProviderWrapper(LabMockProvider(), max_total=60,
+                                  max_per_behavior=10,
+                                  prompt_bodies=_lab_prompt_bodies())
+
+    def add_claim(g, mission_id, i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission_id},
+        })
+
+    # ── phase 1: the "migrated" log — its tail is lab.paused plus a trigger
+    # appended after the last runtime.idle (so Runtime.load requeues it) ─────
+    clear_lab_registry()
+    reset_llm_session()
+    rt = build_lab(llm_provider=wrapped_mock(),
+                   lab_settings=LabSettings(drafts_dir=tmp,
+                                            **(spec.get("settings") or {})),
+                   persist_to=db)
+    rt.run_until_idle()
+    g = rt.graph
+    mission_id = str(g.objects(type="mission")[0].id)
+    branch_id = str(next(b for b in g.objects(type="branch")).id)
+    proposed_before = len([b for b in g.objects(type="branch")
+                           if b.data.get("status") == "proposed"])
+    set_lab_paused(g, True)
+    add_claim(g, mission_id, 1)  # no drain: stranded, exactly like a shutdown
+    rt.save_state()
+    del rt
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    # ── phase 2: boot through the server's REAL resumed path, paused inherited
+    saved_env = {k: os.environ.get(k) for k in
+                 ("ACTIVEGRAPH_DB", "ACTIVEGRAPH_MEMORY_DB",
+                  "LAB_DATABASE_URL", "DATABASE_URL")}
+    real_select = llm_mod.select_lab_provider
+    try:
+        os.environ["ACTIVEGRAPH_DB"] = db
+        os.environ["ACTIVEGRAPH_MEMORY_DB"] = os.path.join(tmp, "memory.sqlite")
+        os.environ.pop("LAB_DATABASE_URL", None)
+        os.environ.pop("DATABASE_URL", None)
+        # The keyless default is a BARE mock (no pause/budget gate); boot must
+        # see the wrapped provider the live server gets.
+        llm_mod.select_lab_provider = lambda **_kw: (
+            wrapped_mock(), {"mode": "mock", "provider": "mock", "model": None})
+        clear_lab_registry()
+        reset_llm_session()
+        rt2 = lab_server._build_runtime()
+    finally:
+        llm_mod.select_lab_provider = real_select
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    g2 = rt2.graph
+
+    c.that(lab_paused(), "paused state rebuilt from the log before the boot drain")
+    depth = rt2.status().queue_depth
+    c.that(depth == exp["queue_depth_after_boot"],
+           f"boot run cycle drained the replay-requeued backlog "
+           f"(queue_depth {depth}, want {exp['queue_depth_after_boot']})")
+    proposed_boot = len([b for b in g2.objects(type="branch")
+                         if b.data.get("status") == "proposed"])
+    c.that(proposed_boot - proposed_before == exp["proposed_while_paused"],
+           f"paused gates plan during the boot drain "
+           f"({proposed_boot - proposed_before} new proposals while paused)")
+    print(f"  paused boot: queue_depth={depth}, "
+          f"{proposed_boot - proposed_before} proposals (worker live, behaviors gated)")
+
+    # ── answer still replies on a process that booted into paused ───────────
+    out = lab_server._chat_job(rt2, branch_id, "are you alive in there?")
+    c.that(out is not None and "as of event" in (out.get("content") or ""),
+           "answer replies on a paused boot (the operator can always talk)")
+
+    # ── resume takes effect in the running process — no restart ─────────────
+    res = lab_server._pause_job(rt2, False)
+    c.that(res.get("changed") is True and not lab_paused()
+           and any(str(e.type) == "lab.resumed" for e in g2.events),
+           "resume appends lab.resumed, flips in-process state, and drains")
+    add_claim(g2, mission_id, 2)
+    reset_llm_run_counters()
+    rt2.run_until_idle()
+    proposed_now = len([b for b in g2.objects(type="branch")
+                        if b.data.get("status") == "proposed"])
+    c.that(proposed_now - proposed_boot == exp["resumed_proposes"],
+           f"autonomous behavior fires after resume "
+           f"({proposed_now - proposed_boot} new proposal)")
+    print(f"  resumed in-process: claim → {proposed_now - proposed_boot} proposed branch")
+
+    # ── the incident is itself a queued finding (requirement: forensics) ────
+    c.that(any((o.data.get("metadata") or {}).get("finding_key")
+               == "paused_boot_dead_worker"
+               for o in g2.objects(type="observation")),
+           "paused-boot incident queued as a finding (LIVE_FINDINGS)")
+    return c.done("paused_boot")
+
+
 def run_seams() -> bool:
     spec = _load("seams.yaml")
     print("\n" + "=" * 64)
@@ -1092,6 +1212,7 @@ def run_all() -> None:
         run_draft_writer(),
         run_editorial(),
         run_operator_controls(),
+        run_paused_boot(),
         run_seams(),
         run_graph_code(),
         run_compat_regression(),

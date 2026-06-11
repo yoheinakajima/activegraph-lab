@@ -59,6 +59,9 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "max_drafts_pending",
     # Operator controls (ADR-015): the daily cost ceiling.
     "daily_cost_cap_usd",
+    # MCP surface (ADR-016): send_chat's bounded reply wait — client-facing
+    # latency policy, not auth, gating, or budget.
+    "mcp_reply_wait_seconds",
 })
 
 # Word-ish boundary match so "lab_pack.kernel" hits imports, attribute

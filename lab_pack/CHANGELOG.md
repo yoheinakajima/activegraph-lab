@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- MCP send_chat's reply wait is now a setting, `mcp_reply_wait_seconds`
+  (default 15, seam-whitelisted): the fixed 60s wait exceeded claude.ai's
+  client-side tool timeout, so the client errored before the structured
+  `reply_pending` partial could be returned. The bound now comes in under
+  the client's; a slow-reply test locks reply_pending-within-the-bound.
+- Paused-boot fix (the evt_1702/1845/1846/1847 incident): the boot run
+  cycle ALWAYS happens — pause state is rebuilt from the log BEFORE the
+  first drain, the replay-requeued backlog is processed at boot, and
+  resume drains immediately so lab.resumed takes effect in the running
+  process. Paused gates which behaviors fire (everything but answer
+  idles), never whether the worker runs. Locked by the new paused_boot
+  fixture; the incident is queued as a live finding (diagnosed entirely
+  from public log forensics over MCP).
+
 - MCP send_chat hardening (ADR-016): the chat path is split into a commit
   phase (message lands and saves) and a bounded reply phase; when the reply
   misses the wait or the reply phase fails, the tool returns a structured
