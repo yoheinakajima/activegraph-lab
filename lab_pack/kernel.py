@@ -41,6 +41,13 @@ KERNEL_MANIFEST: tuple[str, ...] = (
     "sys.modules",
 )
 
+# Absolute daily LLM spend ceiling (ADR-019). This is KERNEL: not a setting,
+# not seam-eligible, not MCP-modifiable. Every cap mechanism — the settings
+# default, an approved setting.daily_cost_cap_usd seam, the MCP set_budget
+# operator control (ADR-021) — clamps to this value at the enforcement
+# point in the budget path. Raising it is a git change, never a graph one.
+ABSOLUTE_DAILY_COST_CEILING_USD: float = 100.00
+
 # Settings that MAY be overridden through seams (ADR-012). Everything not
 # listed is kernel-adjacent: auth, gating, LLM call budgets, and loader
 # behavior are not seams. The daily COST ceiling is deliberately
@@ -57,8 +64,16 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "digest_min_findings",
     "research_min_evidence",
     "max_drafts_pending",
-    # Operator controls (ADR-015): the daily cost ceiling.
+    # Operator controls (ADR-015): the daily cost ceiling (clamped to the
+    # ABSOLUTE_DAILY_COST_CEILING_USD kernel constant, ADR-019).
     "daily_cost_cap_usd",
+    # Model routing (ADR-019): per-behavior model selection. Dots map to
+    # underscores on the LabSettings field (model.plan → model_plan).
+    "model.plan",
+    "model.interpret",
+    "model.draft_writer",
+    "model.answer",
+    "model.default",
     # MCP surface (ADR-016): send_chat's bounded reply wait — client-facing
     # latency policy, not auth, gating, or budget.
     "mcp_reply_wait_seconds",

@@ -328,6 +328,16 @@ def load_lab_packs(
     rt.load_pack(research_pack, settings=ResearchSettings())
     rt.load_pack(codebase_pack, settings=CodebaseSettings())
     rt.load_pack(lab_pack, settings=lab_settings or LabSettings())
+    # The loader registered fresh canonical copies of the lab behaviors;
+    # bind them so seam hot-loads and model routing reach the live runtime.
+    from .behaviors import bind_live_behaviors
+    bind_live_behaviors(rt)
+    # ADR-019: stamp the per-behavior model resolution onto the live
+    # behaviors (the runtime records behavior.model on llm.requested).
+    # Resumed boots re-stamp with seam overrides via seams.apply_approved.
+    from .llm import active_provider
+    from .seams import apply_model_routing
+    apply_model_routing(rt.graph, active_provider() or rt.llm_provider)
 
 
 if __name__ == "__main__":

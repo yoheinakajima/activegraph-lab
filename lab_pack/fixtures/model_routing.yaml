@@ -1,0 +1,20 @@
+# Model routing + budget defaults fixture (ADR-019): two behaviors resolve
+# different models and llm.requested records the per-behavior resolution;
+# a setting.model.* seam override takes effect without restart; every cost
+# cap mechanism clamps to the kernel ABSOLUTE_DAILY_COST_CEILING_USD.
+
+settings:
+  crawl_enabled: false
+
+mission:
+  title: Routing mission
+
+cases:
+  answer_override_model: mock-fast-1
+  cost_cap_seam_body: "250"
+
+expected_outputs:
+  default_plan_model: claude-opus-4-8
+  default_answer_model: claude-sonnet-4-20250514
+  daily_cost_cap_default: 50.0
+  absolute_ceiling: 100.0

@@ -23,7 +23,7 @@ from packs.tool_gateway import pack as tg_pack, ToolGatewaySettings
 from packs.communication import pack as comm_pack, CommunicationSettings
 
 from lab_pack import pack as lab_pack, LabSettings
-from lab_pack.behaviors import clear_lab_registry
+from lab_pack.behaviors import bind_live_behaviors, clear_lab_registry
 from lab_pack.llm import LabMockProvider
 from lab_pack.tools import (
     activate_branch_fn,
@@ -53,6 +53,7 @@ def _new_runtime(spec: dict, *, with_gateway: bool, with_comm: bool) -> Runtime:
     if with_comm:
         rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)  # seam hot-loads must reach the runtime's copies
     return rt
 
 
@@ -363,6 +364,7 @@ def run_draft_writer() -> bool:
     rt = Runtime(Graph(), llm_provider=LabMockProvider())
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    bind_live_behaviors(rt)
     g = rt.graph
 
     m = spec["mission"]
@@ -509,6 +511,7 @@ def run_editorial() -> bool:
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**settings))
+    bind_live_behaviors(rt)
     g = rt.graph
     mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
     rt.run_until_idle()
@@ -673,6 +676,7 @@ def run_operator_controls() -> bool:
     rt.load_pack(core_pack, settings=CoreSettings())
     rt.load_pack(comm_pack, settings=CommunicationSettings())
     rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
     g = rt.graph
     mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
     branch = create_branch_fn(g, mission.id, "Control branch", "talk here",
@@ -920,6 +924,10 @@ def run_seams() -> bool:
     # approved body is the PREFIX of the live description.
     c.that(plan_b.description.startswith(case["v1_body"]),
            "hot-load: live behavior uses the approved body without restart")
+    # The runtime registers a fresh canonical copy — the hot-load must reach
+    # THAT object, not just the module original (found via ADR-019 routing).
+    c.that(rt.get_behavior("lab.plan").description.startswith(case["v1_body"]),
+           "hot-load reaches the runtime's registered behavior copy")
 
     # ── version monotonicity: v2 supersedes ────────────────────────────────
     a2 = propose_seam_fn(g, case["seam_name"], case["v2_body"], "fixture v2")
@@ -1008,6 +1016,115 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_model_routing() -> bool:
+    spec = _load("model_routing.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: model_routing — per-behavior models, hot reroute, ceiling clamp")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.kernel import ABSOLUTE_DAILY_COST_CEILING_USD
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper,
+                              _lab_prompt_bodies, current_cost_cap,
+                              reset_llm_session)
+    from lab_pack.seams import apply_model_routing, propose_seam_fn
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Routing branch", "talk here",
+                              status="active")
+    rt.run_until_idle()
+    routed = apply_model_routing(g)
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    cases = spec["cases"]
+
+    def behavior(name):
+        # The runtime's REGISTERED copy — the object prompt assembly reads.
+        return rt.get_behavior(f"lab.{name}")
+
+    def llm_requested(behavior_name):
+        return [e for e in g.events if str(e.type) == "llm.requested"
+                and str(e.payload.get("behavior", "")).endswith(behavior_name)]
+
+    # ── two behaviors resolve different models ──────────────────────────────
+    c.that(routed.get("plan") == exp["default_plan_model"]
+           and routed.get("answer") == exp["default_answer_model"],
+           f"plan and answer resolve different models ({routed})")
+    c.that(behavior("plan").model == exp["default_plan_model"]
+           and behavior("answer").model == exp["default_answer_model"],
+           "resolution is stamped onto behavior.model")
+
+    # ── llm.requested records the per-behavior resolution ──────────────────
+    g.add_object("observation", {
+        "text": "Claim: the runtime replays every event deterministically.",
+        "confidence": 0.7, "category": "fact",
+        "metadata": {"lab": "site_claim", "mission_id": mission.id},
+    })
+    rt.run_until_idle()
+    _, msg = send_branch_message_fn(g, branch.id, "what model are you on?")
+    rt.run_until_idle()
+    plan_reqs = llm_requested("plan")
+    answer_reqs = llm_requested("answer")
+    c.that(bool(plan_reqs) and plan_reqs[-1].payload.get("model")
+           == exp["default_plan_model"],
+           f"llm.requested records plan's routed model "
+           f"({plan_reqs[-1].payload.get('model') if plan_reqs else None})")
+    c.that(bool(answer_reqs) and answer_reqs[-1].payload.get("model")
+           == exp["default_answer_model"],
+           f"llm.requested records answer's routed model "
+           f"({answer_reqs[-1].payload.get('model') if answer_reqs else None})")
+    print(f"  plan → {routed.get('plan')}; answer → {routed.get('answer')} "
+          "(both on llm.requested)")
+
+    # ── seam override takes effect without restart ──────────────────────────
+    a = propose_seam_fn(g, "setting.model.answer",
+                        cases["answer_override_model"], "fixture reroute")
+    rt.run_until_idle()
+    d = next(x for x in g.objects(type="decision")
+             if x.data.get("subject_ref") == a.id and x.data.get("status") == "pending")
+    approve_decision_fn(g, d.id, True, "fixture approve")
+    rt.run_until_idle()
+    c.that(behavior("answer").model == cases["answer_override_model"],
+           f"approved model seam hot-reroutes answer "
+           f"({behavior('answer').model})")
+    n_before = len(llm_requested("answer"))
+    send_branch_message_fn(g, branch.id, "and now?")
+    rt.run_until_idle()
+    answer_reqs = llm_requested("answer")
+    c.that(len(answer_reqs) > n_before and answer_reqs[-1].payload.get("model")
+           == cases["answer_override_model"],
+           "post-approval llm.requested records the rerouted model")
+    c.that(behavior("plan").model == exp["default_plan_model"],
+           "other behaviors keep their own routing")
+    print(f"  seam reroute: answer → {behavior('answer').model}, no restart")
+
+    # ── budget defaults + the kernel ceiling clamp ──────────────────────────
+    c.that(LabSettings().daily_cost_cap_usd == exp["daily_cost_cap_default"],
+           f"daily_cost_cap_usd default is {exp['daily_cost_cap_default']}")
+    c.that(ABSOLUTE_DAILY_COST_CEILING_USD == exp["absolute_ceiling"],
+           "kernel ceiling constant present")
+    reset_llm_session()
+    wrapper = LabProviderWrapper(LabMockProvider(), max_daily_cost_usd=500.0,
+                                 prompt_bodies=_lab_prompt_bodies())
+    c.that(wrapper.effective_cost_cap() == exp["absolute_ceiling"],
+           f"settings cap 500 clamps to the ceiling "
+           f"({wrapper.effective_cost_cap()})")
+    _LLM_STATE["cost_cap_override"] = 250.0  # an approved seam body of "250"
+    c.that(wrapper.effective_cost_cap() == exp["absolute_ceiling"],
+           "seam override 250 clamps to the ceiling")
+    c.that(current_cost_cap(500.0) == exp["absolute_ceiling"],
+           "display path clamps identically")
+    _LLM_STATE["cost_cap_override"] = 25.0
+    c.that(wrapper.effective_cost_cap() == 25.0,
+           "caps under the ceiling pass through unclamped")
+    reset_llm_session()
+    print(f"  ceiling: 500/250 → {exp['absolute_ceiling']}; 25 → 25")
+    return c.done("model_routing")
+
+
 def run_charter() -> bool:
     spec = _load("charter.yaml")
     print("\n" + "=" * 64)
@@ -1029,7 +1146,9 @@ def run_charter() -> bool:
     file_body = charter_file_default()
 
     def desc(name):
-        return next(b for b in lb.BEHAVIORS if b.name == name).description
+        # The runtime's REGISTERED copy (the loader registers fresh
+        # canonical-named behaviors; the original is only the template).
+        return rt.get_behavior(f"lab.{name}").description
 
     def add_claim(i):
         g.add_object("observation", {
@@ -1338,6 +1457,7 @@ def run_all() -> None:
         run_paused_boot(),
         run_seams(),
         run_charter(),
+        run_model_routing(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

@@ -99,6 +99,59 @@ def composed_description(behavior_name: str, prompt_body: str,
         return prompt_body
     return prompt_body + charter_block(charter_version, charter_text)
 
+
+# ── model routing (ADR-019) ──────────────────────────────────────────────────
+# Per-behavior model selection as seam settings (setting.model.<behavior>,
+# setting.model.default). The resolution is stamped onto behavior.model —
+# the attribute the runtime reads at prompt assembly and records natively
+# on every llm.requested event, so the per-behavior resolution is in the
+# log without any lab-side event plumbing. Cost accounting stays the
+# runtime's native per-model reporting (cost_usd on llm.responded).
+
+MODEL_ROUTED_BEHAVIORS = ("plan", "interpret", "draft_writer", "answer")
+
+
+def resolve_behavior_model(graph, behavior_name: str) -> str:
+    """The model a lab llm_behavior should run: approved seam override,
+    else the LabSettings default; behaviors without their own routing
+    entry resolve through model.default."""
+    from .settings import LabSettings
+    defaults = LabSettings()
+    key = (f"model.{behavior_name}" if behavior_name in MODEL_ROUTED_BEHAVIORS
+           else "model.default")
+    return str(effective_setting(graph, defaults, key)
+               or defaults.model_default).strip()
+
+
+def apply_model_routing(graph, provider: Any = None) -> dict[str, str]:
+    """Stamp the per-behavior model resolution onto the live behaviors —
+    at boot (after apply_approved) and on setting.model.* hot-loads, so a
+    seam override takes effect without restart. A model the active provider
+    does not recognize is skipped (the provider default stays), never an
+    error: cross-provider misconfiguration must not kill the worker.
+    Returns {behavior: model} actually applied."""
+    from . import behaviors as lb
+    applied: dict[str, str] = {}
+    for name in MODEL_ROUTED_BEHAVIORS:
+        model = resolve_behavior_model(graph, name)
+        if not model:
+            continue
+        if provider is not None:
+            try:
+                if not provider.recognizes_model(model):
+                    continue
+            except Exception:
+                pass
+        # Module original and the runtime's registered copy alike — the
+        # runtime reads ITS copy's .model at prompt assembly.
+        for b in lb.behaviors_named(name):
+            try:
+                setattr(b, "model", model)
+            except Exception:
+                object.__setattr__(b, "model", model)
+            applied[name] = model
+    return applied
+
 # resolve() cache: seam_name -> (version, body) | None (= file default).
 # Invalidated by hot_load on approval and by clear_seam_cache().
 _CACHE: dict[str, Optional[tuple[int, str]]] = {}
@@ -222,14 +275,18 @@ def active_version(graph, seam_name: str) -> int:
 
 def effective_setting(graph, settings: Any, name: str) -> Any:
     """A whitelisted setting's value: approved seam override, else the
-    pydantic settings value. The override is coerced to the settings field's
-    own type (int or float); an uncoercible body falls back to the default."""
-    default = getattr(settings, name)
+    pydantic settings value. Dotted seam names map to underscored fields
+    (model.plan → model_plan, ADR-019). The override is coerced to the
+    settings field's own type (str, int, or float); an uncoercible or empty
+    body falls back to the default."""
+    default = getattr(settings, name.replace(".", "_"))
     if name not in SEAM_ELIGIBLE_SETTINGS:
         return default
     version, body = resolve(graph, f"setting.{name}", None)
     if version == 0 or body is None:
         return default
+    if isinstance(default, str):
+        return str(body).strip() or default
     try:
         caster = float if isinstance(default, float) else int
         return caster(str(body).strip())
@@ -278,6 +335,10 @@ def hot_load(graph, artifact_id: str) -> None:
 
     if seam_name.startswith("prompt."):
         _apply_prompt(seam_name.split(".", 1)[1], body)
+    elif seam_name.startswith("setting.model."):
+        # ADR-019: model rerouting takes effect without restart.
+        from .llm import active_provider
+        apply_model_routing(graph, active_provider())
     elif seam_name == CHARTER_SEAM:
         # ADR-018: a new charter recomposes every charter behavior's context
         # with its active prompt body (cache-only, like everything in here).
@@ -291,13 +352,14 @@ def _apply_prompt(behavior_name: str, body: str) -> None:
     from . import behaviors as lb  # late import — seams is kernel, no cycle
     version, charter = _cached_charter()
     text = composed_description(behavior_name, body, version, charter)
-    for b in lb.BEHAVIORS:
-        if getattr(b, "name", None) == behavior_name:
-            try:
-                setattr(b, "description", text)
-            except Exception:
-                object.__setattr__(b, "description", text)
-            return
+    # Both the module original AND the runtime's registered copy: the pack
+    # loader registers fresh canonical-named behaviors, so mutating only the
+    # original would leave the live runtime on the old prompt.
+    for b in lb.behaviors_named(behavior_name):
+        try:
+            setattr(b, "description", text)
+        except Exception:
+            object.__setattr__(b, "description", text)
 
 
 def apply_approved(graph) -> int:
@@ -323,6 +385,10 @@ def apply_approved(graph) -> int:
         elif name.startswith("prompt."):
             _apply_prompt(name.split(".", 1)[1], body)
             applied += 1
+    # ADR-019: model routing re-stamps at boot whether or not a model seam
+    # exists — the LabSettings defaults are the routing table's floor.
+    from .llm import active_provider
+    apply_model_routing(graph, active_provider())
     return applied
 
 

@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from activegraph.llm import AnthropicProvider, LLMResponse, OpenAIProvider
 
+from .kernel import ABSOLUTE_DAILY_COST_CEILING_USD
+
 
 # ---------------------------------------------------------------- schemas
 
@@ -443,7 +445,7 @@ class LabProviderWrapper:
     """
 
     def __init__(self, inner: Any, *, max_total: int = 60, max_per_behavior: int = 5,
-                 max_daily: int = 200, max_daily_cost_usd: float = 5.0,
+                 max_daily: int = 200, max_daily_cost_usd: float = 50.0,
                  prompt_bodies: Optional[dict[str, str]] = None) -> None:
         self._inner = inner
         self._max_total = max_total
@@ -454,10 +456,13 @@ class LabProviderWrapper:
         self.default_model = getattr(inner, "default_model", "unknown")
 
     def effective_cost_cap(self) -> float:
-        """ADR-015: the seam-approved override wins, else the settings value.
-        Tuning the ceiling is self-modification through the gate."""
+        """ADR-015/019: the seam-approved override wins, else the settings
+        value — and EVERY result clamps to the kernel's absolute ceiling.
+        Tuning the cap is self-modification through the gate; moving the
+        ceiling is a git change."""
         override = _LLM_STATE.get("cost_cap_override")
-        return float(override) if override is not None else self._max_daily_cost
+        cap = float(override) if override is not None else self._max_daily_cost
+        return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)
 
     def _behavior_for(self, system: str) -> Optional[str]:
         for name, body in self._prompts.items():
@@ -585,6 +590,24 @@ class LabProviderWrapper:
 
 # ---------------------------------------------------------------- selection
 
+# The provider this process runs (set by select_lab_provider). Model routing
+# (ADR-019) consults it so a seam-routed model the active provider does not
+# recognize never reaches the wire.
+_ACTIVE_PROVIDER: dict[str, Any] = {"provider": None}
+
+
+def active_provider() -> Any:
+    return _ACTIVE_PROVIDER["provider"]
+
+
+def current_cost_cap(settings_default: float) -> float:
+    """The daily cost cap in force for display paths: seam override else the
+    settings value, clamped to the kernel ceiling (ADR-019)."""
+    override = _LLM_STATE.get("cost_cap_override")
+    cap = float(override) if override is not None else float(settings_default)
+    return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)
+
+
 _PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 _AUTODETECT_ORDER = ["anthropic", "openai"]
 _DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-sonnet-4-20250514"}
@@ -634,10 +657,12 @@ def select_lab_provider(
                 break
 
     if chosen is None or pref == "mock":
-        return LabMockProvider(), {"mode": "mock", "provider": "mock", "model": None}
+        mock = LabMockProvider()
+        _ACTIVE_PROVIDER["provider"] = mock
+        return mock, {"mode": "mock", "provider": "mock", "model": None}
 
     if chosen == "anthropic" and model is None and settings is not None:
-        model = getattr(settings, "model", None)
+        model = getattr(settings, "model_default", None)
 
     inst: Any = OpenAIProvider() if chosen == "openai" else AnthropicProvider()
     inst.default_model = model or _DEFAULT_MODELS[chosen]
@@ -646,7 +671,8 @@ def select_lab_provider(
         max_total=getattr(settings, "max_total_llm_calls_per_session", 60),
         max_per_behavior=getattr(settings, "max_llm_calls_per_behavior_run", 5),
         max_daily=getattr(settings, "max_llm_calls_per_day", 200),
-        max_daily_cost_usd=getattr(settings, "daily_cost_cap_usd", 5.0),
+        max_daily_cost_usd=getattr(settings, "daily_cost_cap_usd", 50.0),
         prompt_bodies=_lab_prompt_bodies(),
     )
+    _ACTIVE_PROVIDER["provider"] = wrapped
     return wrapped, {"mode": "live", "provider": chosen, "model": inst.default_model}

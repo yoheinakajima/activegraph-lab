@@ -79,6 +79,39 @@ def _file_default_description(name: str) -> str:
     recompose this through lab_pack/seams.py at hot-load and boot."""
     return composed_description(name, _PROMPTS[name], 1, charter_file_default())
 
+
+# The pack loader registers FRESH canonical-named copies of these behaviors
+# (lab.plan, lab.answer, …) on every load_pack — deliberately, so frozen
+# pack contents stay untouched. Anything that mutates live behavior state
+# after load (prompt/charter seam hot-loads, model routing) must therefore
+# mutate the RUNTIME'S copies, not just the module originals; mutating only
+# the originals silently affects future loads and nothing else (discovered
+# while wiring ADR-019 model routing). bind_live_behaviors is called
+# wherever a runtime is built or resumed.
+_LIVE_BEHAVIORS: list = []
+
+
+def bind_live_behaviors(rt) -> int:
+    """Capture the runtime's registered copies of the lab behaviors so seam
+    hot-loads and model routing reach the live registration. Replaces any
+    previous binding (one runtime per process outside fixtures)."""
+    del _LIVE_BEHAVIORS[:]
+    for b in BEHAVIORS:
+        try:
+            _LIVE_BEHAVIORS.append(rt.get_behavior(f"lab.{b.name}"))
+        except Exception:
+            pass
+    return len(_LIVE_BEHAVIORS)
+
+
+def behaviors_named(name: str) -> list:
+    """Every behavior object answering to `name`: the module original plus
+    the bound runtime copy (canonical lab.<name>), when one exists."""
+    out = [b for b in BEHAVIORS if getattr(b, "name", "") == name]
+    out += [b for b in _LIVE_BEHAVIORS
+            if getattr(b, "name", "") == f"lab.{name}"]
+    return out
+
 # ---------------------------------------------------------------- registries
 
 _CRAWLS: dict[str, dict] = {}
@@ -136,11 +169,12 @@ def clear_lab_registry() -> None:
     _PENDING_PUBLISH.clear()
     _IDLE_LOGGED["capped"] = False
     clear_seam_cache()
-    # Seam hot-loads mutate live behavior descriptions; restore file defaults
-    # (prompt body + CHARTER v1 block for the charter behaviors, ADR-018) so
-    # fixture runs are isolated from each other.
-    for b in BEHAVIORS:
-        name = getattr(b, "name", "")
+    # Seam hot-loads mutate live behavior descriptions (module originals AND
+    # the bound runtime copies); restore file defaults (prompt body + CHARTER
+    # v1 block for the charter behaviors, ADR-018) so fixture runs and
+    # resumed boots are isolated from stale overrides.
+    for b in list(BEHAVIORS) + list(_LIVE_BEHAVIORS):
+        name = getattr(b, "name", "").split(".")[-1]
         if name not in _PROMPTS:
             continue
         default = _file_default_description(name)
@@ -149,6 +183,15 @@ def clear_lab_registry() -> None:
                 setattr(b, "description", default)
             except Exception:
                 object.__setattr__(b, "description", default)
+        # Model routing (ADR-019) mutates behavior.model; reset the module
+        # originals to None so the next Runtime stamps its provider default
+        # and routing re-applies. Bound runtime copies keep their model —
+        # apply_model_routing re-stamps them right after any registry reset.
+        if any(b is x for x in BEHAVIORS) and getattr(b, "model", None) is not None:
+            try:
+                setattr(b, "model", None)
+            except Exception:
+                object.__setattr__(b, "model", None)
 
 
 def _now() -> str:

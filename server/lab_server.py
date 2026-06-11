@@ -1036,16 +1036,16 @@ def _feed(rt, limit: int = 100) -> dict:
 def _operator_status() -> dict:
     """ADR-015 status: paused, calls today/cap, cost today/cap. In-process
     state is authoritative between syncs; all of it rebuilds from the log."""
-    from lab_pack.llm import _LLM_STATE
+    from lab_pack.llm import _LLM_STATE, current_cost_cap
     from lab_pack.settings import LabSettings
     defaults = LabSettings()
-    cap = _LLM_STATE.get("cost_cap_override")
     return {
         "paused": bool(_LLM_STATE.get("paused")),
         "llm_calls_today": int(_LLM_STATE.get("daily_used") or 0),
         "llm_calls_cap": defaults.max_llm_calls_per_day,
         "llm_cost_today": round(float(_LLM_STATE.get("daily_cost") or 0), 4),
-        "llm_cost_cap": float(cap if cap is not None else defaults.daily_cost_cap_usd),
+        # Clamped to the kernel ceiling like the enforcement path (ADR-019).
+        "llm_cost_cap": current_cost_cap(defaults.daily_cost_cap_usd),
     }
 
 
