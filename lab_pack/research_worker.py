@@ -46,6 +46,7 @@ from pathlib import Path
 
 from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
+from .github_read import call_spec_for_url
 from .llm import ResearchSynthesis, consume_llm_anomalies, is_inert
 from .seams import effective_setting, seam_versions_stamp
 from .settings import LabSettings
@@ -63,6 +64,7 @@ _CALLS: dict[str, str] = {}       # capability_call id → task_id
 _CLAIMED: set[str] = set()        # task ids this worker claimed
 _SYNTH_REQUESTED: set[str] = set()  # task ids with a synthesis request
 _SYNTHESIZED: set[str] = set()    # task ids the llm stage already handled
+_GH_PROVIDER_ID: dict[str, str] = {}  # the github capability_provider
 
 
 def clear_research_worker_registry() -> None:
@@ -71,6 +73,24 @@ def clear_research_worker_registry() -> None:
     _CLAIMED.clear()
     _SYNTH_REQUESTED.clear()
     _SYNTHESIZED.clear()
+    _GH_PROVIDER_ID.clear()
+
+
+def _ensure_github_provider(graph) -> str:
+    """Idempotently create the tool_gateway capability_provider for the
+    read-only GitHub tools (ADR-022, rung 1)."""
+    if "id" in _GH_PROVIDER_ID:
+        return _GH_PROVIDER_ID["id"]
+    provider = graph.add_object("capability_provider", {
+        "name": "github",
+        "kind": "local",
+        "description": ("Read-only GitHub access (ADR-022): allowlisted "
+                        "public repos via tool_gateway; never a write."),
+        "capabilities": ["get_tree", "get_file", "list_commits",
+                         "list_issues", "list_pulls"],
+    })
+    _GH_PROVIDER_ID["id"] = provider.id
+    return provider.id
 
 
 def task_claimed(task_id: str) -> bool:
@@ -201,16 +221,22 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
                        "in the intent)")
             return
         from .behaviors import _ensure_web_provider, _now
-        provider_id = _ensure_web_provider(graph)
         state = {"pending": set(), "sources": [], "failed": [],
                  "branch_id": branch_id, "cap": cap}
         _TASKS[obj_id] = state
         for url in urls:
+            # github.com sources route to the read-only GitHub tools
+            # (ADR-022); everything else goes through web.fetch_url. Either
+            # way the fetch is a tool_gateway capability_call (CONTRACT).
+            provider_name, capability, input_data = call_spec_for_url(url)
+            provider_id = (_ensure_web_provider(graph)
+                           if provider_name == "web"
+                           else _ensure_github_provider(graph))
             call = graph.add_object("capability_call", {
                 "provider_id": provider_id,
-                "provider_name": "web",
-                "capability_name": "fetch_url",
-                "input_data": {"url": url},
+                "provider_name": provider_name,
+                "capability_name": capability,
+                "input_data": input_data,
                 "risk_class": "low",
                 "status": "proposed",
                 "proposed_by": "lab.research_worker",

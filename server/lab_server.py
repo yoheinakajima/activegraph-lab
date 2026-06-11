@@ -57,7 +57,8 @@ _ERRORS_MAX = 50
 _ERRORS: _deque = _deque(maxlen=_ERRORS_MAX)
 
 _SECRET_ENV_KEYS = ("LAB_MCP_TOKEN", "LAB_OPERATOR_TOKEN", "LAB_DATABASE_URL",
-                    "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+                    "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                    "GITHUB_TOKEN")
 
 
 def _sanitize_error_text(text: str) -> str:
@@ -352,6 +353,8 @@ def _build_runtime():
                        memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
+        from lab_pack.github_read import register_github_read
+        register_github_read()  # ADR-022 rung 1
         _rebuild_lab_registries(rt)
         from lab_pack import seams
         n = seams.apply_approved(rt.graph)

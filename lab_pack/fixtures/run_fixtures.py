@@ -1016,6 +1016,127 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_github_read() -> bool:
+    spec = _load("github_read.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: github_read — canned responses, allowlist refusal, MCP "
+          "parity, worker source")
+    print("=" * 64)
+
+    import base64
+    import json as _json
+    from lab_pack.github_read import (GITHUB_CAPABILITIES, gh_get_file,
+                                      gh_get_tree, gh_list_commits,
+                                      register_github_read, repo_allowlist,
+                                      set_transport)
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    allowed = exp["allowed_repo"]
+    file_text = exp["file_text"]
+
+    def transport(url):
+        if "/git/trees/" in url:
+            return 200, {"truncated": False, "tree": [
+                {"path": "README.md", "type": "blob", "size": 52},
+                {"path": "lab_pack", "type": "tree"}]}
+        if "/contents/" in url:
+            return 200, {"type": "file", "encoding": "base64",
+                         "content": base64.b64encode(file_text.encode()).decode()}
+        if "/commits" in url:
+            return 200, [{"sha": "abc1234def0", "commit": {"author": {
+                "name": "yohei", "date": "2026-06-11T00:00:00Z"},
+                "message": "seed the lab\n\nbody"}}]
+        return 404, {"message": "Not Found"}
+
+    try:
+        set_transport(transport)
+
+        # ── the read tools against canned responses ────────────────────────
+        tree = gh_get_tree(allowed)
+        c.that(tree["status"] == 200
+               and "README.md" in tree["content"],
+               f"get_tree returns entries ({tree.get('status')})")
+        f = gh_get_file(allowed, "README.md")
+        c.that(f["status"] == 200 and f["content"] == file_text,
+               "get_file decodes the canned base64 body")
+        commits = gh_list_commits(allowed, limit=5)
+        c.that(commits["status"] == 200
+               and _json.loads(commits["content"])["commits"][0]["sha"] == "abc1234def",
+               "list_commits returns trimmed rows")
+
+        # ── allowlist refusal — before any transport call ──────────────────
+        calls = {"n": 0}
+        def counting(url):
+            calls["n"] += 1
+            return transport(url)
+        set_transport(counting)
+        refused = gh_get_tree(exp["refused_repo"])
+        c.that(refused.get("error") and "GITHUB_REPO_ALLOWLIST" in refused["error"]
+               and calls["n"] == 0,
+               "non-allowlisted repo refused with zero network calls")
+        c.that(allowed in repo_allowlist()
+               and "yoheinakajima/activegraph-packs" in repo_allowlist(),
+               f"default allowlist normalizes bare names ({sorted(repo_allowlist())})")
+
+        # ── MCP passthrough parity: same handlers, same allowlist ──────────
+        from server import mcp as mcp_mod
+        def mcp_github(args):
+            resp = mcp_mod._github_read(1, args)
+            result = resp["result"]
+            text = result["content"][0]["text"]
+            return result["isError"], text
+        is_err, text = mcp_github({"op": "get_file", "repo": allowed,
+                                   "path": "README.md"})
+        c.that(not is_err and _json.loads(text) == gh_get_file(allowed, "README.md"),
+               "MCP github_read parity with the gateway handler")
+        is_err, text = mcp_github({"op": "get_tree", "repo": exp["refused_repo"]})
+        c.that(is_err and "GITHUB_REPO_ALLOWLIST" in text,
+               "MCP passthrough enforces the same allowlist (tool error)")
+        is_err, text = mcp_github({"op": "delete_repo", "repo": allowed})
+        c.that(is_err and "unknown op" in text,
+               "only the read ops exist — nothing writable to call")
+        print("  tools + refusal + MCP parity against canned responses")
+
+        # ── the research worker consumes a github.com source ───────────────
+        rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+        register_web_fetch(lambda url, **_kw: {"url": url, "status": 404,
+                                               "content": "", "error": "404"},
+                           overwrite=True)
+        register_github_read(overwrite=True)
+        g = rt.graph
+        mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+        rt.run_until_idle()
+        bspec = spec["branch"]
+        branch = create_branch_fn(g, mission.id, bspec["title"],
+                                  bspec["intent"].strip(), status="active")
+        rt.run_until_idle()
+        task = next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch.id), None)
+        c.that(task is not None and task.data.get("status") == "done",
+               f"worker completed a github-sourced research task "
+               f"({task.data.get('status') if task else 'no task'})")
+        gh_calls = [x for x in g.objects(type="capability_call")
+                    if x.data.get("provider_name") == "github"]
+        c.that(len(gh_calls) == 1
+               and gh_calls[0].data.get("capability_name") == "get_file",
+               f"the github URL routed to github.get_file via tool_gateway "
+               f"({len(gh_calls)})")
+        findings = [o for o in _lab_obs(g, "research_finding")
+                    if (o.data.get("metadata") or {}).get("lab_branch_id")
+                    == branch.id]
+        c.that(bool(findings) and all(
+            any("github.com" in u for u in
+                (o.data.get("metadata") or {}).get("source_urls") or [])
+            for o in findings),
+            f"findings attribute the github source ({len(findings)})")
+        print("  research worker: github URL → gateway call → attributed findings")
+    finally:
+        set_transport(None)
+    return c.done("github_read")
+
+
 def run_seam_proposal() -> bool:
     spec = _load("seam_proposal.yaml")
     print("\n" + "=" * 64)
@@ -1681,6 +1802,7 @@ def run_all() -> None:
         run_model_routing(),
         run_research_worker(),
         run_seam_proposal(),
+        run_github_read(),
         run_graph_code(),
         run_compat_regression(),
         run_storage_selection(),

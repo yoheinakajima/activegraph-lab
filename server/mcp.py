@@ -153,6 +153,30 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "github_read",
+        "description": "Read-only GitHub passthrough (ADR-022): the same "
+                       "allowlisted tools the research worker uses. ops: "
+                       "get_tree (repo, ref?, recursive?), get_file (repo, "
+                       "path, ref?), list_commits (repo, path?, limit?), "
+                       "list_issues / list_pulls (repo, state?, limit?). "
+                       "Repos outside GITHUB_REPO_ALLOWLIST are refused.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string",
+                       "enum": ["get_tree", "get_file", "list_commits",
+                                "list_issues", "list_pulls"]},
+                "repo": {"type": "string", "description": "owner/name"},
+                "path": {"type": "string"},
+                "ref": {"type": "string"},
+                "state": {"type": "string", "enum": ["open", "closed", "all"]},
+                "limit": {"type": "integer"},
+                "recursive": {"type": "boolean"},
+            },
+            "required": ["op", "repo"],
+        },
+    },
+    {
         "name": "set_budget",
         "description": "OPERATOR CONTROL (ADR-021): set the daily LLM cost "
                        "cap in USD. Clamped to the kernel ceiling "
@@ -529,6 +553,24 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     })
 
 
+def _github_read(msg_id: Any, args: dict) -> dict:
+    """ADR-022: the MCP passthrough calls the SAME handlers the gateway
+    registers (one endpoint, one allowlist); allowlist refusals come back
+    as tool errors, never 500s."""
+    from lab_pack.github_read import GITHUB_CAPABILITIES
+    op = (args.get("op") or "").strip()
+    fn = GITHUB_CAPABILITIES.get(op)
+    if fn is None:
+        return _tool_failure(
+            msg_id, f"unknown op: {op!r} (want one of "
+                    f"{', '.join(sorted(GITHUB_CAPABILITIES))})")
+    kwargs = {k: v for k, v in args.items() if k != "op"}
+    out = fn(**kwargs)
+    if out.get("error") and not out.get("status"):
+        return _tool_failure(msg_id, out["error"])
+    return _tool_result(msg_id, out)
+
+
 # ── operator-control tier (ADR-021) ─────────────────────────────────────────
 # Same MCP authority as send_chat; rate-limited like every mutation. Each
 # control emits a PUBLIC event (lab.budget_set / lab.paused / lab.resumed)
@@ -616,6 +658,10 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
             return 200, _control_pause(msg_id, name == "pause_lab",
                                        get_rt=get_rt,
                                        run_on_worker=run_on_worker)
+        if name == "github_read":
+            # ADR-022: a passthrough to the gateway's read-only handlers —
+            # no graph, no lock (network I/O must not hold the runtime).
+            return 200, _github_read(msg_id, args)
         fn = _READ_TOOLS.get(name)
         if fn is None:
             return 200, _rpc_error(msg_id, -32602, f"unknown tool: {name}")

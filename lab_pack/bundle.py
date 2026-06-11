@@ -89,6 +89,8 @@ def build_lab(
     rt = Runtime(graph or Graph(), **kwargs)
     load_lab_packs(rt, lab_settings=lab_settings, memory_backend_url=memory_backend_url)
     register_web_fetch(fetch_handler)
+    from .github_read import register_github_read
+    register_github_read()  # ADR-022 rung 1: read-only, allowlisted
 
     if create_mission:
         mission = create_mission_fn(

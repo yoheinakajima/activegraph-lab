@@ -185,7 +185,7 @@ def main() -> int:
         tools = {t["name"] for t in (b.get("result") or {}).get("tools", [])}
         expected = {"get_status", "get_feed", "get_branch", "get_pending_decisions",
                     "get_post", "list_posts", "list_seams", "get_errors",
-                    "get_log", "get_entity",
+                    "get_log", "get_entity", "github_read",
                     "send_chat", "set_budget", "pause_lab", "resume_lab"}
         check(tools == expected,
               f"exactly the ADR-016 tools + get_errors (ADR-023) + the "
