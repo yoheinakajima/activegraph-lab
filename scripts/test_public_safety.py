@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Public-safety audit (3a/3b, ADR-011): the whole event log, every object,
 the feed JSON, captured boot output, and error paths must contain ZERO
-traces of the secrets in the environment. DATABASE_URL is a credential too.
+traces of the secrets in the environment. LAB_DATABASE_URL and DATABASE_URL
+are credentials too.
 
 Sentinels are planted in the env, a full loop runs (chat, decision, fetch
 failure, LLM anomaly, drafts), everything serializable is grepped.
@@ -28,6 +29,7 @@ SENTINELS = {
     "LAB_OPERATOR_TOKEN": "tok-SENTINEL-pL2mR8dN4c",
     "LAB_MCP_TOKEN": "mcp-SENTINEL-qW7vJ3hF9e",
     "DATABASE_URL": "postgres://sentinel_user:pw-SENTINEL-aB5xY1@db.sentinel.internal:5432/lab",
+    "LAB_DATABASE_URL": "postgres://lab_sentinel_user:pw-SENTINEL-mK6tE9@db.lab-sentinel.internal:5432/lab",
 }
 
 FAILURES: list[str] = []
@@ -85,8 +87,9 @@ def _run() -> int:
         provider, info = select_lab_provider(settings=LabSettings())
         print(f"LLM: mode={info['mode']} provider={info['provider']}")
         print(f"boot: backend={storage.backend()}")
-        # IMPORTANT: persist_to=None — the sentinel DATABASE_URL points
-        # nowhere; backend() still reads it, which is exactly what we audit.
+        # IMPORTANT: persist_to=None — the sentinel LAB_DATABASE_URL/
+        # DATABASE_URL point nowhere; backend() still reads them, which is
+        # exactly what we audit.
         rt = build_lab(
             # max_total=3: under ADR-014 the digest drafts once, so the
             # session makes fewer LLM calls — 3 still exhausts mid-run.
@@ -309,8 +312,10 @@ def _run() -> int:
         if "." in secret:
             check(secret.rsplit(".", 1)[-1] not in blob,
                   f"{name} signature fragment absent")
-    # DATABASE_URL fragments count too (host, user, password)
-    for frag in ("db.sentinel.internal", "sentinel_user", "pw-SENTINEL-aB5xY1"):
+    # LAB_DATABASE_URL/DATABASE_URL fragments count too (host, user, password)
+    for frag in ("db.sentinel.internal", "sentinel_user", "pw-SENTINEL-aB5xY1",
+                 "db.lab-sentinel.internal", "lab_sentinel_user",
+                 "pw-SENTINEL-mK6tE9"):
         check(frag not in blob, f"credential fragment '{frag}' absent")
 
     print("== exception hygiene (3b) ==")

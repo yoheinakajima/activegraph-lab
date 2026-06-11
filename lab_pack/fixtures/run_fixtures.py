@@ -1041,6 +1041,47 @@ def run_compat_regression() -> bool:
     return c.done("compat_regression")
 
 
+def run_storage_selection() -> bool:
+    """ADR-009 (note): backend selection order LAB_DATABASE_URL > DATABASE_URL > SQLite."""
+    print("\n" + "=" * 64)
+    print("Fixture: storage_selection — LAB_DATABASE_URL > DATABASE_URL > SQLite")
+    print("=" * 64)
+
+    import os
+    from lab_pack import storage
+
+    keys = ("LAB_DATABASE_URL", "DATABASE_URL", "ACTIVEGRAPH_DB")
+    saved = {k: os.environ.pop(k, None) for k in keys}
+    lab_url = "postgres://lab_fixture@db.lab.fixture:5432/lab"
+    legacy_url = "postgres://legacy_fixture@db.legacy.fixture:5432/lab"
+    c = Check()
+    try:
+        os.environ["LAB_DATABASE_URL"] = lab_url
+        os.environ["DATABASE_URL"] = legacy_url
+        c.that(storage.backend() == "postgres" and storage.store_url() == lab_url,
+               f"both set → LAB_DATABASE_URL wins (got {storage.store_url()})")
+
+        del os.environ["LAB_DATABASE_URL"]
+        c.that(storage.backend() == "postgres" and storage.store_url() == legacy_url,
+               f"LAB_DATABASE_URL absent → DATABASE_URL used (got {storage.store_url()})")
+
+        del os.environ["DATABASE_URL"]
+        c.that(storage.backend() == "sqlite" and storage.store_url().endswith("lab.sqlite"),
+               f"neither set → SQLite default (got {storage.store_url()})")
+
+        os.environ["LAB_DATABASE_URL"] = "postgresql://lab_fixture@db.lab.fixture:5432/lab"
+        c.that(storage.store_url() == lab_url,
+               "postgresql:// alias normalized on the LAB_DATABASE_URL path")
+        print("  both → LAB_DATABASE_URL; legacy → DATABASE_URL; neither → sqlite")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return c.done("storage_selection")
+
+
 def run_all() -> None:
     results = [
         run_bootstrap(),
@@ -1054,6 +1095,7 @@ def run_all() -> None:
         run_seams(),
         run_graph_code(),
         run_compat_regression(),
+        run_storage_selection(),
     ]
     passed = sum(results)
     print(f"\n{'=' * 64}")

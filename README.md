@@ -102,7 +102,9 @@ cd ../activegraph-packs && ACTIVEGRAPH_PORT=7799 pnpm dev
 | Env var | Default | Meaning |
 |---|---|---|
 | `LAB_PORT` | `7799` | server port |
-| `ACTIVEGRAPH_DB` | `data/lab.sqlite` | event-log store (resumed on restart) |
+| `LAB_DATABASE_URL` | unset | Postgres event store; wins over `DATABASE_URL` (ADR-009 note). In production this is the Replit-managed Neon cluster's writable primary endpoint |
+| `DATABASE_URL` | unset | fallback Postgres URL (Replit reserves this name — see replit.md) |
+| `ACTIVEGRAPH_DB` | `data/lab.sqlite` | SQLite event-log store when no Postgres URL is set (resumed on restart) |
 | `ACTIVEGRAPH_MEMORY_DB` | `data/lab_memory.sqlite` | memory_gateway backend |
 | `LAB_LLM_PROVIDER` | auto | `openai` / `anthropic` / `mock` |
 | `LAB_LLM_MODEL` | provider default | model override |
@@ -111,7 +113,8 @@ cd ../activegraph-packs && ACTIVEGRAPH_PORT=7799 pnpm dev
 
 - Push this repo to GitHub: `git push origin main`
 - Import to Replit: create a Repl from the GitHub repo (the `.replit` run command is checked in)
-- Add the Postgres integration (sets `DATABASE_URL` automatically)
+- Add the Postgres integration (`postgresql-16` module — it owns the Replit-managed Neon cluster that is the production database; do NOT remove it)
+- Supply the cluster's **writable primary** endpoint URL as the `LAB_DATABASE_URL` secret — Replit reserves the name `DATABASE_URL` at publish time, so the lab reads `LAB_DATABASE_URL` first and falls back to `DATABASE_URL` (ADR-009 note)
 - Generate the operator token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`
 - Set Secrets: `ANTHROPIC_API_KEY`, `LAB_OPERATOR_TOKEN` (from above), `LAB_ENV=prod` — leave `LAB_ALLOW_GRAPH_CODE` unset (ADR-012)
 - Run. First boot seeds the mission (`mode=fresh`); redeploys resume (`mode=resumed`).
@@ -123,7 +126,7 @@ Verification (replace `$URL` and `$TOK`):
 - Tokenless mutation refused: `curl -s -o /dev/null -w "%{http_code}\n" -X POST $URL/chat -d '{}'` → `401`
 - Tokened mutation OK: `curl -s -X POST $URL/chat -H "Authorization: Bearer $TOK" -d '{"branch_id":"branch#2","content":"hello"}' | head -c 200`
 - Restart the Repl, then: `curl -s $URL/healthz` → `event_count` ≥ before, boot log shows `mode=resumed`
-- Postgres round-trip (scratch DB): `DATABASE_URL=... python scripts/test_postgres.py`
+- Postgres round-trip (scratch DB): `LAB_DATABASE_URL=... python scripts/test_postgres.py`
 
 ## Test suite (all keyless, all deterministic)
 

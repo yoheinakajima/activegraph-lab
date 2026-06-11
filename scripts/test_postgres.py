@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Postgres integration test (1d). SKIPS unless DATABASE_URL is set.
+"""Postgres integration test (1d). SKIPS unless LAB_DATABASE_URL (or
+DATABASE_URL — ADR-009 note) is set.
 
 Runs the smoke loop against the native PostgresEventStore, then simulates a
 restart (Runtime.load from the same URL) and verifies mode=resumed with the
 same graph state. Exit 0 on pass OR skip; 1 on failure.
 
 First-deploy verification (single line, zsh):
-    DATABASE_URL=$DATABASE_URL python scripts/test_postgres.py
+    LAB_DATABASE_URL=$LAB_DATABASE_URL python scripts/test_postgres.py
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -19,18 +19,18 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 
 def main() -> int:
-    if not os.environ.get("DATABASE_URL", "").strip():
-        print("test_postgres: SKIP — DATABASE_URL not set "
-              "(run on the deploy target: DATABASE_URL=... python scripts/test_postgres.py)")
+    from lab_pack import storage
+
+    if storage.backend() != "postgres":
+        print("test_postgres: SKIP — LAB_DATABASE_URL/DATABASE_URL not set "
+              "(run on the deploy target: LAB_DATABASE_URL=... python scripts/test_postgres.py)")
         return 0
 
     from activegraph import Runtime
-    from lab_pack import clear_lab_registry, storage
+    from lab_pack import clear_lab_registry
     from lab_pack.bundle import build_lab, load_lab_packs
     from lab_pack.llm import LabMockProvider, reset_llm_session
     from lab_pack.settings import LabSettings
-
-    assert storage.backend() == "postgres", "DATABASE_URL set but backend != postgres"
     url = storage.store_url()
     if storage.store_has_run(url):
         print("test_postgres: FAIL — store already has a run; use a scratch database")
