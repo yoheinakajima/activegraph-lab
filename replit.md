@@ -50,7 +50,7 @@ boot log).
 | `LAB_OPERATOR_TOKEN` | bearer token for mutations; unset → read-only mode |
 | `LAB_MCP_TOKEN` | the one secret behind `/mcp` (ADR-016/017): legacy bearer, the OAuth signing root, AND the password the operator pastes on `/authorize`; permits MCP reads + `send_chat` but NEVER decisions or pause, and the operator token never opens `/mcp`; unset → MCP + OAuth disabled; rotating it revokes every OAuth client/token at once (nothing is stored) |
 | `LAB_ENV` | `prod` (disables /reset; set by .replit) |
-| `DATABASE_URL` | added automatically by the Replit Postgres integration |
+| `LAB_DATABASE_URL` | the production database: the Replit-managed Neon cluster, accessed via its **writable primary** endpoint, supplied as this secret. Replit reserves the name `DATABASE_URL` when its managed-Postgres module is present (it collides with explicit secrets at publish time), so the lab reads `LAB_DATABASE_URL` first and falls back to `DATABASE_URL` (ADR-009 note). The **`postgresql-16` module must NOT be removed** — it owns that cluster; removing it destroys the production database. |
 
 `LAB_ALLOW_GRAPH_CODE` is **intentionally absent**: approved graph-code
 drafts stay dormant (ADR-012). Flipping it on is a deliberate operator
@@ -70,5 +70,6 @@ act, not a deploy default.
 ## Verify a deploy
 
 See README.md → Deploy for the curl checklist; the one-shot Postgres
-round-trip test is `python scripts/test_postgres.py` (uses DATABASE_URL,
-needs an empty scratch database).
+round-trip test is `python scripts/test_postgres.py` (uses
+LAB_DATABASE_URL, falling back to DATABASE_URL; needs an empty scratch
+database).

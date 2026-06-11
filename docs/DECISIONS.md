@@ -75,6 +75,7 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Date: 2026-06-11
 - Decision: The event store is activegraph's native persistence layer (ag-coder pattern: a dedicated `activegraph` Postgres schema, framework-owned tables, fork/replay native, via `pip install "activegraph[postgres]"`). `DATABASE_URL` present → Postgres; absent → SQLite under `data/` (the dev/fixture default; fixtures stay keyless and deterministic). Backend selection lives in exactly one place (`lab_pack/storage.py`, kernel); no other code may know which store is active, and all projections read through runtime/event APIs, never raw SQL against framework tables.
 - Rationale: The log is the source of truth; the store is the framework's concern, not the lab's. One selection point keeps the swap auditable and the rest of the codebase backend-blind.
+- Note (2026-06-11): selection now reads `LAB_DATABASE_URL` first, falling back to `DATABASE_URL`, then SQLite. Replit reserves `DATABASE_URL` when its managed-Postgres module is present, colliding with explicit secrets at publish time; the lab sidesteps the reserved name rather than fighting the platform, and the fallback preserves every existing environment. `LAB_DATABASE_URL` is a credential exactly like `DATABASE_URL` (ADR-011); the sentinel audit covers both.
 - OPEN: memory_gateway's own store stays local-SQLite for now.
 
 ## ADR-010: Deployment — Replit, continuously running

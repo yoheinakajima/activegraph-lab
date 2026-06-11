@@ -1,14 +1,16 @@
 """Storage adapter — KERNEL (ADR-009, ADR-012).
 
-Backend selection happens HERE and only here: `DATABASE_URL` present →
+Backend selection happens HERE and only here: `LAB_DATABASE_URL` present →
 activegraph's native PostgresEventStore (dedicated `activegraph` schema,
-framework-owned tables, fork/replay native); absent → SQLite under data/
-(the dev/fixture default). No other code may know which store is active —
-everything reads through runtime/event APIs, never raw SQL against
-framework tables.
+framework-owned tables, fork/replay native); else `DATABASE_URL` (Replit
+reserves that name for its managed-Postgres module — see the ADR-009 note);
+absent → SQLite under data/ (the dev/fixture default). No other code may
+know which store is active — everything reads through runtime/event APIs,
+never raw SQL against framework tables.
 
-DATABASE_URL is a credential (ADR-011): this module never logs, stores, or
-echoes it. describe() returns only the backend name.
+LAB_DATABASE_URL and DATABASE_URL are credentials (ADR-011): this module
+never logs, stores, or echoes them. describe() returns only the backend
+name.
 """
 
 from __future__ import annotations
@@ -22,9 +24,15 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _db_url() -> str:
+    """LAB_DATABASE_URL wins over DATABASE_URL (Replit reserves the latter)."""
+    return (os.environ.get("LAB_DATABASE_URL", "").strip()
+            or os.environ.get("DATABASE_URL", "").strip())
+
+
 def store_url() -> str:
     """The persistence URL/path for Runtime(persist_to=...) / Runtime.load."""
-    url = os.environ.get("DATABASE_URL", "").strip()
+    url = _db_url()
     if url:
         # activegraph's parser wants postgres:// — normalize the common alias.
         if url.startswith("postgresql://"):
@@ -37,7 +45,7 @@ def store_url() -> str:
 
 def backend() -> str:
     """'postgres' or 'sqlite' — for boot logs and /healthz, never the URL."""
-    return "postgres" if os.environ.get("DATABASE_URL", "").strip() else "sqlite"
+    return "postgres" if _db_url() else "sqlite"
 
 
 def store_has_run(url: Optional[str] = None) -> bool:
