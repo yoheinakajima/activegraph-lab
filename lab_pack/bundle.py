@@ -284,6 +284,26 @@ LIVE_FINDINGS: list[dict] = [
             "(everything but answer idles), never whether the worker runs."
         ),
     },
+    {
+        "key": "emit_projects_before_append",
+        "text": (
+            "Finding (upstream, activegraph core): Graph.emit projects an "
+            "event to the in-memory log — and serves it from every "
+            "projection — BEFORE store.append runs, and swallows store "
+            "failures, so a wedged store leaves the runtime confidently "
+            "serving phantom state. This lab ran NON-DURABLE in production "
+            "for two days because of that ordering: a pg_restore'd lineage "
+            "left the events.seq sequence behind the restored rows, every "
+            "durable append died with a UniqueViolation inside graph.emit "
+            "AFTER the event entered memory, and all projections (including "
+            "MCP forensics) kept reporting the writes as committed "
+            "(ADR-023; the evt evidence is in the log). Proposed upstream "
+            "change: surface append failures loudly — fail the emit, or "
+            "mark the runtime degraded so health checks and projections can "
+            "say so. Draft fuel and an upstream issue candidate alongside "
+            "the add_relation convention finding."
+        ),
+    },
 ]
 
 
