@@ -510,6 +510,15 @@ def consume_llm_anomalies(graph) -> list[str]:
                     + ("idle until the UTC day resets." if (daily or daily_cost)
                        else "queued work resumes next session."))
             lab_kind = "llm_budget"
+        elif a["kind"] == "call":
+            # Provider/API/network failure: the call itself failed and no
+            # model output exists. Distinct from parse — the Opus 400 was
+            # misfiled as llm_parse_failure under the old single label
+            # (observation#142, evt_2870).
+            text = (f"LLM provider call failed in {a['behavior'] or 'unknown behavior'}: "
+                    f"{a['detail']}. No model output was produced; the behavior "
+                    "returned an inert output and fires again on its next trigger.")
+            lab_kind = "llm_call_failure"
         else:
             text = (f"LLM output parse failure in {a['behavior'] or 'unknown behavior'}: "
                     f"{a['detail']}. Salvaged what parsed; raw output attached.")
@@ -583,6 +592,51 @@ def _inert_output(output_schema: type, note: str) -> Any:
         return None
 
 
+# ── model-parameter compatibility (the Opus incident) ────────────────────────
+# ADR-019 routing seams can point a behavior at a model the call path can't
+# speak to: the first Opus-routed call 400'd on the lab's hardcoded
+# temperature ("`temperature` may only be set to 1 when thinking is
+# enabled") and the failure was misfiled as llm_parse_failure
+# (observation#142, evt_2870). The lab now sets no temperature of its own;
+# what reaches the wrapper unset is activegraph's @llm_behavior default,
+# forwarded as the provider's server default — the wire-equivalent of
+# omitting the field, since the pinned providers serialize temperature
+# unconditionally (ADR-005: upstream is untouchable; the HTTP call is
+# assembled inside the provider).
+
+_FRAMEWORK_DEFAULT_TEMPERATURE = 0.7  # activegraph @llm_behavior default
+
+# Parameters the wrapper may strip, mapped to the value the API treats as
+# "not sent" (the pinned providers omit top_p entirely at 1.0 and always
+# send temperature, where 1.0 is the server default).
+_PARAM_SERVER_DEFAULTS = {"temperature": 1.0, "top_p": 1.0}
+
+_UNSUPPORTED_PARAM_PHRASES = ("unsupported", "not supported",
+                              "does not support", "may only be set",
+                              "deprecated", "invalid parameter")
+
+
+def _unsupported_param(exc: BaseException) -> Optional[str]:
+    """The parameter named by a 400 of the unsupported/deprecated-parameter
+    shape, when it is one the wrapper can strip; else None. Deliberately
+    conservative: the error must look like a bad request AND use
+    unsupported/deprecated phrasing AND name a known parameter — rate
+    limits, timeouts, 500s and auth failures never match, so they are
+    never retried here."""
+    extras = getattr(exc, "payload_extras", None) or {}
+    text = " ".join([str(exc), str(extras.get("message", "")),
+                     str(extras.get("exception_type", ""))]).lower()
+    if not any(s in text for s in ("400", "invalid_request", "bad_request",
+                                   "badrequest")):
+        return None
+    if not any(s in text for s in _UNSUPPORTED_PARAM_PHRASES):
+        return None
+    for param in _PARAM_SERVER_DEFAULTS:
+        if param in text:
+            return param
+    return None
+
+
 class LabProviderWrapper:
     """Budget enforcement + malformed-output salvage around any LLMProvider.
 
@@ -595,6 +649,14 @@ class LabProviderWrapper:
     - parse salvage: when the inner provider returns no parsed output, try
       to recover JSON from raw_text; failing that, return an inert output
       and queue a parse anomaly with the raw text attached.
+    - parameter compatibility (the Opus incident): a framework-default
+      temperature is forwarded as the server default (the lab sets none),
+      and a 400 naming an unsupported/deprecated parameter strips it and
+      retries exactly once, recording the strip on provider_meta
+      (lab_param_stripped) so it rides the llm.responded event payload.
+    - failure domains: anomaly kind "call" (provider/API/network — no model
+      output) records llm_call_failure; "parse" (llm_parse_failure) is
+      reserved for output that arrived but didn't parse.
     Never raises into the runtime.
     """
 
@@ -686,12 +748,41 @@ class LabProviderWrapper:
         _LLM_STATE["by_behavior"][behavior or "?"] = used + 1
         _LLM_STATE["last_model"] = kwargs.get("model") or self.default_model
 
+        # The lab declares no temperature (the Opus incident): the framework
+        # default reaching us means "not explicitly set", forwarded as the
+        # server default — the closest the pinned providers allow to
+        # omitting the field. An explicit value (seam, settings, a future
+        # declaration) is anything else and passes through untouched.
+        if kwargs.get("temperature") == _FRAMEWORK_DEFAULT_TEMPERATURE:
+            kwargs["temperature"] = _PARAM_SERVER_DEFAULTS["temperature"]
+
+        stripped: Optional[dict[str, Any]] = None
         try:
-            resp = self._inner.complete(**kwargs)
+            try:
+                resp = self._inner.complete(**kwargs)
+            except Exception as first_exc:
+                param = _unsupported_param(first_exc)
+                if param is None or param not in kwargs:
+                    raise
+                # Strip-and-retry exactly once: reset the named parameter to
+                # its server default and re-call. A second failure falls to
+                # the outer handler and records llm_call_failure.
+                stripped = {"parameter": param,
+                            "original_value": kwargs.get(param),
+                            "error_class": type(first_exc).__name__}
+                kwargs[param] = _PARAM_SERVER_DEFAULTS[param]
+                resp = self._inner.complete(**kwargs)
             try:  # ADR-015: native cost accounting, mirrored for the ceiling
                 _LLM_STATE["daily_cost"] += Decimal(str(resp.cost_usd or 0))
             except Exception:
                 pass
+            if stripped is not None:
+                # Ride the llm.responded event payload (provider_meta is in
+                # LLMResponse.to_dict()) so the strip is on the public record.
+                try:
+                    resp.provider_meta["lab_param_stripped"] = stripped
+                except Exception:
+                    pass
         except Exception as exc:
             # Native providers RAISE on schema-parse failures (the raw model
             # text rides on payload_extras) — salvage from there before
@@ -706,9 +797,16 @@ class LabProviderWrapper:
                         latency_seconds=0.0,
                         model=kwargs.get("model") or self.default_model,
                         finish_reason="stop",
+                        provider_meta=({"lab_param_stripped": stripped}
+                                       if stripped else {}),
                     )
+            # raw model text present means the HTTP call SUCCEEDED and the
+            # output didn't parse (parse domain); absent means the call
+            # itself failed — provider/API/network (call domain). The Opus
+            # 400 was misfiled as parse under the old single label
+            # (observation#142, evt_2870).
             _LLM_STATE["anomalies"].append({
-                "kind": "parse", "behavior": behavior,
+                "kind": "parse" if raw else "call", "behavior": behavior,
                 "detail": f"provider call failed: {type(exc).__name__}: "
                           f"{str(exc).splitlines()[0][:200]}",
                 "raw": raw})

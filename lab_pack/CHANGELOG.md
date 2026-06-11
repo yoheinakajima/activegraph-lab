@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Model-parameter compatibility (the Opus incident): ADR-019 routing
+  seams can point a behavior at a model that rejects the lab's hardcoded
+  temperature (400 "may only be set to 1"), and the failure was misfiled
+  as llm_parse_failure. The lab now declares no temperature anywhere
+  (six hardcoded kwargs removed); LabProviderWrapper forwards a
+  framework-default temperature as the server default — the
+  wire-equivalent of omitting the field through the pinned providers
+  (ADR-005) — and on a 400 naming an unsupported/deprecated parameter
+  strips it and retries exactly once, recording the strip on the
+  llm.responded payload (provider_meta.lab_param_stripped). Failure
+  domains split: new anomaly kind "call" → llm_call_failure for
+  provider/API/network errors; llm_parse_failure reserved for output
+  that arrived but didn't parse. Locked by the model_params fixture;
+  the hazard is queued as a keyed live finding (upstream candidate:
+  parameter handling belongs next to the provider's HTTP assembly).
+
 - Store connection resilience (ADR-009 note; the Neon idle-suspend
   incident, twice): PostgresEventStore's single boot-lifetime connection
   dies when serverless Postgres suspends an idle compute — first write

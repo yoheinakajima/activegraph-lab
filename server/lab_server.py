@@ -595,6 +595,7 @@ DEFAULT_TEMPLATES = {
     "stall":            "{short_text}",
     "llm_budget":       "LLM budget exhausted — stopping model calls cleanly. {short_text}",
     "llm_parse_failure": "Model output didn't parse in {behavior} — salvaged what I could, raw output kept.",
+    "llm_call_failure": "Model call failed in {behavior} — no output produced; it fires again on its next trigger.",
     "finding":          "Logged a finding: \u201c{short_text}\u201d",
     "upstream_friction": "Recorded upstream friction: \u201c{short_text}\u201d",
     "draft_mirror_failure": "{short_text}",

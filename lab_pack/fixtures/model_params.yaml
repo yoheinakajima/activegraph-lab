@@ -1,0 +1,30 @@
+name: model_params
+description: >
+  Model-parameter compatibility (the Opus incident) and LLM failure-domain
+  classification. A model rejecting temperature gets one strip-and-retry
+  with the strip recorded on provider_meta / the llm.responded payload;
+  unparseable-but-delivered output stays llm_parse_failure; a failed call
+  (500, network) records llm_call_failure. The lab declares no temperature
+  of its own — the framework default is forwarded as the server default.
+
+settings: {}
+
+mission:
+  title: Grow the activegraph.ai evidence base
+
+cases:
+  framework_default_temperature: 0.7
+  server_default_temperature: 1.0
+  explicit_temperature: 0.3
+  reject_400: >-
+    Error code: 400 - {'type': 'error', 'error': {'type':
+    'invalid_request_error', 'message': '`temperature` may only be set to 1
+    when thinking is enabled. Please consult our documentation.'}}
+  server_500: >-
+    Error code: 500 - {'type': 'error', 'error': {'type': 'api_error',
+    'message': 'Internal server error'}}
+
+expected_outputs:
+  stripped_parameter: temperature
+  call_failure_kind: llm_call_failure
+  parse_failure_kind: llm_parse_failure

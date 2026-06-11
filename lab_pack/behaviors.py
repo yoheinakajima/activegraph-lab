@@ -512,7 +512,6 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
     creates=["branch"],
-    temperature=0.2,
     max_tokens=1024,
     tools=[],
 )
@@ -740,7 +739,6 @@ def work(event, graph, ctx, *, settings: LabSettings):
         "recent_events": 0,
     },
     creates=["observation", "decision", "branch"],
-    temperature=0.2,
     max_tokens=1024,
     tools=[],
 )
@@ -1322,7 +1320,6 @@ def _coverage_review(body: str) -> Optional[str]:
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
     creates=["artifact", "decision"],
-    temperature=0.4,
     max_tokens=4096,
     tools=[],
 )
@@ -1470,7 +1467,6 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
     creates=["artifact", "decision", "observation"],
-    temperature=0.3,
     max_tokens=4096,
     tools=[],
 )
@@ -1671,7 +1667,6 @@ def _apply_steering(graph, branch_id: str, content: str,
         "recent_events": 0,
     },
     creates=["comm_response_candidate"],
-    temperature=0.4,
     max_tokens=1024,
     tools=[],
 )

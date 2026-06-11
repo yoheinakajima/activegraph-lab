@@ -321,7 +321,6 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
     model=None,  # routes through setting.model.research_worker (ADR-019)
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
     creates=["observation", "evaluation"],
-    temperature=0.2,
     max_tokens=2048,
     tools=[],
 )

@@ -79,7 +79,8 @@ def main() -> int:
 
     stalls = lab_kinds.get("stall", 0)
     fails = {k: lab_kinds.get(k, 0)
-             for k in ("fetch_failure", "llm_parse_failure", "llm_budget", "gate_violation")}
+             for k in ("fetch_failure", "llm_parse_failure", "llm_call_failure",
+                       "llm_budget", "gate_violation")}
     print(f"\nStalls: {stalls} | failures: "
           + ", ".join(f"{k}: {n}" for k, n in fails.items()))
 

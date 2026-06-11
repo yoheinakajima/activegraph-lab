@@ -325,6 +325,32 @@ LIVE_FINDINGS: list[dict] = [
             "any URL-target store on a serverless backend hits this."
         ),
     },
+    {
+        "key": "model_parameter_compatibility",
+        "text": (
+            "Finding: the first Opus-routed call surfaced a model-parameter "
+            "compatibility hazard — ADR-019 routing seams can point a "
+            "behavior at a model the call path can't speak to. The lab's "
+            "behavior declarations hardcoded temperature=0.2-0.4; the "
+            "routed model rejects any temperature but the default ('400: "
+            "temperature may only be set to 1'), and the failure was "
+            "misfiled as llm_parse_failure because every provider exception "
+            "carried the single 'parse' label (observation#142, evt_2870). "
+            "Fix: the lab sets no temperature unless explicitly chosen — a "
+            "framework-default value is forwarded as the server default, "
+            "the wire-equivalent of omitting the field through the pinned "
+            "providers (ADR-005) — and a 400 naming an unsupported or "
+            "deprecated parameter strips it and retries exactly once, "
+            "recording the strip on the llm.responded payload "
+            "(provider_meta.lab_param_stripped). Failure domains split: "
+            "llm_call_failure for provider/API/network errors (no model "
+            "output exists), llm_parse_failure reserved for output that "
+            "arrived but didn't parse. Upstream candidate: the pinned "
+            "providers serialize temperature unconditionally, so true "
+            "omission is impossible below the lab — parameter-compatibility "
+            "handling belongs next to the HTTP assembly in the provider."
+        ),
+    },
 ]
 
 

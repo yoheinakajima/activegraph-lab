@@ -1467,6 +1467,193 @@ def run_model_routing() -> bool:
     return c.done("model_routing")
 
 
+def run_model_params() -> bool:
+    spec = _load("model_params.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: model_params — temperature omission, strip-and-retry, "
+          "call vs parse failure domains")
+    print("=" * 64)
+
+    from decimal import Decimal
+
+    from activegraph.llm import LLMResponse
+    from activegraph.llm.errors import LLMBehaviorError
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, PlanProposal,
+                              _lab_prompt_bodies, consume_llm_anomalies,
+                              reset_llm_session)
+
+    cases = spec["cases"]
+    exp = spec["expected_outputs"]
+    c = Check()
+
+    def _ok_response(text: str = '{"lab": "ok"}') -> LLMResponse:
+        return LLMResponse(raw_text=text, parsed=None, input_tokens=1,
+                           output_tokens=1, cost_usd=Decimal("0"),
+                           latency_seconds=0.0, model="fixture",
+                           finish_reason="stop")
+
+    class Recording:
+        """Accepts anything; records the temperature each call carried."""
+        default_model = "fixture-accepting"
+
+        def __init__(self):
+            self.seen: list = []
+
+        def complete(self, **kw):
+            self.seen.append(kw.get("temperature"))
+            return _ok_response()
+
+    class OpusShaped:
+        """Shaped like the pinned provider against a thinking model: 400s
+        on any temperature but the server default (the production
+        message), succeeds at the default — the lab mock answers then."""
+        default_model = "fixture-opus"
+
+        def __init__(self):
+            self.inner = LabMockProvider()
+            self.seen: list = []
+
+        def complete(self, **kw):
+            self.seen.append(kw.get("temperature"))
+            if kw.get("temperature") != cases["server_default_temperature"]:
+                raise LLMBehaviorError(
+                    "llm.network_error", cases["reject_400"],
+                    payload_extras={"exception_type": "BadRequestError",
+                                    "message": cases["reject_400"]})
+            return self.inner.complete(**kw)
+
+    class AlwaysFailing:
+        """Raises `err` on every call (a persistent 400, or a 500)."""
+        default_model = "fixture-failing"
+
+        def __init__(self, err):
+            self.err, self.calls = err, 0
+
+        def complete(self, **kw):
+            self.calls += 1
+            raise self.err
+
+    base_kwargs = dict(system="", messages=[], model="fixture", max_tokens=64,
+                       top_p=1.0, output_schema=None, timeout_seconds=5)
+
+    # ── omission: framework default forwards as the server default ─────────
+    reset_llm_session()
+    rec = Recording()
+    w = LabProviderWrapper(rec, prompt_bodies=_lab_prompt_bodies())
+    w.complete(temperature=cases["framework_default_temperature"], **base_kwargs)
+    c.that(rec.seen == [cases["server_default_temperature"]],
+           f"framework-default temperature forwards as the server default "
+           f"({rec.seen})")
+    w.complete(temperature=cases["explicit_temperature"], **base_kwargs)
+    c.that(rec.seen[-1] == cases["explicit_temperature"],
+           "an explicit temperature passes through untouched")
+
+    # ── strip-and-retry: 400 naming temperature → one retry + metadata ─────
+    reset_llm_session()
+    opus = OpusShaped()
+    w = LabProviderWrapper(opus, prompt_bodies=_lab_prompt_bodies())
+    resp = w.complete(temperature=cases["explicit_temperature"], **base_kwargs)
+    c.that(opus.seen == [cases["explicit_temperature"],
+                         cases["server_default_temperature"]],
+           f"unsupported-parameter 400 → strip and retry exactly once "
+           f"({opus.seen})")
+    stripped = (resp.provider_meta or {}).get("lab_param_stripped") or {}
+    c.that(stripped.get("parameter") == exp["stripped_parameter"]
+           and stripped.get("original_value") == cases["explicit_temperature"],
+           f"the strip rides provider_meta → llm.responded payload ({stripped})")
+    c.that(not _LLM_STATE["anomalies"],
+           "a successful strip-retry queues no anomaly")
+
+    # ── persistent 400: retried once, then surfaces as a CALL failure ──────
+    reset_llm_session()
+    rej = AlwaysFailing(LLMBehaviorError(
+        "llm.network_error", cases["reject_400"],
+        payload_extras={"exception_type": "BadRequestError",
+                        "message": cases["reject_400"]}))
+    w = LabProviderWrapper(rej, prompt_bodies=_lab_prompt_bodies())
+    w.complete(temperature=cases["explicit_temperature"], **base_kwargs)
+    c.that(rej.calls == 2, f"persistent 400: exactly one retry ({rej.calls})")
+    c.that([a["kind"] for a in _LLM_STATE["anomalies"]] == ["call"],
+           f"the second failure queues a call anomaly "
+           f"({[a['kind'] for a in _LLM_STATE['anomalies']]})")
+
+    # ── a 500 is a CALL failure and is never strip-retried ──────────────────
+    fail = AlwaysFailing(LLMBehaviorError(
+        "llm.network_error", cases["server_500"],
+        payload_extras={"exception_type": "InternalServerError",
+                        "message": cases["server_500"]}))
+    w = LabProviderWrapper(fail, prompt_bodies=_lab_prompt_bodies())
+    w.complete(temperature=cases["server_default_temperature"], **base_kwargs)
+    c.that(fail.calls == 1, f"a 500 is not retried ({fail.calls} call)")
+    c.that(_LLM_STATE["anomalies"][-1]["kind"] == "call",
+           "a 500 queues a call anomaly")
+
+    # ── delivered-but-unparseable output stays in the PARSE domain ─────────
+    class Garbage:
+        default_model = "fixture-garbage"
+
+        def complete(self, **kw):
+            return _ok_response("sorry, I cannot produce JSON today.")
+
+    w = LabProviderWrapper(Garbage(), prompt_bodies=_lab_prompt_bodies())
+    w.complete(temperature=cases["server_default_temperature"],
+               **{**base_kwargs, "output_schema": PlanProposal})
+    c.that(_LLM_STATE["anomalies"][-1]["kind"] == "parse",
+           "unparseable delivered output queues a parse anomaly")
+
+    # ── the recorder splits the observation kinds ───────────────────────────
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    consume_llm_anomalies(g)
+    call_obs = _lab_obs(g, exp["call_failure_kind"])
+    parse_obs = _lab_obs(g, exp["parse_failure_kind"])
+    c.that(len(call_obs) == 2 and len(parse_obs) == 1,
+           f"observations split by domain: {len(call_obs)} call, "
+           f"{len(parse_obs)} parse")
+    c.that(all("provider call failed" in o.data.get("text", "")
+               for o in call_obs),
+           "call-failure observations carry the provider error")
+
+    # ── end to end: an Opus-shaped model through the real behaviors ────────
+    clear_lab_registry()
+    reset_llm_session()
+    opus = OpusShaped()
+    rt = Runtime(Graph(), llm_provider=LabProviderWrapper(
+        opus, prompt_bodies=_lab_prompt_bodies()))
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings())
+    bind_live_behaviors(rt)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Params branch", "talk here",
+                              status="active")
+    rt.run_until_idle()
+    send_branch_message_fn(g, branch.id, "are you alive on opus?")
+    rt.run_until_idle()
+    c.that(bool(opus.seen) and all(
+        t == cases["server_default_temperature"] for t in opus.seen),
+        f"lab declarations omit temperature: an Opus-shaped model never "
+        f"400s ({sorted(set(opus.seen))})")
+    # a future explicit setting (seam/settings) still strips on the 400
+    rt.get_behavior("lab.answer").temperature = cases["explicit_temperature"]
+    n_seen = len(opus.seen)
+    send_branch_message_fn(g, branch.id, "and explicitly tempered?")
+    rt.run_until_idle()
+    c.that(cases["explicit_temperature"] in opus.seen[n_seen:],
+           "explicit behavior temperature reaches the wire first")
+    responded = [e for e in g.events if str(e.type) == "llm.responded"]
+    strips = [(e.payload.get("provider_meta") or {}).get("lab_param_stripped")
+              for e in responded]
+    strips = [s for s in strips if s]
+    c.that(bool(strips) and strips[-1]["parameter"] == exp["stripped_parameter"],
+           f"llm.responded event metadata records the strip ({strips[-1:]})")
+    reset_llm_session()
+    print(f"  strip-retry: {opus.seen[n_seen:]} → success; "
+          f"domains: {len(call_obs)} call / {len(parse_obs)} parse")
+    return c.done("model_params")
+
+
 def run_charter() -> bool:
     spec = _load("charter.yaml")
     print("\n" + "=" * 64)
@@ -1800,6 +1987,7 @@ def run_all() -> None:
         run_seams(),
         run_charter(),
         run_model_routing(),
+        run_model_params(),
         run_research_worker(),
         run_seam_proposal(),
         run_github_read(),
