@@ -178,7 +178,16 @@ New ADRs append to the end. Changing a CONTRACT.md invariant requires an ADR her
 - Enablement: `research_worker_enabled` defaults False in the pack — no embedding, fixture, or test reaches the network by surprise — and the server boot enables it; the live lab always runs the worker. Budgets and pause ride the provider wrapper like every lab llm_behavior. Claimed/synthesized task ids rebuild from their observations on resume; in-flight fetches do not survive a restart — the stall watchdog releases the task (accepted: a restart costs one task retry, not a coordinator).
 - Rationale: the capability gap was the honest state of the evidence base, but honesty about not working is worth less than working honestly — a worker that lives in the lab, obeys the same gateway/budget/pause rails, and disappears the moment upstream fills the gap keeps the emergent-coordination claim intact while making research branches actually execute.
 
-ADR-021–022: reserved for the in-flight consolidation session (MCP expansion, GitHub read).
+## ADR-021: MCP expansion — deeper reads, reversible operator controls; the inbox does not move
+
+- Status: accepted; amends ADR-016
+- Date: 2026-06-11
+- Decision (a), READ tier: two new tools, both pure projections of public data on the fast path so the operator's AI can inspect traces without the agent in the loop. `get_log` mirrors `/lab/log` (the FULL event log as one-line rows, cursor-paginated) and `get_entity` mirrors `/lab/entity` (any object or event id → fields, decoded relations both ways, raw payload, prev/next) — each calls the SAME projection function as its HTTP twin, so the two surfaces cannot drift (parity is fixture-locked). `get_errors` already sits in the READ tier (ADR-023); verified present, not rebuilt.
+- Decision (b), NEW operator-control tier (same MCP authority as send_chat, same rate limiter): `set_budget` (params `amount_usd`, `today_only`) sets the daily LLM cost cap — clamped to the kernel `ABSOLUTE_DAILY_COST_CEILING_USD` (ADR-019) at intake AND at the enforcement point, and recorded as a public `lab.budget_set` control event carrying old → new and scope. A today-only cap dies at UTC midnight and the latest persistent cap resumes; the log is the persistence (sync_daily_budget rebuilds, like pause). `pause_lab` / `resume_lab` carry the same semantics as the UI toggle — public `lab.paused`/`lab.resumed` control events, answer stays live, resume drains immediately — tagged `by=operator_via_mcp`.
+- Rationale for (b): budget and pause are REVERSIBLE operational controls, categorically unlike promotions — a wrong pause costs minutes and is undone by its twin tool; a wrong promotion publishes or self-modifies. The line that does not move: approve/reject of decisions and seam promotion remain EXCLUDED from MCP — the inbox stays human-only. (ADR-016's "pause/resume excluded" clause is superseded by exactly this reversibility argument; its two-way token separation, send_chat tagging, and everything else stand.)
+- Note: `lab.budget_set` joins the marker-event family (ADR-013/015) — a log entry the lab's own projections and budget rebuild read, projecting no graph state. The sentinel audit covers every new tool's output like every public surface.
+
+ADR-022: reserved for the in-flight consolidation session (GitHub read).
 
 ## ADR-023: Chat path failure domain — the append is the only fail point; everything else degrades, diagnosably
 

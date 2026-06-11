@@ -135,7 +135,13 @@ def _run() -> int:
     for name, args in (("get_status", {}), ("get_feed", {}),
                        ("get_branch", {"branch_id": str(branch.id)}),
                        ("get_pending_decisions", {}), ("list_posts", {}),
-                       ("list_seams", {}),
+                       ("list_seams", {}), ("get_errors", {}),
+                       # ADR-021 expansion: the new READ + control tools join
+                       # the audited corpus like every public surface.
+                       ("get_log", {"limit": 50}),
+                       ("get_entity", {"id": str(branch.id)}),
+                       ("set_budget", {"amount_usd": 9.5, "today_only": True}),
+                       ("pause_lab", {}), ("resume_lab", {}),
                        ("send_chat", {"branch_id": str(branch.id),
                                       "message": "audit: anything secret in here?"})):
         mcp_outputs.append(mcp_call("tools/call", {"name": name, "arguments": args}))

@@ -318,6 +318,12 @@ _LLM_STATE: dict[str, Any] = {
     "daily_cost": Decimal("0"),   # today's spend, from llm.responded events
     "daily_cost_recorded": False,
     "cost_cap_override": None,    # approved setting.daily_cost_cap_usd seam
+    # ADR-021: the MCP set_budget operator control, rebuilt from
+    # lab.budget_set marker events: {"persistent": float|None,
+    # "today_amount": float|None, "today_date": str|None}. A today-only cap
+    # dies at UTC midnight and the latest persistent cap (if any) resumes;
+    # a persistent set clears any standing today-only deviation.
+    "operator_cost_cap": None,
     "paused": False,              # ADR-015; rebuilt from lab.paused/resumed
     "pause_skipped": set(),       # behaviors skipped THIS pause episode
     "last_model": None,
@@ -340,6 +346,7 @@ def sync_daily_budget(rt) -> int:
     cost = Decimal("0")
     paused = _LLM_STATE["paused"]
     saw_marker = False
+    budget_evt = None
     for e in rt.graph.events:
         t = str(e.type)
         ts = str(getattr(e, "timestamp", "") or "")
@@ -354,6 +361,19 @@ def sync_daily_budget(rt) -> int:
             paused, saw_marker = True, True
         elif t == "lab.resumed":
             paused, saw_marker = False, True
+        elif t == "lab.budget_set":
+            if budget_evt is None:
+                budget_evt = {"persistent": None, "today_amount": None,
+                              "today_date": None}
+            amount = float(e.payload.get("new_usd") or 0)
+            if e.payload.get("today_only"):
+                budget_evt["today_amount"] = amount
+                budget_evt["today_date"] = str(e.payload.get("date") or "")
+            else:
+                budget_evt["persistent"] = amount
+                budget_evt["today_amount"] = None  # explicit set supersedes
+                budget_evt["today_date"] = None
+    _LLM_STATE["operator_cost_cap"] = budget_evt
     _LLM_STATE["daily_used"] = used
     _LLM_STATE["daily_cost"] = cost
     if saw_marker and paused != _LLM_STATE["paused"]:
@@ -398,7 +418,56 @@ def reset_llm_session() -> None:
                       budget_recorded=False, daily_used=0,
                       daily_recorded=False, daily_cost=Decimal("0"),
                       daily_cost_recorded=False, cost_cap_override=None,
+                      operator_cost_cap=None,
                       paused=False, pause_skipped=set(), last_model=None)
+
+
+def _operator_cap_now() -> Optional[float]:
+    """The MCP set_budget override in force, if any: a today-only cap dies
+    at UTC midnight and the latest persistent cap (if any) resumes
+    (ADR-021)."""
+    from datetime import datetime, timezone
+    oc = _LLM_STATE.get("operator_cost_cap")
+    if not oc:
+        return None
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if oc.get("today_amount") is not None and oc.get("today_date") == today:
+        return float(oc["today_amount"])
+    if oc.get("persistent") is not None:
+        return float(oc["persistent"])
+    return None
+
+
+def set_operator_budget(rt, amount_usd: float, *, today_only: bool,
+                        by: str = "operator") -> dict:
+    """ADR-021: the reversible budget control. Clamps to the kernel ceiling,
+    appends a public lab.budget_set control event recording old → new and
+    scope (the log is the persistence; sync_daily_budget rebuilds), and
+    updates in-process state."""
+    from datetime import datetime, timezone
+    from .behaviors import emit_lab_event
+    from .settings import LabSettings
+    requested = float(amount_usd)
+    amount = min(requested, ABSOLUTE_DAILY_COST_CEILING_USD)
+    old = current_cost_cap(LabSettings().daily_cost_cap_usd)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    emit_lab_event(rt.graph, "lab.budget_set", {
+        "old_usd": old, "new_usd": amount, "requested_usd": requested,
+        "today_only": bool(today_only), "date": today, "by": by,
+    })
+    oc = _LLM_STATE.get("operator_cost_cap") or {
+        "persistent": None, "today_amount": None, "today_date": None}
+    if today_only:
+        oc["today_amount"], oc["today_date"] = amount, today
+    else:
+        oc["persistent"] = amount
+        oc["today_amount"] = oc["today_date"] = None
+    _LLM_STATE["operator_cost_cap"] = oc
+    return {"old_usd": old, "new_usd": amount, "requested_usd": requested,
+            "clamped": requested > amount,
+            "ceiling_usd": ABSOLUTE_DAILY_COST_CEILING_USD,
+            "scope": "today_only (resets at UTC midnight)" if today_only
+                     else "until changed"}
 
 
 def reset_llm_run_counters() -> None:
@@ -545,6 +614,9 @@ class LabProviderWrapper:
         value — and EVERY result clamps to the kernel's absolute ceiling.
         Tuning the cap is self-modification through the gate; moving the
         ceiling is a git change."""
+        operator = _operator_cap_now()
+        if operator is not None:  # the most recent human intent wins (ADR-021)
+            return min(operator, ABSOLUTE_DAILY_COST_CEILING_USD)
         override = _LLM_STATE.get("cost_cap_override")
         cap = float(override) if override is not None else self._max_daily_cost
         return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)
@@ -686,8 +758,12 @@ def active_provider() -> Any:
 
 
 def current_cost_cap(settings_default: float) -> float:
-    """The daily cost cap in force for display paths: seam override else the
-    settings value, clamped to the kernel ceiling (ADR-019)."""
+    """The daily cost cap in force for display paths: operator control, else
+    seam override, else the settings value — clamped to the kernel ceiling
+    (ADR-019/021)."""
+    operator = _operator_cap_now()
+    if operator is not None:
+        return min(operator, ABSOLUTE_DAILY_COST_CEILING_USD)
     override = _LLM_STATE.get("cost_cap_override")
     cap = float(override) if override is not None else float(settings_default)
     return min(cap, ABSOLUTE_DAILY_COST_CEILING_USD)

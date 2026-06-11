@@ -771,6 +771,12 @@ def _build_entries(g, timeline=None) -> list[dict]:
         elif e.type == "lab.resumed":
             sentence = "Lab resumed by the operator."
             kind = "control"
+        elif e.type == "lab.budget_set":
+            p = e.payload or {}
+            scope = "today only" if p.get("today_only") else "until changed"
+            sentence = (f"Daily budget set to ${float(p.get('new_usd') or 0):.2f} "
+                        f"({scope}) — was ${float(p.get('old_usd') or 0):.2f}.")
+            kind = "control"
         if sentence:
             entry = {
                 "event_id": str(e.id),
@@ -878,6 +884,10 @@ def _event_summary(g, e) -> str:
         return "lab paused by the operator"
     if t == "lab.resumed":
         return "lab resumed by the operator"
+    if t == "lab.budget_set":
+        scope = "today only" if p.get("today_only") else "until changed"
+        return (f"daily budget set to ${float(p.get('new_usd') or 0):.2f} "
+                f"({scope}) — was ${float(p.get('old_usd') or 0):.2f}")
     return t  # unknown kind: labeled, never blank
 
 
@@ -1252,7 +1262,7 @@ def _chat_job(rt, branch_id: str, content: str, source: Optional[str] = None):
     return out
 
 
-def _pause_job(rt, paused: bool) -> dict:
+def _pause_job(rt, paused: bool, by: str = "operator") -> dict:
     """Flip the global pause (ADR-015). Runs on the runtime worker. A resume
     drains immediately: the lab.resumed marker must take effect in the running
     process — queued triggers (including any replay-requeued backlog) fire on
@@ -1263,7 +1273,7 @@ def _pause_job(rt, paused: bool) -> dict:
     from lab_pack.llm import lab_paused, reset_llm_run_counters, set_lab_paused
     if lab_paused() == paused:
         return {"paused": paused, "changed": False}
-    set_lab_paused(rt.graph, paused, by="operator")
+    set_lab_paused(rt.graph, paused, by=by)
     if not paused:
         reset_llm_run_counters()
         rt.run_until_idle()

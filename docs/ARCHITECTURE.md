@@ -29,7 +29,7 @@ Eleven small reactive behaviors, no orchestrator:
 
 ## Event taxonomy
 
-The runtime owns the taxonomy: `object.created` / `object.patched` / relation events, plus `llm.requested`/`llm.responded` for llm_behaviors. The lab adds no STATE-BEARING event types; lab semantics (progress, approval-request, narration) are payloads on graph mutations — progress is an observation patch, an approval request is a pending decision object. Three marker events are appended but project no graph state: `artifact.published` (ADR-013) and `lab.paused`/`lab.resumed` (ADR-015) — pure log entries the lab's own projections and boot-time rebuilds read. The feed is a projection over these events joined with their objects.
+The runtime owns the taxonomy: `object.created` / `object.patched` / relation events, plus `llm.requested`/`llm.responded` for llm_behaviors. The lab adds no STATE-BEARING event types; lab semantics (progress, approval-request, narration) are payloads on graph mutations — progress is an observation patch, an approval request is a pending decision object. Four marker events are appended but project no graph state: `artifact.published` (ADR-013), `lab.paused`/`lab.resumed` (ADR-015), and `lab.budget_set` (ADR-021) — pure log entries the lab's own projections and boot-time rebuilds read. The feed is a projection over these events joined with their objects.
 
 ## Worker coordination (ADR-006)
 

@@ -10,12 +10,17 @@ goes through the same code path as POST /chat. Auth (LAB_MCP_TOKEN) and the
 rate limiter live in server/lab_server.py (kernel, ADR-012); this module
 only sees already-authorized messages.
 
-Tool tiers (ADR-016; get_errors added by ADR-023):
+Tool tiers (ADR-016; get_errors added by ADR-023; ADR-021 expansion):
   READ:     get_status, get_feed, get_branch, get_pending_decisions,
-            get_post, list_posts, list_seams, get_errors
+            get_post, list_posts, list_seams, get_errors, get_log,
+            get_entity — pure projections of public data, fast path.
   OPERATOR: send_chat (tagged source=operator_via_mcp in the public log)
-  EXCLUDED BY DESIGN: decision approval, pause/resume, seam promotion —
-            the inbox is the one place only the human operator exists.
+  OPERATOR CONTROL (ADR-021; same authority as send_chat): set_budget,
+            pause_lab, resume_lab — REVERSIBLE operational controls,
+            categorically unlike promotions; each emits a public control
+            event.
+  EXCLUDED BY DESIGN: approve/reject of decisions and seam promotion
+            remain EXCLUDED from MCP — the inbox stays human-only.
 """
 
 from __future__ import annotations
@@ -29,8 +34,11 @@ INSTRUCTIONS = (
     "Read-and-talk surface for the activegraph-lab research agent. READ tools "
     "project the public event log (cite event ids like evt_42 and branch ids "
     "back to the operator). send_chat posts to a branch thread AS the operator "
-    "— it lands in the public log. Approving decisions, pausing, and seam "
-    "promotion are deliberately not available here (ADR-016)."
+    "— it lands in the public log. set_budget and pause_lab/resume_lab are "
+    "reversible operator controls (public control events; budgets clamp to a "
+    "kernel ceiling). Approving/rejecting decisions and seam promotion are "
+    "deliberately not available here — the inbox stays human-only "
+    "(ADR-016/021)."
 )
 
 _DEFAULT_LIMIT = 30
@@ -113,6 +121,70 @@ TOOLS: list[dict] = [
             },
             "required": [],
         },
+    },
+    {
+        "name": "get_log",
+        "description": "The FULL event log (the feed shows only narrated "
+                       "entries) as one-line rows, newest first — mirror of "
+                       "/lab/log. Cursor-paginated: pass the oldest rendered "
+                       "event id as `before` for older rows.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "before": {"type": "string",
+                           "description": "Return rows older than this event id."},
+                "limit": {"type": "integer",
+                          "description": "Max rows (default 100, max 500)."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_entity",
+        "description": "Inspect ANY object or event id — mirror of "
+                       "/lab/entity. Objects: fields, creation/patch events, "
+                       "decoded relations both ways. Events: full payload, "
+                       "prev/next ids, onward refs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string",
+                                  "description": "e.g. branch#3 or evt_42"}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "set_budget",
+        "description": "OPERATOR CONTROL (ADR-021): set the daily LLM cost "
+                       "cap in USD. Clamped to the kernel ceiling "
+                       "($100/day — not movable from here). today_only=true "
+                       "resets at UTC midnight. Emits a public control event "
+                       "recording old → new and scope. Reversible, unlike "
+                       "decision approval — which stays human-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "amount_usd": {"type": "number",
+                               "description": "The new daily cap in USD (> 0)."},
+                "today_only": {"type": "boolean",
+                               "description": "True: applies today (UTC) only."},
+            },
+            "required": ["amount_usd"],
+        },
+    },
+    {
+        "name": "pause_lab",
+        "description": "OPERATOR CONTROL (ADR-021): pause the lab — same "
+                       "semantics as the UI toggle (every LLM behavior except "
+                       "answer idles; a public lab.paused control event is "
+                       "appended). Reversible via resume_lab.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "resume_lab",
+        "description": "OPERATOR CONTROL (ADR-021): resume the lab — appends "
+                       "a public lab.resumed control event and drains queued "
+                       "work immediately.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "send_chat",
@@ -287,6 +359,29 @@ def _tool_get_errors(rt, args: dict) -> dict:
                      "restart, never authoritative — the event log is")}
 
 
+def _tool_get_log(rt, args: dict) -> dict:
+    """ADR-021: mirror of GET /lab/log — same projection function, so HTTP
+    and MCP cannot drift."""
+    from server.lab_server import _log_page
+    try:
+        limit = max(1, min(int(args.get("limit") or 100), 500))
+    except (TypeError, ValueError):
+        limit = 100
+    return _log_page(rt.graph, args.get("before"), limit)
+
+
+def _tool_get_entity(rt, args: dict) -> dict:
+    """ADR-021: mirror of GET /lab/entity — same projection function."""
+    from server.lab_server import _entity_projection
+    entity_id = (args.get("id") or "").strip()
+    if not entity_id:
+        raise ToolError("id is required")
+    out = _entity_projection(rt.graph, entity_id)
+    if out is None:
+        raise ToolError(f"no such entity: {entity_id}")
+    return out
+
+
 _READ_TOOLS = {
     "get_status": _tool_get_status,
     "get_feed": _tool_get_feed,
@@ -296,6 +391,8 @@ _READ_TOOLS = {
     "list_posts": _tool_list_posts,
     "list_seams": _tool_list_seams,
     "get_errors": _tool_get_errors,
+    "get_log": _tool_get_log,
+    "get_entity": _tool_get_entity,
 }
 
 
@@ -432,6 +529,42 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     })
 
 
+# ── operator-control tier (ADR-021) ─────────────────────────────────────────
+# Same MCP authority as send_chat; rate-limited like every mutation. Each
+# control emits a PUBLIC event (lab.budget_set / lab.paused / lab.resumed)
+# — these are reversible operational controls, categorically unlike
+# promotions. Approve/reject and seam promotion remain EXCLUDED.
+
+
+def _control_set_budget(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dict:
+    try:
+        amount = float(args.get("amount_usd"))
+    except (TypeError, ValueError):
+        return _tool_failure(msg_id, "amount_usd must be a number")
+    if amount <= 0:
+        return _tool_failure(msg_id, "amount_usd must be positive")
+    today_only = bool(args.get("today_only"))
+    get_rt()
+
+    def job(rt):
+        from lab_pack.llm import set_operator_budget
+        from server.lab_server import _save
+        out = set_operator_budget(rt, amount, today_only=today_only,
+                                  by="operator_via_mcp")
+        _save(rt)
+        return out
+
+    return _tool_result(msg_id, run_on_worker(job))
+
+
+def _control_pause(msg_id: Any, paused: bool, *, get_rt, run_on_worker) -> dict:
+    from server.lab_server import _pause_job
+    get_rt()
+    out = run_on_worker(lambda rt: _pause_job(rt, paused,
+                                              by="operator_via_mcp"))
+    return _tool_result(msg_id, out)
+
+
 def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
                 rate_limited) -> tuple[int, Optional[dict]]:
     """One streamable-HTTP POST: a single JSON-RPC message in, a single JSON
@@ -470,12 +603,19 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name == "send_chat":
+        if name in ("send_chat", "set_budget", "pause_lab", "resume_lab"):
             if rate_limited():
                 return 429, _rpc_error(msg_id, -32000,
                                        "rate limited (30 mutations/min)")
-            return 200, _send_chat(msg_id, args, get_rt=get_rt, lock=lock,
-                                   run_on_worker=run_on_worker)
+            if name == "send_chat":
+                return 200, _send_chat(msg_id, args, get_rt=get_rt, lock=lock,
+                                       run_on_worker=run_on_worker)
+            if name == "set_budget":
+                return 200, _control_set_budget(msg_id, args, get_rt=get_rt,
+                                                run_on_worker=run_on_worker)
+            return 200, _control_pause(msg_id, name == "pause_lab",
+                                       get_rt=get_rt,
+                                       run_on_worker=run_on_worker)
         fn = _READ_TOOLS.get(name)
         if fn is None:
             return 200, _rpc_error(msg_id, -32602, f"unknown tool: {name}")

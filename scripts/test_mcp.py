@@ -185,12 +185,17 @@ def main() -> int:
         tools = {t["name"] for t in (b.get("result") or {}).get("tools", [])}
         expected = {"get_status", "get_feed", "get_branch", "get_pending_decisions",
                     "get_post", "list_posts", "list_seams", "get_errors",
-                    "send_chat"}
+                    "get_log", "get_entity",
+                    "send_chat", "set_budget", "pause_lab", "resume_lab"}
         check(tools == expected,
-              f"exactly the 8 ADR-016 tools + get_errors (ADR-023) ({sorted(tools)})")
-        gate_tools = {"approve_decision", "reject_decision", "pause", "resume",
-                      "promote_seam"}
-        check(not (tools & gate_tools), "no gate authority exposed (excluded by design)")
+              f"exactly the ADR-016 tools + get_errors (ADR-023) + the "
+              f"ADR-021 expansion ({sorted(tools)})")
+        check("get_errors" in tools, "get_errors present in the READ tier (ADR-023)")
+        gate_tools = {"approve_decision", "reject_decision", "promote_seam",
+                      "approve", "reject"}
+        check(not (tools & gate_tools),
+              "no gate authority exposed — approve/reject and seam promotion "
+              "stay human-only (ADR-021)")
 
         print("== read tools ==")
         s, _, status = call_tool(base, "get_status")
@@ -244,6 +249,114 @@ def main() -> int:
         s, _, errs = call_tool(base, "get_errors")
         check(s == 200 and "errors" in errs and "note" in errs,
               "get_errors projects the diagnostics ring buffer (ADR-023)")
+
+        print("== get_log / get_entity parity with the HTTP projections (ADR-021) ==")
+        def http_get(path):
+            r = urllib.request.Request(base + path)
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return json.loads(resp.read())
+        s, _, log = call_tool(base, "get_log", {"limit": 10})
+        check(s == 200 and len(log.get("rows", [])) == 10
+              and log.get("total", 0) > 10,
+              f"get_log returns one-line rows ({len(log.get('rows', []))}/"
+              f"{log.get('total')})")
+        check(log == http_get("/lab/log?limit=10"),
+              "get_log is byte-identical to GET /lab/log")
+        s, _, older = call_tool(base, "get_log",
+                                {"limit": 10, "before": log["oldest_rendered"]})
+        ids_a = {r["event_id"] for r in log["rows"]}
+        ids_b = {r["event_id"] for r in older.get("rows", [])}
+        check(ids_b and not (ids_a & ids_b), "get_log cursor pages do not overlap")
+        check(all((r.get("summary") or "").strip() for r in log["rows"]),
+              "no log row renders blank")
+
+        s, _, ent = call_tool(base, "get_entity", {"id": seed_branch.id})
+        check(s == 200 and ent.get("kind") == "object"
+              and (ent.get("relations_out") or ent.get("relations_in")),
+              "get_entity on an object id returns fields + relations")
+        from urllib.parse import quote
+        check(ent == http_get(f"/lab/entity?id={quote(str(seed_branch.id), safe='')}"),
+              "get_entity is byte-identical to GET /lab/entity")
+        evt_id = log["rows"][0]["event_id"]
+        s, _, ev = call_tool(base, "get_entity", {"id": evt_id})
+        check(ev.get("kind") == "event" and ev.get("prev_id")
+              and "refs" in ev,
+              "get_entity on an event id returns payload + prev/next + refs")
+        s, _, err = call_tool(base, "get_entity", {"id": "thing#9999"})
+        check(isinstance(err, str) and "no such entity" in err,
+              "get_entity on a bogus id is a tool error, not a 500")
+
+        print("== operator-control tier (ADR-021): set_budget clamps to the ceiling ==")
+        from lab_pack.kernel import ABSOLUTE_DAILY_COST_CEILING_USD as CEIL
+        s, _, out = call_tool(base, "set_budget", {"amount_usd": 500})
+        check(s == 200 and out.get("new_usd") == CEIL and out.get("clamped") is True,
+              f"set_budget 500 clamps to the kernel ceiling ({out.get('new_usd')})")
+        s, _, st = call_tool(base, "get_status")
+        check(st.get("llm_cost_cap") == CEIL,
+              f"status reports the clamped cap ({st.get('llm_cost_cap')})")
+        s, _, out = call_tool(base, "set_budget",
+                              {"amount_usd": 12.5, "today_only": True})
+        check(out.get("new_usd") == 12.5 and "today_only" in out.get("scope", ""),
+              f"today-only cap under the ceiling passes through ({out})")
+        s, _, st = call_tool(base, "get_status")
+        check(st.get("llm_cost_cap") == 12.5,
+              f"today-only cap in force ({st.get('llm_cost_cap')})")
+        bevts = [e for e in rt.graph.events if str(e.type) == "lab.budget_set"]
+        check(len(bevts) == 2
+              and bevts[-1].payload.get("old_usd") == CEIL
+              and bevts[-1].payload.get("new_usd") == 12.5
+              and bevts[-1].payload.get("today_only") is True
+              and bevts[-1].payload.get("by") == "operator_via_mcp",
+              "public control events record old → new and scope")
+        # today_only resets at UTC midnight: backdate the marker, resync (the
+        # log is the persistence) — the persistent cap resumes.
+        bevts[-1].payload["date"] = "2000-01-01"
+        from lab_pack.llm import sync_daily_budget
+        sync_daily_budget(rt)
+        s, _, st = call_tool(base, "get_status")
+        check(st.get("llm_cost_cap") == CEIL,
+              f"expired today-only cap → the persistent cap resumes "
+              f"({st.get('llm_cost_cap')})")
+        s, _, err = call_tool(base, "set_budget", {"amount_usd": -3})
+        check(isinstance(err, str) and "positive" in err,
+              "set_budget validates the amount")
+
+        print("== operator-control tier (ADR-021): pause/resume via MCP ==")
+        from lab_pack.llm import reset_llm_run_counters
+        s, _, out = call_tool(base, "pause_lab")
+        check(s == 200 and out.get("paused") is True and out.get("changed") is True,
+              "pause_lab pauses (public lab.paused event)")
+        s, _, st = call_tool(base, "get_status")
+        check(st.get("paused") is True, "status shows paused")
+        proposed_before = len([b for b in g.objects(type="branch")
+                               if b.data.get("status") == "proposed"])
+        reset_llm_run_counters()
+        g.add_object("observation", {
+            "text": "Claim while paused: replay rebuilds state deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": None}})
+        rt.run_until_idle()
+        proposed_paused = len([b for b in g.objects(type="branch")
+                               if b.data.get("status") == "proposed"])
+        check(proposed_paused == proposed_before,
+              "behaviors idle while paused via MCP")
+        s, _, out = call_tool(base, "resume_lab")
+        check(out.get("paused") is False and out.get("changed") is True,
+              "resume_lab resumes and drains")
+        reset_llm_run_counters()
+        g.add_object("observation", {
+            "text": "Claim after resume: replay rebuilds state deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": None}})
+        rt.run_until_idle()
+        proposed_resumed = len([b for b in g.objects(type="branch")
+                                if b.data.get("status") == "proposed"])
+        check(proposed_resumed == proposed_paused + 1,
+              f"behaviors fire again after resume "
+              f"({proposed_resumed - proposed_paused} new proposal)")
+        check(any(str(e.type) == "lab.paused" for e in g.events)
+              and any(str(e.type) == "lab.resumed" for e in g.events),
+              "pause/resume control events are in the public log")
 
         print("== send_chat round-trip (operator authority via MCP) ==")
         s, _, out = call_tool(base, "send_chat",
