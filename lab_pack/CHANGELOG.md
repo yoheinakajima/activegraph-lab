@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Per-behavior budget exhaustion is observable (the 2026-06-12 burst):
+  hitting the per-behavior cap records ONE `llm_behavior_budget`
+  observation per behavior per run episode (queue-side dedup, like the
+  pause path; counters-reset = new episode) plus a feed narration naming
+  the starved behavior — independent of the session-wide
+  `budget_recorded` flag, which previously swallowed every per-behavior
+  exhaustion after the first budget observation of any kind, so a newly
+  activated branch's `lab.plan` went `[lab-inert]` with no trace. The
+  burst incident itself (4,357→13,677 events in ~15 min, ~78% no-op
+  bookkeeping, caused_by fan-out, MCP timeouts as collateral) is seeded
+  as a keyed LIVE_FINDINGS entry; debounce/compaction design is
+  deliberately reserved for the lab's own investigation branch. Locked
+  by the budget_starvation fixture.
+
 - Decision resolution carries rationale (ADR-026): `POST /lab/decision`
   takes an optional rationale; the ONE resolution patch event records
   `metadata.resolution_rationale` + `resolved_by=operator` (the

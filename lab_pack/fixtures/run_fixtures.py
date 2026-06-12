@@ -1019,6 +1019,83 @@ def run_operator_controls() -> bool:
     return c.done("operator_controls")
 
 
+def run_budget_starvation() -> bool:
+    spec = _load("budget_starvation.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: budget_starvation — per-behavior exhaustion is observable "
+          "(ADR-019 follow-up)")
+    print("=" * 64)
+
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper,
+                              _lab_prompt_bodies, reset_llm_run_counters,
+                              reset_llm_session)
+    from server.lab_server import _build_entries
+
+    clear_lab_registry()
+    reset_llm_session()
+    cap = int(spec["per_behavior_cap"])
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=cap, max_daily=200,
+                                 max_daily_cost_usd=50.0,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt = Runtime(Graph(), llm_provider=wrapper)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    def add_claim(i):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+        rt.run_until_idle()
+
+    def exhausted():
+        return [o for o in _lab_obs(g, "llm_behavior_budget")
+                if (o.data.get("metadata") or {}).get("behavior") == "plan"]
+
+    # The incident shape: the session-wide budget flag is already consumed
+    # (any earlier budget observation sets it). Per-behavior exhaustion must
+    # record regardless — this is exactly what the old path swallowed.
+    _LLM_STATE["budget_recorded"] = True
+
+    add_claim(1)
+    add_claim(2)
+    c.that(len(exhausted()) == 0, "under the cap → no exhaustion observation")
+    add_claim(3)
+    add_claim(4)
+    c.that(len(exhausted()) == exp["episode_observations"],
+           f"one llm_behavior_budget observation per behavior per episode, "
+           f"not per trigger ({len(exhausted())} for 2 capped triggers)")
+    c.that(bool(exhausted()) and "per-run cap" in exhausted()[0].data.get("text", ""),
+           "the observation names the cap")
+
+    narrated = [en for en in _build_entries(g)
+                if "Per-behavior LLM cap hit" in en["sentence"]]
+    c.that(len(narrated) == len(exhausted()),
+           f"each exhaustion observation narrates on the feed ({len(narrated)})")
+    c.that(bool(narrated) and "plan" in narrated[0]["sentence"],
+           "the narration names the starved behavior")
+    print(f"  episode 1: 2 capped triggers → {len(exhausted())} observation, "
+          f"{len(narrated)} feed narration")
+
+    # ── a new run episode may record again ──────────────────────────────────
+    reset_llm_run_counters()
+    add_claim(5)
+    add_claim(6)
+    add_claim(7)
+    c.that(len(exhausted()) == exp["second_episode_observations"],
+           f"new run episode → exhaustion records again ({len(exhausted())})")
+    print(f"  episode 2: counters reset, re-exhausted → {len(exhausted())} total")
+    return c.done("budget_starvation")
+
+
 def run_decision_rationale() -> bool:
     spec = _load("decision_rationale.yaml")
     print("\n" + "=" * 64)
@@ -2540,6 +2617,7 @@ def run_all() -> None:
         run_draft_writer(),
         run_editorial(),
         run_operator_controls(),
+        run_budget_starvation(),
         run_decision_rationale(),
         run_paused_boot(),
         run_seams(),
