@@ -387,7 +387,14 @@ def load_lab_packs(
     """Load the bundle's packs onto an existing Runtime (also used on resume —
     Runtime.load replays state without behaviors, so packs re-register here)."""
     rt.load_pack(core_pack, settings=CoreSettings())
-    rt.load_pack(tool_gateway_pack, settings=ToolGatewaySettings())
+    # max_output_chars sized so a full fetch envelope survives storage: the
+    # lab's fetcher returns up to 200K chars of page and JSON-escaping
+    # inflates it (~2x worst case for markup-heavy HTML). The gateway's 10K
+    # default truncated the live homepage's envelope mid-string — the 1/30
+    # crawl stall; diagnosis above _parse_fetch_envelope in behaviors.py,
+    # which also salvages any envelope that overflows this bound anyway.
+    rt.load_pack(tool_gateway_pack,
+                 settings=ToolGatewaySettings(max_output_chars=450_000))
     rt.load_pack(secrets_pack, settings=SecretsSettings())
     rt.load_pack(memory_gateway_pack, settings=MemoryGatewaySettings(backend_url=memory_backend_url))
     rt.load_pack(agent_profile_pack, settings=AgentProfileSettings())

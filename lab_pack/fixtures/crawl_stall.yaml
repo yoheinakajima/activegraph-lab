@@ -1,0 +1,81 @@
+description: |
+  The 1/30 crawl stall, reproduced and fixed. Production shape (mission#1,
+  evt_768, source#45): the gateway stores the fetch envelope JSON-encoded
+  and truncated to max_output_chars, so a real page's envelope was cut
+  mid-string; ingest's json.loads failed, the fallback treated the ESCAPED
+  envelope as HTML, and href=\"...\" matched no link — queued=0 forever.
+
+  The runner inflates the index page past the gateway's 10K default
+  (head preload noise before the nav, a long inline SVG path after the
+  prose — the same place production's source#45 was cut), then asserts:
+  the stored envelope IS truncated mid-JSON, yet the salvage parser
+  recovers the readable prefix, links extract (relative / fragment /
+  absolute same-host followed; off-domain, subdomain excluded), the crawl
+  proceeds to every same-host page within depth<=2 / page-cap caps, claims
+  stay clean, and the operator `recrawl` steering verb starts a fresh
+  crawl episode that ingest reacts to (ADR-025; replay never re-fires
+  behaviors, so the live lab needs this nudge).
+
+base_url: https://lab.example
+
+settings:
+  crawl_max_depth: 2
+  crawl_page_cap: 30
+  max_claims_per_page: 4
+  dispatch_gap_check: false
+
+index_template: |
+  <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+  <title>lab.example - an event-sourced runtime</title>
+  __HEAD_NOISE__
+  </head><body>
+  <header>
+    <a href="/docs">Docs</a>
+    <a href="/docs#install">Install</a>
+    <a href="https://lab.example/runtime/">Runtime</a>
+    <a href="/blog">Blog</a>
+    <a href="https://docs.lab.example/guide">Hosted docs</a>
+    <a href="https://github.com/example/lab">GitHub</a>
+    <a href="#top">Top</a>
+  </header>
+  <main>
+  <p>The runtime replays every event deterministically, so any agent run can
+  be audited after the fact.</p>
+  <p>Every behavior fires from graph state automatically, with no central
+  orchestrator in the loop.</p>
+  </main>
+  __TAIL_NOISE__
+  </body></html>
+
+pages:
+  https://lab.example/docs: |
+    <html><body><a href="/blog">Blog</a>
+    <p>Packs compose through graph state, not function calls, which lets you
+    remove a pack without rewiring the system.</p></body></html>
+  https://lab.example/runtime: |
+    <html><body>
+    <p>The runtime supports deterministic forks anchored to committed
+    events.</p></body></html>
+  https://lab.example/blog: |
+    <html><body><a href="/blog/post-1">Post one</a>
+    <p>Replay rebuilds the graph without re-firing behaviors.</p></body></html>
+  https://lab.example/blog/post-1: |
+    <html><body><a href="/blog/post-2">Post two</a>
+    <p>This post links one level deeper to test the depth cap on every
+    crawl.</p></body></html>
+  https://lab.example/blog/post-2: |
+    <html><body>
+    <p>Depth three. This page must never be fetched at crawl_max_depth
+    2.</p></body></html>
+
+branch:
+  title: read_the_website
+  intent: Read the site end to end.
+
+expected_outputs:
+  truncated_source_chars: 10000   # the gateway's max_output_chars default
+  fetched_pages: 5                # index, /docs, /runtime, /blog, /blog/post-1
+  never_fetched:
+    - https://lab.example/blog/post-2   # depth 3 > crawl_max_depth
+    - https://docs.lab.example/guide    # subdomain = off-host
+    - https://github.com/example/lab    # off-domain

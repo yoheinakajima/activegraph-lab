@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Truthful steering replies (ADR-025; the evt_3676 incident): steering
+  mutations apply before the reply is composed, the reply reports
+  POST-mutation state and cites the new `lab.steering_applied` marker
+  event for every applied verb, a no-op verb says so, and an action
+  request no verb supports draws an explicit refusal naming the
+  supported verb set — the model's pre-mutation narration is used only
+  for questions about state (its prompt now forbids action claims).
+  Verb matching is word-boundary ("activate" no longer hides inside
+  "deactivate", "pause" inside "unpause"). Locked by the
+  truthful_steering fixture.
+- Steering verbs `activate` (proposed/scoped → active, recording the
+  operator rationale as a branch_activated observation; the existing
+  dispatch reacts) and `deactivate` (active → proposed) — operator
+  authority, MCP-allowed (reversible, like pause; ADR-021's argument).
+  End-to-end locked in the research_worker fixture: MCP activate →
+  dispatch → worker claims, fetches, synthesizes, completes.
+- Decision keying closed correctly (ADR-025): pending decisions index by
+  branch as well as subject_ref (chat `approve` on a publish decision —
+  subject = the artifact — was a silent no-op). Exactly one pending
+  applies; multiple list ids without mutating; zero is an honest no-op;
+  and operator_via_mcp messages are REFUSED for approve/reject — the
+  inbox stays human-only (ADR-016/021).
+- The 1/30 crawl stall diagnosed and fixed (mission#1 evt_768 /
+  source#45): the gateway stores the fetch envelope JSON-encoded and
+  truncated at max_output_chars (default 10K), a real page's envelope
+  was cut mid-string, ingest's json.loads fallback treated the ESCAPED
+  envelope as HTML, and `href=\"...\"` matched no link — queued=0
+  forever. Fixed in layers: `_parse_fetch_envelope` salvages truncated
+  envelopes (diagnosis comment above it), link extraction is
+  anchor-scoped (bare `href=` also matched `<link rel=preload>` asset
+  tags — dozens of same-host /_next/ chunks that would burn the page
+  budget) and fragment-tolerant (`/docs#install` resolves to `/docs`
+  instead of being dropped), and bundle.load_lab_packs sizes the
+  gateway's max_output_chars so a full envelope survives storage.
+  Depth<=2 / page<=30 caps stand; existing junk-claim observations are
+  untouched (append-only log). New steering verb `recrawl` creates a
+  crawl_request scoped to the mission target_url for a fresh crawl
+  episode — replay never re-fires behaviors, so a resumed lab needs the
+  nudge. Locked by the crawl_stall fixture.
 - Seam-proposal truncation + evidence relevance (decision#195 /
   artifact#194): the chat-triggered seam_proposal_request capped the
   operator's message at 500 chars, so the seam_writer drafted a charter

@@ -41,6 +41,14 @@ branches:
   unhandled:
     title: Implement a parser probe
     intent: Implement code in the repo to test the parser end to end.
+  activated:
+    # ADR-025 Phase 2: stays proposed until the operator's MCP chat message
+    # activates it; the existing dispatch then reacts and the worker runs
+    # the task end to end.
+    title: Verify the replay claim after operator activation
+    intent: >
+      Research the replay claim using https://example.com/replay as the
+      primary source.
 
 expected_outputs:
   success_findings_min: 1

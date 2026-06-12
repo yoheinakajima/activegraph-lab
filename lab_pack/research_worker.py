@@ -257,15 +257,14 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
         return
     state["pending"].discard(call_id)
 
+    # Decode through the salvaging envelope parser — the gateway truncates
+    # stored output at max_output_chars, and a truncated envelope must not
+    # degrade into escaped-JSON soup (the 1/30 crawl stall; the diagnosis
+    # sits above _parse_fetch_envelope in behaviors.py).
+    from .behaviors import _parse_fetch_envelope
     content = data.get("content") or ""
-    try:
-        payload = json.loads(content)
-        html = payload.get("content", "")
-        url = payload.get("url") or ""
-        status = payload.get("status", 200)
-        fetch_error = payload.get("error")
-    except (json.JSONDecodeError, AttributeError):
-        html, url, status, fetch_error = content, "", 200, None
+    html, env_url, status, fetch_error = _parse_fetch_envelope(content)
+    url = env_url or ""
 
     if fetch_error or (isinstance(status, int) and (status == 0 or status >= 400)):
         state["failed"].append({"url": url, "status": status,

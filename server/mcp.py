@@ -214,7 +214,11 @@ TOOLS: list[dict] = [
         "name": "send_chat",
         "description": "Post a message into a branch's thread WITH OPERATOR "
                        "AUTHORITY. The message is public and tagged "
-                       "source=operator_via_mcp. Returns status=ok with the "
+                       "source=operator_via_mcp. Reversible steering verbs "
+                       "work from here (pause/resume, activate/deactivate, "
+                       "draft, recrawl — ADR-025); approve/reject are "
+                       "REFUSED for MCP-tagged messages — the inbox stays "
+                       "human-only (ADR-016/021). Returns status=ok with the "
                        "lab's reply, its event-horizon stamp, and the event "
                        "ids created — or status=reply_pending with the "
                        "message event ids when the message landed but the "

@@ -36,6 +36,9 @@ resume — replay does not re-fire behaviors:
   _GAP_CHECKED       task ids the gap check already ran for
   _EVALUATED         task ids already marked with an outcome evaluation
   _PENDING_BY_SUBJECT subject_ref → pending decision id
+  _PENDING_BY_BRANCH branch id → pending decision ids (chat approve/reject
+                     keys by the thread's branch; subject_ref alone missed
+                     publish/self_modify decisions — ADR-025)
   _APPLIED_DECISIONS decision ids whose outcome gate already applied
   _APPROVED_PUBLISH  subject_refs with an approved publish decision
   _THREAD_TO_BRANCH  comm_thread id → branch id (discusses cache)
@@ -124,6 +127,7 @@ _DISPATCHED: set[str] = set()
 _GAP_CHECKED: set[str] = set()
 _EVALUATED: set[str] = set()
 _PENDING_BY_SUBJECT: dict[str, str] = {}
+_PENDING_BY_BRANCH: dict[str, list[str]] = {}
 _APPLIED_DECISIONS: set[str] = set()
 # Phase 4 (chat-triggered seam proposals): rejected decisions are the
 # evidence pool a proposal cites; BehaviorGraph cannot scan decisions, so
@@ -159,6 +163,7 @@ def clear_lab_registry() -> None:
     _GAP_CHECKED.clear()
     _EVALUATED.clear()
     _PENDING_BY_SUBJECT.clear()
+    _PENDING_BY_BRANCH.clear()
     _APPLIED_DECISIONS.clear()
     _REJECTED_DECISIONS.clear()
     _SEAM_PROPOSED.clear()
@@ -240,7 +245,16 @@ from html import unescape as _unescape
 _DROP_RE = re.compile(
     r"<(script|style|svg|nav|footer)[^>]*>.*?</\1\s*>", re.S | re.I)
 _HTML_RE = re.compile(r"<[^>]+>")
-_HREF_RE = re.compile(r"""href\s*=\s*["']([^"'#]+)["']""", re.I)
+# Crawlable links are ANCHOR hrefs only. The old bare href= pattern also
+# matched <link rel="preload/stylesheet"> asset tags — on a real Next.js
+# page that is dozens of same-host /_next/static/... URLs ahead of the nav,
+# which would burn the whole page budget on JS chunks and fonts (caught by
+# the crawl_stall fixture). And allow '#' inside the href: real-world nav
+# links carry fragments ("/docs#install") and the old [^"'#] class could
+# never reach the closing quote on those, dropping the link entirely; the
+# fragment is stripped after urljoin, so "/docs#install" and "/docs" dedup
+# to one page.
+_HREF_RE = re.compile(r"""<a\s[^>]*?href\s*=\s*["']([^"']+)["']""", re.I)
 
 _CLAIM_CUES = (
     "replay", "audit", "event", "graph", "behavior", "pack", "agent",
@@ -296,6 +310,71 @@ def _claims_from_text(text: str, cap: int) -> list[str]:
         if len(claims) >= cap:
             break
     return claims
+
+
+# DIAGNOSIS — the 1/30 crawl stall (live mission#1: crawl froze at
+# fetched=1, queued=0 from evt_768 onward; source#45 is the evidence).
+#
+# The lab's fetch handler returns {"url", "status", "content"} and
+# tool_gateway's call_executor JSON-encodes that whole envelope before
+# storing it, truncated to settings.max_output_chars (default 10,000).
+# The live activegraph.ai homepage is a few hundred KB of Next.js HTML, so
+# the stored envelope was cut off MID-JSON-STRING (source#45 ends inside an
+# inline SVG path). From there the chain was:
+#
+#   1. json.loads(source.content) raised on the truncated envelope, and the
+#      fallback treated the RAW ESCAPED ENVELOPE as if it were the page HTML.
+#   2. In that escaped text every link reads href=\"...\" — a backslash sits
+#      between '=' and the quote — so _HREF_RE matched NOTHING. Zero links
+#      were queued (suspect 1: link extraction against real-world HTML, with
+#      gateway truncation as the trigger). The queue therefore never had a
+#      second page to drain (suspect 2 was a consequence, not a cause), and
+#      dedup was clean (suspect 3 ruled out: queued=0, nothing stuck).
+#   3. Bonus pollution: claims were extracted from the escaped envelope —
+#      the junk site_claim observations (#47–#59) in the live log. Those
+#      stay as they are: the log is append-only; the shape gate
+#      (_sentence_like) already stops new ones.
+#
+# Fixtures never caught it because canned pages are tiny — the envelope fit
+# under 10K and json.loads always succeeded.
+#
+# The fix is two layers: bundle.load_lab_packs sizes the gateway's
+# max_output_chars so a full fetch envelope survives storage, and this
+# parser salvages any envelope that is truncated anyway — recover url and
+# status from the intact JSON prefix, then unescape the content fragment by
+# re-terminating the JSON string (trimming up to a few chars handles a cut
+# inside an escape sequence). Links and claims then come from readable HTML
+# instead of escaped soup. Locked by the crawl_stall fixture.
+_ENVELOPE_PREFIX_RE = re.compile(
+    r'\s*\{\s*"url":\s*"([^"]*)",\s*"status":\s*(\d+),\s*"content":\s*"(.*)\Z',
+    re.S)
+
+
+def _parse_fetch_envelope(content: str) -> tuple[str, Optional[str], Any, Any]:
+    """Decode a tool_result's stored fetch envelope, salvaging truncated
+    ones. Returns (html, url, status, error); url is None when the stored
+    content was not an envelope at all (plain-text handlers)."""
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict):
+            return (payload.get("content", ""), payload.get("url"),
+                    payload.get("status", 200), payload.get("error"))
+        return content, None, 200, None
+    except ValueError:
+        pass
+    m = _ENVELOPE_PREFIX_RE.match(content or "")
+    if not m:
+        return content, None, 200, None
+    url, status, fragment = m.group(1), int(m.group(2)), m.group(3)
+    for cut in range(0, 7):  # a cut mid-escape leaves a dangling \ or \uXX
+        try:
+            html = json.loads(f'"{fragment[:len(fragment) - cut]}"')
+            break
+        except ValueError:
+            continue
+    else:
+        html = fragment.replace('\\"', '"').replace("\\n", " ")
+    return html, url, status, None
 
 
 def _links_from_html(html: str, base_url: str) -> list[str]:
@@ -423,16 +502,12 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
     state["fetched"] += 1
 
     # The fetch handler returns JSON {"url", "status", "content", "error"?};
-    # the gateway stores it (sanitized) as the source content.
+    # the gateway stores it (sanitized, possibly truncated) as the source
+    # content. _parse_fetch_envelope salvages truncated envelopes — the
+    # 1/30-stall diagnosis lives above its definition.
     content = data.get("content") or ""
-    try:
-        payload = json.loads(content)
-        html = payload.get("content", "")
-        fetched_url = payload.get("url") or url
-        status = payload.get("status", 200)
-        fetch_error = payload.get("error")
-    except (json.JSONDecodeError, AttributeError):
-        html, fetched_url, status, fetch_error = content, url, 200, None
+    html, env_url, status, fetch_error = _parse_fetch_envelope(content)
+    fetched_url = env_url or url
 
     # A failed page is evidence, not an error: record it and move on. The
     # crawl never aborts on one page.
@@ -1119,6 +1194,25 @@ def _publish_artifact(graph, artifact_id: str, decision_id: str) -> None:
     })
 
 
+def index_pending_decision(graph, decision_id: str, data: dict) -> None:
+    """ADR-025: chat approve/reject keys by the thread's BRANCH, so every
+    pending decision is indexed under its branch too — subject_ref for
+    promote decisions (the subject IS the branch), metadata.lab_branch_id
+    for publish and self_modify decisions. Also used by the server's
+    resume rebuild."""
+    subject = data.get("subject_ref") or ""
+    branch_id = None
+    subj = graph.get_object(subject) if subject else None
+    if subj is not None and subj.type == "branch":
+        branch_id = subject
+    elif (data.get("metadata") or {}).get("lab_branch_id"):
+        branch_id = (data.get("metadata") or {}).get("lab_branch_id")
+    if branch_id:
+        bucket = _PENDING_BY_BRANCH.setdefault(branch_id, [])
+        if decision_id not in bucket:
+            bucket.append(decision_id)
+
+
 def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) -> None:
     if decision_id in _APPLIED_DECISIONS:
         return
@@ -1127,6 +1221,9 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
     kind = data.get("kind")
     status = data.get("status")
     _PENDING_BY_SUBJECT.pop(subject, None)
+    for bucket in _PENDING_BY_BRANCH.values():
+        if decision_id in bucket:
+            bucket.remove(decision_id)
     if status == "rejected":
         _REJECTED_DECISIONS.append({"id": decision_id, "kind": kind,
                                     "subject_ref": subject,
@@ -1206,6 +1303,7 @@ def gate(event, graph, ctx, *, settings: LabSettings):
         if obj.get("type") == "decision" and data.get("status") == "pending":
             decision_id = obj.get("id")
             _PENDING_BY_SUBJECT[data.get("subject_ref", "")] = decision_id
+            index_pending_decision(graph, decision_id, data)
             if data.get("kind") == "publish":
                 _PENDING_PUBLISH.add(decision_id)  # the drafting cap's counter
             meta = dict(data.get("metadata") or {})
@@ -1563,6 +1661,54 @@ _STEER_APPROVE = ("approve",)
 _STEER_REJECT = ("reject",)
 _STEER_DRAFT = ("draft",)
 _STEER_PROPOSE = ("propose",)
+_STEER_ACTIVATE = ("activate",)
+_STEER_DEACTIVATE = ("deactivate",)
+_STEER_RECRAWL = ("recrawl", "re-crawl")
+
+# The verb set a refusal names (ADR-025). Order = documentation order.
+SUPPORTED_STEERING_VERBS = (
+    "pause", "resume", "activate", "deactivate", "draft", "approve",
+    "reject", "recrawl", "propose <seam>")
+
+# Action-shaped requests no steering verb supports. When one of these appears
+# and no supported verb matched, the reply is an explicit refusal naming the
+# verb set — never a narration of an action that did not happen (ADR-025;
+# the evt_3676 incident: "Activating this branch now... task dispatched"
+# replied to a verb that did not exist).
+_UNSUPPORTED_ACTION_RE = re.compile(
+    r"\b(archive|delete|remove|publish|post|merge|deploy|restart|reboot|"
+    r"cancel|abort|stop|kill|terminate|promote|demote|abandon|rename|"
+    r"escalate|fork|dispatch|execute)\b")
+
+
+def _has_verb(low: str, words: tuple[str, ...]) -> bool:
+    """Word-boundary verb match. Substring matching mis-fired in production:
+    'activate' lives inside 'deactivate'/'reactivate' and 'pause' inside
+    'unpause' — boundaries make each verb match only itself."""
+    return any(re.search(rf"\b{re.escape(w)}\b", low) for w in words)
+
+
+def _unsupported_action(low: str) -> Optional[str]:
+    m = _UNSUPPORTED_ACTION_RE.search(low)
+    return m.group(1) if m else None
+
+
+def _steering_event(graph, verb: str, branch_id: str, msg_id: str,
+                    summary: str, source: Optional[str],
+                    refs: Optional[dict] = None) -> Optional[str]:
+    """Append the lab.steering_applied marker (marker-event family,
+    ADR-013/015/021/025) recording WHAT a chat verb mutated, and return its
+    event id — the citation the reply carries. The reply may only claim
+    actions it can cite (ADR-025)."""
+    try:
+        ev = graph.emit("lab.steering_applied", {
+            "verb": verb, "branch_id": branch_id, "message_id": msg_id,
+            "summary": summary, "source": source or "operator",
+            "refs": dict(refs or {}),
+        })
+        return str(getattr(ev, "id", "")) or None
+    except Exception:
+        return None
 
 # Phase 4: which seam is the operator talking about? An explicit seam name
 # wins; otherwise "<behavior> … prompt" or "charter" phrasing resolves.
@@ -1704,53 +1850,201 @@ def _request_seam_proposal(graph, branch_id: str, msg_id: str,
     return f"seam proposal requested for {seam_name} (gated, pending review)"
 
 
+def _pending_for_branch(graph, branch_id: str) -> list:
+    """Pending decisions keyed by branch (ADR-025): promote decisions whose
+    subject IS the branch plus publish/self_modify decisions tagged with
+    metadata.lab_branch_id — verified still pending against the graph (the
+    registry is a cache, never the truth)."""
+    out = []
+    for d_id in _PENDING_BY_BRANCH.get(branch_id, []):
+        d = graph.get_object(d_id)
+        if d is not None and d.data.get("status") == "pending":
+            out.append(d)
+    return out
+
+
+def _applied(verb, summary, event_id):
+    return {"kind": "applied", "verb": verb, "summary": summary,
+            "event_id": event_id}
+
+
+def _noop(verb, summary):
+    return {"kind": "noop", "verb": verb, "summary": summary,
+            "event_id": None}
+
+
+def _resolve_decision_verb(graph, branch_id: str, msg_id: str, verb: str,
+                           source: Optional[str]) -> dict:
+    """Chat approve/reject (ADR-025). MCP-tagged messages are REFUSED — the
+    inbox is human-only (ADR-016/021); the old subject_ref keying bug was a
+    side door that failed closed, and it stays closed. Exactly one pending
+    decision applies; multiple list ids without mutating; zero is an honest
+    no-op."""
+    if source == "operator_via_mcp":
+        return {"kind": "refused", "verb": verb, "event_id": None,
+                "summary": (
+                    f"I did not {verb} anything: decisions cannot be resolved "
+                    "from this surface. Approve/reject authority stays with "
+                    "the human operator (ADR-016/021) — messages relayed over "
+                    "MCP (source=operator_via_mcp) are refused for decision "
+                    "verbs. Use the inbox at /lab.")}
+    pending = _pending_for_branch(graph, branch_id)
+    if not pending:
+        return _noop(verb, f"Nothing to {verb}: no pending decision "
+                           "references this branch.")
+    if len(pending) > 1:
+        listed = "; ".join(
+            f"{d.id} ({d.data.get('kind')} on {d.data.get('subject_ref')})"
+            for d in pending)
+        return _noop(verb, (
+            f"Nothing was {verb}d: {len(pending)} decisions are pending on "
+            f"this branch — {listed}. Resolve a specific one from the inbox "
+            "at /lab."))
+    decision = pending[0]
+    new_status = "approved" if verb == "approve" else "rejected"
+    graph.patch_object(decision.id, {"status": new_status})
+    summary = (f"decision {decision.id} ({decision.data.get('kind')} on "
+               f"{decision.data.get('subject_ref')}) {new_status}")
+    event_id = _steering_event(graph, verb, branch_id, msg_id, summary,
+                               source, refs={"decision_id": decision.id})
+    return _applied(verb, summary, event_id)
+
+
 def _apply_steering(graph, branch_id: str, content: str,
-                    msg_id: Optional[str] = None) -> Optional[str]:
-    """Deterministic steering: the reply is fast, the effect lands at this
-    event boundary. Returns a short description of the mutation, or None."""
+                    msg_id: Optional[str] = None,
+                    source: Optional[str] = None) -> Optional[dict]:
+    """Deterministic steering: the effect lands at this event boundary and
+    the reply is composed AFTER it, from post-mutation graph state
+    (ADR-025). Returns None when no steering verb matched, else a result
+    dict: kind=applied (with the lab.steering_applied event id the reply
+    cites), noop, or refused — each with a reply-ready summary."""
     low = content.lower()
+    msg_id = msg_id or ""
     branch = graph.get_object(branch_id)
     if branch is None:
         return None
+    status = branch.data.get("status")
 
-    # Phase 4: checked before the draft verb — "propose an improved
-    # draft_writer prompt" contains 'draft' but is a proposal request.
-    if any(w in low for w in _STEER_PROPOSE):
+    # Checked before the draft verb — "propose an improved draft_writer
+    # prompt" contains 'draft' but is a proposal request.
+    if _has_verb(low, _STEER_PROPOSE):
         seam_name = _seam_name_from_message(low)
         if seam_name:
-            return _request_seam_proposal(graph, branch_id, msg_id or "",
-                                          content, seam_name)
-    if any(w in low for w in _STEER_PAUSE):
+            summary = _request_seam_proposal(graph, branch_id, msg_id,
+                                             content, seam_name)
+            event_id = _steering_event(graph, "propose", branch_id, msg_id,
+                                       summary, source,
+                                       refs={"seam_name": seam_name})
+            return _applied("propose", summary, event_id)
+    if _has_verb(low, _STEER_PAUSE):
+        if status == "paused":
+            return _noop("pause", "This branch is already paused.")
         graph.patch_object(branch_id, {"status": "paused"})
-        return "branch paused"
-    if any(w in low for w in _STEER_RESUME):
-        if branch.data.get("status") != "paused":
-            return None
+        event_id = _steering_event(graph, "pause", branch_id, msg_id,
+                                   "branch paused", source)
+        return _applied("pause", "branch paused", event_id)
+    if _has_verb(low, _STEER_RESUME):
+        if status != "paused":
+            return _noop("resume", f"This branch is not paused "
+                                   f"(status={status}) — nothing to resume.")
         graph.patch_object(branch_id, {"status": "active"})
-        return "branch resumed (status=active)"
-    if any(w in low for w in _STEER_DRAFT):
+        event_id = _steering_event(graph, "resume", branch_id, msg_id,
+                                   "branch resumed (status=active)", source)
+        return _applied("resume", "branch resumed (status=active)", event_id)
+    if _has_verb(low, _STEER_DEACTIVATE):
+        # ADR-025: the reversible twin of activate — back to proposed.
+        if status != "active":
+            return _noop("deactivate",
+                         f"This branch is not active (status={status}) — "
+                         "deactivate only reverts an active branch to "
+                         "proposed.")
+        graph.patch_object(branch_id, {"status": "proposed"})
+        event_id = _steering_event(graph, "deactivate", branch_id, msg_id,
+                                   "branch deactivated (status=proposed)",
+                                   source)
+        return _applied("deactivate", "branch deactivated (status=proposed)",
+                        event_id)
+    if _has_verb(low, _STEER_ACTIVATE):
+        # ADR-025: operator authority, MCP-allowed — reversible like pause
+        # (ADR-021's argument). Activation records the operator's rationale
+        # as an observation and lets the EXISTING dispatch react to the
+        # status patch (work fires on status→active; nothing new dispatches).
+        if status == "active":
+            return _noop("activate", "This branch is already active.")
+        if status == "paused":
+            return _noop("activate", "This branch is paused — use resume.")
+        if status not in ("proposed", "scoped"):
+            return _noop("activate",
+                         f"This branch is {status} — only a proposed or "
+                         "scoped branch can be activated.")
+        obs = graph.add_object("observation", {
+            "text": (f"Branch activated by the operator. Rationale: "
+                     f"{content[:400]}"),
+            "confidence": 1.0,
+            "category": "fact",
+            "metadata": {"lab": "branch_activated", "lab_branch_id": branch_id,
+                         "message_id": msg_id, "source": source or "operator"},
+        })
+        graph.add_relation(branch_id, obs.id, "supported_by")
+        graph.patch_object(branch_id, {"status": "active"})
+        summary = "branch activated (status=active); dispatch reacts next"
+        event_id = _steering_event(graph, "activate", branch_id, msg_id,
+                                   summary, source,
+                                   refs={"rationale_observation": obs.id})
+        return _applied("activate", summary, event_id)
+    if _has_verb(low, _STEER_RECRAWL):
+        # ADR-025/crawl fix: replay never re-fires behaviors, so a resumed
+        # lab whose crawl stalled needs an operator nudge. The request is a
+        # crawl_request source ingest ALREADY reacts to, scoped to the
+        # mission target_url; the in-process crawl registry resets so dedup
+        # does not no-op a deliberate re-fetch (the registry is a cache —
+        # existing observations are never mutated, the log is append-only).
+        mission = graph.get_object(branch.data.get("mission_id")) \
+            if branch.data.get("mission_id") else None
+        target = (mission.data.get("target_url") or "").strip() \
+            if mission is not None else ""
+        if not target:
+            return _noop("recrawl", "No mission target_url is linked to "
+                                    "this branch — nothing to recrawl.")
+        _CRAWLS[mission.id] = {"visited": set(), "fetched": 0, "queued": set()}
+        req = graph.add_object("source", {
+            "kind": "crawl_request",
+            "content": target,
+            "url": target,
+            "channel": "lab",
+            "metadata": {"mission_id": mission.id, "depth": 0,
+                         "requested_by": "operator", "message_id": msg_id},
+        })
+        summary = f"recrawl requested for {target} (fresh crawl episode)"
+        event_id = _steering_event(graph, "recrawl", branch_id, msg_id,
+                                   summary, source,
+                                   refs={"crawl_request": req.id,
+                                         "mission_id": mission.id})
+        return _applied("recrawl", summary, event_id)
+    if _has_verb(low, _STEER_DRAFT):
         # 4b escape hatch: the operator can request a draft on anything.
         # Explicit attention — bypasses the pending-publish cap (ADR-014).
         evidence = _branch_evidence_ids(graph, branch_id)
-        hint = "research" if branch.data.get("status") == "decided" else "note"
-        _request_draft(
+        hint = "research" if status == "decided" else "note"
+        req = _request_draft(
             graph, post_kind_hint=hint, item_ids=evidence,
             requested_by="operator", branch_id=branch_id,
             mission_id=branch.data.get("mission_id"),
             rationale=(f"Operator requested a draft on branch "
                        f"'{branch.data.get('title')}': {content[:160]}"),
         )
-        return f"draft requested on this branch ({hint}; operator escape hatch)"
-    if any(w in low for w in _STEER_APPROVE):
-        decision_id = _PENDING_BY_SUBJECT.get(branch_id)
-        if decision_id:
-            graph.patch_object(decision_id, {"status": "approved"})
-            return f"decision {decision_id} approved"
-    if any(w in low for w in _STEER_REJECT):
-        decision_id = _PENDING_BY_SUBJECT.get(branch_id)
-        if decision_id:
-            graph.patch_object(decision_id, {"status": "rejected"})
-            return f"decision {decision_id} rejected"
+        summary = (f"draft requested on this branch ({hint}; operator "
+                   "escape hatch)")
+        event_id = _steering_event(graph, "draft", branch_id, msg_id,
+                                   summary, source,
+                                   refs={"draft_request": req.id})
+        return _applied("draft", summary, event_id)
+    if _has_verb(low, _STEER_APPROVE):
+        return _resolve_decision_verb(graph, branch_id, msg_id, "approve",
+                                      source)
+    if _has_verb(low, _STEER_REJECT):
+        return _resolve_decision_verb(graph, branch_id, msg_id, "reject",
+                                      source)
     return None
 
 
@@ -1777,7 +2071,7 @@ def _apply_steering(graph, branch_id: str, content: str,
         "depth": 1,
         "recent_events": 0,
     },
-    creates=["comm_response_candidate"],
+    creates=["comm_response_candidate", "observation", "source"],
     max_tokens=1024,
     tools=[],
 )
@@ -1793,8 +2087,16 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
     Creates: comm_response_candidate with an event-horizon stamp ("as of event
     N" = the triggering event — nothing later was visible) and provenance refs.
     Never blocks on running work: it reads only committed graph state.
-    Steering messages (pause/resume/approve/reject) ALSO write the mutation —
-    reply fast, effect at the event boundary.
+
+    Truthful steering (ADR-025): steering mutations apply FIRST, and for any
+    action-shaped message the reply is composed deterministically from
+    POST-MUTATION graph state — an applied verb cites its
+    lab.steering_applied event id, a no-op/refusal says so, and an action no
+    verb supports draws an explicit refusal naming the verb set. The model's
+    pre-mutation narration is never used for action messages: it cannot cite
+    a mutation, so it may not claim one (the evt_3676 incident — "Activating
+    this branch now... task dispatched" — narrated a verb that did not
+    exist).
     """
     obj = event.payload.get("object", {})
     msg_id = obj.get("id")
@@ -1809,20 +2111,42 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
         return  # Not a branch thread — the generic chat pack may still reply.
 
     consume_llm_anomalies(graph)
-    mutation = _apply_steering(graph, branch_id, data.get("content") or "",
-                               msg_id)
+    content = data.get("content") or ""
+    result = _apply_steering(graph, branch_id, content, msg_id,
+                             source=meta.get("source"))
 
+    # Post-mutation state: read AFTER steering applied (ADR-025).
     branch = graph.get_object(branch_id)
-    reply = (getattr(out, "reply", None) or "").strip() if out is not None else ""
-    if not reply or is_inert(reply):
-        # Budget or parse trouble — still answer honestly from graph state.
-        reply = ("I couldn't produce a model-written reply (LLM budget or "
-                 "output-parse issue — recorded as an observation). ")
-        if branch is not None:
-            reply += (f"Branch “{branch.data.get('title')}” is currently "
-                      f"{branch.data.get('status')}.")
-    if mutation:
-        reply += f"\n\nApplied: {mutation}."
+    b_status = branch.data.get("status") if branch is not None else None
+    status_line = (f"Branch “{branch.data.get('title')}” is now {b_status}."
+                   if branch is not None else "")
+
+    unsupported = None if result else _unsupported_action(content.lower())
+    if result is not None:
+        if result["kind"] == "applied" and result.get("event_id"):
+            reply = (f"Applied: {result['summary']} — recorded at "
+                     f"{result['event_id']}.")
+        elif result["kind"] == "applied":
+            reply = f"Applied: {result['summary']}."
+        else:
+            reply = result["summary"]
+        reply += f"\n\n{status_line}"
+    elif unsupported:
+        reply = (f"I can't do that: no steering verb performs '{unsupported}' "
+                 "from chat, and I won't claim actions I can't cite. "
+                 f"Supported verbs in a branch thread: "
+                 f"{', '.join(SUPPORTED_STEERING_VERBS)}. "
+                 f"{status_line}")
+    else:
+        reply = (getattr(out, "reply", None) or "").strip() \
+            if out is not None else ""
+        if not reply or is_inert(reply):
+            # Budget or parse trouble — still answer honestly from graph state.
+            reply = ("I couldn't produce a model-written reply (LLM budget or "
+                     "output-parse issue — recorded as an observation). ")
+            if branch is not None:
+                reply += (f"Branch “{branch.data.get('title')}” is currently "
+                          f"{b_status}.")
     reply += f"\n\n— as of event {event.id}"
 
     candidate = graph.add_object("comm_response_candidate", {
@@ -1835,10 +2159,13 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
         "metadata": {
             "event_horizon": str(event.id),
             "seam_versions": seam_versions_stamp(graph, "prompt.answer"),
+            "steering": ({"verb": result["verb"], "kind": result["kind"],
+                          "event_id": result.get("event_id")}
+                         if result else None),
             "provenance": {
                 "branch_id": branch_id,
                 "mission_id": (branch.data.get("mission_id") if branch else None),
-                "branch_status": (branch.data.get("status") if branch else None),
+                "branch_status": b_status,
             },
         },
     })

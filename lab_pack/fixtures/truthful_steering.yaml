@@ -1,0 +1,30 @@
+description: |
+  ADR-025 — truthful steering replies, the activate verb, and decision
+  keying. Steering mutations apply BEFORE the reply is composed; the reply
+  reports post-mutation state and may claim only actions whose
+  lab.steering_applied event it cites. An action request no verb supports
+  draws an explicit refusal naming the verb set (the evt_3676 incident:
+  the old reply narrated "Activating this branch now... task dispatched"
+  for a verb that did not exist).
+
+  Decision verbs key by the thread's BRANCH (subject_ref alone missed
+  publish/self_modify decisions — a silent no-op in production): exactly
+  one pending applies, multiple list ids without mutating, zero is an
+  honest no-op, and operator_via_mcp messages are REFUSED for
+  approve/reject — the inbox stays human-only (ADR-016/021); the keying
+  bug was a side door that failed closed, and it stays closed.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+branch:
+  title: Verify the replay claim
+  intent: Find evidence that replay rebuilds graph state deterministically.
+
+expected_outputs:
+  refusal_names_verbs: ["activate", "recrawl", "approve"]
