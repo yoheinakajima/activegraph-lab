@@ -127,16 +127,37 @@ if (draftBranch) {
   check(false, "no branch carries a draft entry to verify");
 }
 
-console.log("== decision buttons -> /lab/decision ==");
+console.log("== decision buttons -> rationale form -> /lab/decision (ADR-026) ==");
 doc.getElementById("back").click();
 await new Promise((r) => setTimeout(r, 50));
-const firstCard = doc.querySelector("#inbox .decision-card");
+const annotated = feed.inbox.find((d) => (d.annotations || []).length > 0);
+const target = annotated || feed.inbox[0];
+const firstCard = doc.querySelector(`[data-decision-id="${target.id}"]`);
 const decisionId = firstCard.dataset.decisionId;
+check(!annotated || !!firstCard.querySelector(".annotations"),
+  "annotated decision renders its operator notes");
 firstCard.querySelector("button.approve").click();
 await new Promise((r) => setTimeout(r, 50));
+const form = firstCard.querySelector(".resolve-form");
+check(!!form && form.hidden === false,
+  "approve opens the optional rationale form, no immediate POST");
+check(!posts.some((p) => p.url === "/lab/decision"),
+  "nothing POSTs before confirm");
+const field = firstCard.querySelector(".resolve-rationale");
+if (annotated) {
+  const notes = annotated.annotations;
+  check(field.value === notes[notes.length - 1].text,
+    "rationale prefilled from the most recent annotation");
+} else {
+  check(field.value === "", "rationale prefilled empty (skippable)");
+}
+field.value = "ui-check: reason recorded on the resolution event";
+firstCard.querySelector("button.confirm").click();
+await new Promise((r) => setTimeout(r, 50));
 const hit = posts.find((p) => p.url === "/lab/decision");
-check(!!hit && hit.body.decision_id === decisionId && hit.body.approved === true,
-  `approve button POSTs {decision_id: ${decisionId}, approved: true} to /lab/decision`);
+check(!!hit && hit.body.decision_id === decisionId && hit.body.approved === true
+  && hit.body.rationale === "ui-check: reason recorded on the resolution event",
+  `confirm POSTs {decision_id: ${decisionId}, approved: true, rationale} to /lab/decision`);
 check(!!hit && hit.headers && hit.headers.Authorization === "Bearer test-operator-token",
   "mutation carries the Bearer header");
 

@@ -14,6 +14,10 @@ One relation, not a new layer (ADR-004): a communication-pack `comm_thread` `dis
 
 Inside a thread: run events and chat messages interleaved in ONE scroll, ordered by the log. An input box posts to `/chat` with the thread→branch link. Pending decisions show approve/reject buttons that mutate the decision object through the API. No separate chat pane.
 
+## Inbox resolution (ADR-026)
+
+Approve/reject open an optional rationale field (skippable; recorded on the resolution event as `resolution_rationale`, `resolved_by=operator`). Pending decisions render their MCP annotations (`annotate_decision` — public, `operator_via_mcp`-attributed commentary, never authority); the rationale field prefills from the most recent annotation and the operator can edit before confirming. On resolve, annotations link into the decision's evidence.
+
 ## Feed
 
 The home view: reverse-chron entries projected from lab events via `GET /lab/feed`, grouped by branch. Each entry is one human sentence derived from event type + payload — template-based; LLM narration is a later branch. Pending decisions are pinned at the top — that is the inbox, not a separate page.

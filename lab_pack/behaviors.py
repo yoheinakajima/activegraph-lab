@@ -132,7 +132,8 @@ _APPLIED_DECISIONS: set[str] = set()
 # Phase 4 (chat-triggered seam proposals): rejected decisions are the
 # evidence pool a proposal cites; BehaviorGraph cannot scan decisions, so
 # the gate feeds this registry (rebuilt from the graph on resume).
-_REJECTED_DECISIONS: list[dict] = []   # {id, kind, subject_ref}
+_REJECTED_DECISIONS: list[dict] = []   # {id, kind, subject_ref, seam_name,
+                                       #  resolution_rationale (ADR-026)}
 _SEAM_PROPOSED: set[str] = set()       # seam_proposal_request ids handled
 _APPROVED_PUBLISH: set[str] = set()
 _THREAD_TO_BRANCH: dict[str, str] = {}
@@ -930,11 +931,18 @@ def _item_context(graph, ref: str) -> dict:
         return ctx
     o = graph.get_object(ref)
     text = ""
+    out = {"finding_id": ref,
+           "origin": "unknown (predates provenance tracking)"}
     if o is not None:
         text = (o.data.get("text") or o.data.get("title")
                 or o.data.get("rationale") or "")[:300]
-    return {"finding_id": ref, "text": text,
-            "origin": "unknown (predates provenance tracking)"}
+        rr = (o.data.get("metadata") or {}).get("resolution_rationale")
+        if rr:
+            # ADR-026: a cited decision carries the OPERATOR's resolution
+            # reason alongside the proposer's pitch.
+            out["resolution_rationale"] = str(rr)[:300]
+    out["text"] = text
+    return out
 
 
 def _drafting_capped(graph, settings: LabSettings, *, operator: bool) -> bool:
@@ -1225,10 +1233,15 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
         if decision_id in bucket:
             bucket.remove(decision_id)
     if status == "rejected":
+        meta = data.get("metadata") or {}
         _REJECTED_DECISIONS.append({"id": decision_id, "kind": kind,
                                     "subject_ref": subject,
-                                    "seam_name": (data.get("metadata") or {})
-                                    .get("seam_name")})
+                                    "seam_name": meta.get("seam_name"),
+                                    # ADR-026: the OPERATOR's reason rides
+                                    # with the registry entry, so proposals
+                                    # cite it, not just the proposer's pitch.
+                                    "resolution_rationale":
+                                        meta.get("resolution_rationale")})
 
     if kind == "promote" and subject:
         new_status = "decided" if status == "approved" else "archived"
@@ -1812,6 +1825,10 @@ def _request_seam_proposal(graph, branch_id: str, msg_id: str,
         evidence.append(d["id"])
         item = {"decision_id": d["id"], "kind": d["kind"],
                 "subject_ref": d["subject_ref"]}
+        if d.get("resolution_rationale"):
+            # ADR-026: the operator's stated reason for the rejection — the
+            # evidence a proposal should actually argue from.
+            item["resolution_rationale"] = d["resolution_rationale"]
         subject = graph.get_object(d["subject_ref"]) if d["subject_ref"] else None
         if subject is not None:
             item["subject_title"] = subject.data.get("title")
@@ -1902,7 +1919,14 @@ def _resolve_decision_verb(graph, branch_id: str, msg_id: str, verb: str,
             "at /lab."))
     decision = pending[0]
     new_status = "approved" if verb == "approve" else "rejected"
-    graph.patch_object(decision.id, {"status": new_status})
+    # Resolve through the one resolution path (ADR-026): resolved_by stamps,
+    # pending annotations link into the evidence. The operator's chat message
+    # IS the rationale here — it is already in the log; record it on the
+    # resolution event too so the registry carries the reason.
+    from .tools import approve_decision_fn
+    msg = graph.get_object(msg_id) if msg_id else None
+    rationale = (msg.data.get("content") or "")[:400] if msg is not None else ""
+    approve_decision_fn(graph, decision.id, verb == "approve", rationale)
     summary = (f"decision {decision.id} ({decision.data.get('kind')} on "
                f"{decision.data.get('subject_ref')}) {new_status}")
     event_id = _steering_event(graph, verb, branch_id, msg_id, summary,

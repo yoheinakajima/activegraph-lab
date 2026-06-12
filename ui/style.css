@@ -66,6 +66,15 @@ h3.register {
 }
 .decision-card button.approve { border-color: var(--accent); color: var(--accent); }
 .decision-card button.reject  { border-color: #c97a6a; color: #c97a6a; }
+/* ADR-026: optional resolution rationale + MCP annotations */
+.decision-card .resolve-form { margin-top: 8px; }
+.decision-card .resolve-rationale {
+  display: block; width: 100%; box-sizing: border-box; margin-bottom: 6px;
+  font: inherit; font-size: 13px; padding: 6px 8px; resize: vertical;
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.decision-card .annotations { border-left: 2px solid var(--line); padding-left: 10px; }
 
 /* branch groups */
 .branch-group {

@@ -140,6 +140,10 @@ def _run() -> int:
     set_transport(lambda url: (200, {"content": __import__("base64").b64encode(
         b"# canned README for the audit").decode(), "encoding": "base64"}))
 
+    # ADR-026: a pending decision to annotate — its output joins the corpus.
+    pending_id = next((str(d.id) for d in g.objects(type="decision")
+                       if d.data.get("status") == "pending"), "decision#1")
+
     mcp_outputs = [mcp_call("initialize", {"protocolVersion": "2025-06-18"})]
     for name, args in (("get_status", {}), ("get_feed", {}),
                        ("get_branch", {"branch_id": str(branch.id)}),
@@ -151,6 +155,11 @@ def _run() -> int:
                        ("get_entity", {"id": str(branch.id)}),
                        ("set_budget", {"amount_usd": 9.5, "today_only": True}),
                        ("pause_lab", {}), ("resume_lab", {}),
+                       # ADR-026: annotate output (and the annotation's
+                       # events/objects) joins the corpus like every tool.
+                       ("annotate_decision",
+                        {"decision_id": pending_id,
+                         "note": "audit: pre-review note (ADR-026)"}),
                        # ADR-022: github_read outputs join the corpus — a
                        # canned hit (transport injected below) and an
                        # allowlist refusal; the sentinel GITHUB_TOKEN must

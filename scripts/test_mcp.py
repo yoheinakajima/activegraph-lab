@@ -186,10 +186,12 @@ def main() -> int:
         expected = {"get_status", "get_feed", "get_branch", "get_pending_decisions",
                     "get_post", "list_posts", "list_seams", "get_errors",
                     "get_log", "get_entity", "github_read",
-                    "send_chat", "set_budget", "pause_lab", "resume_lab"}
+                    "send_chat", "set_budget", "pause_lab", "resume_lab",
+                    "annotate_decision"}
         check(tools == expected,
               f"exactly the ADR-016 tools + get_errors (ADR-023) + the "
-              f"ADR-021 expansion ({sorted(tools)})")
+              f"ADR-021 expansion + annotate_decision (ADR-026) "
+              f"({sorted(tools)})")
         check("get_errors" in tools, "get_errors present in the READ tier (ADR-023)")
         gate_tools = {"approve_decision", "reject_decision", "promote_seam",
                       "approve", "reject"}
@@ -357,6 +359,53 @@ def main() -> int:
         check(any(str(e.type) == "lab.paused" for e in g.events)
               and any(str(e.type) == "lab.resumed" for e in g.events),
               "pause/resume control events are in the public log")
+
+        print("== annotate_decision (ADR-026): commentary, not authority ==")
+        pending = next(d for d in g.objects(type="decision")
+                       if d.data.get("status") == "pending")
+        note = "Pre-review: the claim needs a linked evaluation; recommend reject."
+        s, _, out = call_tool(base, "annotate_decision",
+                              {"decision_id": str(pending.id), "note": note})
+        check(s == 200 and isinstance(out, dict)
+              and out.get("status") == "pending" and out.get("annotation_id"),
+              f"annotate attaches a note; the decision STAYS pending ({out})")
+        check(rt.graph.get_object(pending.id).data.get("status") == "pending",
+              "annotate cannot change status — the inbox does not move")
+        ann = rt.graph.get_object(out["annotation_id"])
+        ameta = (ann.data.get("metadata") or {}) if ann is not None else {}
+        check(ann is not None and ameta.get("lab") == "decision_annotation"
+              and ameta.get("source") == "operator_via_mcp"
+              and ameta.get("decision_id") == str(pending.id),
+              "annotation is a public observation attributed operator_via_mcp")
+        s, _, pend2 = call_tool(base, "get_pending_decisions")
+        mine = next(d for d in pend2["pending"] if d["id"] == str(pending.id))
+        check([a["text"] for a in mine.get("annotations", [])] == [note],
+              "get_pending_decisions exposes the annotation in full "
+              "(the UI's rationale prefill source)")
+        s, _, err = call_tool(base, "annotate_decision",
+                              {"decision_id": str(pub.id), "note": "too late"})
+        check(isinstance(err, str) and "already" in err,
+              "annotating a resolved decision is a tool error")
+        s, _, err = call_tool(base, "annotate_decision",
+                              {"decision_id": "decision#9999", "note": "x"})
+        check(isinstance(err, str) and "no such decision" in err,
+              "annotating a bogus id is a tool error, not a 500")
+        # The human operator resolves over HTTP with a rationale (ADR-026):
+        # the resolution event carries it and links the annotation.
+        rationale = "Rejecting: the throughput claim has no linked evidence."
+        s, body = http(base, "/lab/decision", "POST",
+                       {"decision_id": str(pending.id), "approved": False,
+                        "rationale": rationale}, token=OPERATOR_TOKEN)
+        check(s == 200 and body.get("status") == "rejected",
+              f"operator resolves with a rationale over /lab/decision ({s})")
+        d = rt.graph.get_object(pending.id)
+        dmeta = d.data.get("metadata") or {}
+        check(dmeta.get("resolution_rationale") == rationale
+              and dmeta.get("resolved_by") == "operator",
+              "resolution_rationale + resolved_by=operator recorded")
+        check(str(ann.id) in (d.data.get("evidence_refs") or []),
+              "the pending annotation is linked into the resolution's evidence")
+        rt.run_until_idle()  # let the gate apply the rejection outcome
 
         print("== send_chat round-trip (operator authority via MCP) ==")
         s, _, out = call_tool(base, "send_chat",

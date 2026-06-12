@@ -199,14 +199,72 @@ def send_branch_message_fn(
     return thread_id, msg
 
 
-def approve_decision_fn(graph, decision_id: str, approved: bool, rationale: str = ""):
-    """Resolve a pending decision. gate applies the outcome at the next boundary."""
+def approve_decision_fn(graph, decision_id: str, approved: bool, rationale: str = "",
+                        resolved_by: str = "operator"):
+    """Resolve a pending decision. gate applies the outcome at the next boundary.
+
+    ADR-026: the resolution is ONE patch whose event carries the operator's
+    reasons — `metadata.resolution_rationale` (when given) and
+    `metadata.resolved_by` — separate from the PROPOSER's `rationale`, which
+    stays untouched. Pending annotations (annotate_decision_fn) are linked
+    into the decision's evidence_refs by the same patch, so the resolution
+    event cites them."""
     decision = graph.get_object(decision_id)
     patch: dict = {"status": "approved" if approved else "rejected"}
-    if rationale and decision is not None:
-        existing = decision.data.get("rationale") or ""
-        patch["rationale"] = (existing + f"\nResolution: {rationale}").strip()
+    if decision is not None:
+        meta = dict(decision.data.get("metadata") or {})
+        meta["resolved_by"] = resolved_by
+        if rationale:
+            meta["resolution_rationale"] = rationale
+        patch["metadata"] = meta
+        annotations = list(meta.get("annotation_refs") or [])
+        if annotations:
+            evidence = list(decision.data.get("evidence_refs") or [])
+            patch["evidence_refs"] = evidence + [a for a in annotations
+                                                 if a not in evidence]
     return graph.patch_object(decision_id, patch)
+
+
+def annotate_decision_fn(graph, decision_id: str, note: str,
+                         source: str = "operator_via_mcp"):
+    """Attach a public, attributed annotation to a PENDING decision (ADR-026).
+
+    Commentary, not authority: the note becomes an observation
+    (metadata.lab=decision_annotation) and its id is appended to the
+    decision's metadata.annotation_refs — the decision's STATUS is never
+    touched here, by construction. When the operator later resolves,
+    approve_decision_fn links the annotations into the resolution's
+    evidence, and the inbox projection exposes them so the UI prefills the
+    rationale field from the most recent one. Raises ValueError for a
+    missing or already-resolved decision."""
+    note = (note or "").strip()
+    if not note:
+        raise ValueError("note is required")
+    decision = graph.get_object(decision_id)
+    if decision is None or str(decision.type) != "decision":
+        raise ValueError(f"no such decision: {decision_id}")
+    if decision.data.get("status") != "pending":
+        raise ValueError(
+            f"decision is already {decision.data.get('status')} — "
+            "annotations attach to pending decisions only")
+    meta = dict(decision.data.get("metadata") or {})
+    subject = decision.data.get("subject_ref") or ""
+    branch_id = meta.get("lab_branch_id") or (
+        subject if subject.startswith("branch#") else None)
+    obs = graph.add_object("observation", {
+        "text": note,
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "decision_annotation",
+                     "decision_id": decision_id,
+                     "lab_branch_id": branch_id,
+                     "source": source},
+    })
+    refs = list(meta.get("annotation_refs") or [])
+    refs.append(str(obs.id))
+    meta["annotation_refs"] = refs
+    graph.patch_object(decision_id, {"metadata": meta})
+    return obs
 
 
 def complete_task_fn(graph, task_id: str, result_summary: str, success: bool = True):
