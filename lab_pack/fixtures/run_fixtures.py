@@ -1227,6 +1227,136 @@ def run_seam_proposal() -> bool:
     return c.done("seam_proposal")
 
 
+def run_seam_verbatim() -> bool:
+    spec = _load("seam_verbatim.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seam_verbatim — full operator text, intact VERBATIM, "
+          "blocked tamper, seam-relevant evidence")
+    print("=" * 64)
+
+    from lab_pack.behaviors import _normalize_ws
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+    section = spec["verbatim_section"].strip()
+    c.that(len(section) >= 600,
+           f"fixture self-check: the verbatim section is long ({len(section)})")
+
+    # A rejected PUBLISH decision on the record — draft_writer-relevant
+    # evidence the charter proposal must NOT cite (decision#195's 2nd defect).
+    rejected_artifact = g.add_object("artifact", {
+        "kind": "blog_draft", "title": "A draft the operator rejected",
+        "content": "## rejected body", "format": "markdown", "status": "draft",
+        "metadata": {"lab": "blog_draft", "slug": "rejected-one"},
+    })
+    rejected_publish = g.add_object("decision", {
+        "subject_ref": rejected_artifact.id, "kind": "publish",
+        "status": "pending", "rationale": "fixture: publish?",
+        "evidence_refs": [], "metadata": {},
+    })
+    rt.run_until_idle()
+    approve_decision_fn(g, rejected_publish.id, False, "fixture: rejected")
+    rt.run_until_idle()
+
+    def charter_seams():
+        return [a for a in g.objects(type="artifact")
+                if a.data.get("kind") == "seam"
+                and (a.data.get("metadata") or {}).get("seam_name")
+                == exp["seam_name"]]
+
+    # ── happy path: long VERBATIM section survives end to end ──────────────
+    msg_a = (f"Please propose a new {exp['seam_name']} carrying this "
+             f"standing portfolio.\n\nVERBATIM:\n{section}\nEND VERBATIM")
+    _, msg = send_branch_message_fn(g, branch.id, msg_a)
+    rt.run_until_idle()
+
+    requests = _lab_obs(g, "seam_proposal_request")
+    c.that(len(requests) == 1, f"one proposal request assembled ({len(requests)})")
+    req_meta = (requests[0].data.get("metadata") or {}) if requests else {}
+    c.that(req_meta.get("operator_request") == msg_a,
+           f"the request carries the operator message IN FULL "
+           f"({len(str(req_meta.get('operator_request')))} of {len(msg_a)} chars)")
+    c.that(req_meta.get("verbatim_sections") == [section],
+           "the VERBATIM section is extracted whole onto the request")
+
+    seams_ = charter_seams()
+    c.that(len(seams_) == 1
+           and (seams_[0].data.get("metadata") or {}).get("version")
+           == exp["proposal_version"],
+           f"charter proposal authored as v{exp['proposal_version']} "
+           f"({len(seams_)})")
+    body = (seams_[0].data.get("content") or "") if seams_ else ""
+    c.that(_normalize_ws(section) in _normalize_ws(body),
+           f"the {len(section)}-char VERBATIM section survives intact into "
+           "the proposed body")
+    pend = [d for d in g.objects(type="decision")
+            if d.data.get("kind") == "self_modify"
+            and d.data.get("status") == "pending"
+            and d.data.get("subject_ref") == (seams_[0].id if seams_ else None)]
+    c.that(len(pend) == 1, f"pending self_modify opened ({len(pend)})")
+    refs = (pend[0].data.get("evidence_refs") or []) if pend else []
+    c.that(msg.id in refs, "the operator message is always cited")
+    c.that(rejected_publish.id not in refs,
+           f"a charter proposal does not cite publish rejections ({refs})")
+    print(f"  happy path: {len(section)}-char VERBATIM intact in v2; "
+          "publish rejection not cited")
+
+    # ── reject v2: a SAME-SEAM rejection becomes citable charter evidence ──
+    approve_decision_fn(g, pend[0].id, False, "fixture: reject charter v2")
+    rt.run_until_idle()
+
+    # ── tamper: the mock reproduces decision#195 (truncate + paraphrase) ───
+    msg_b = (f"Please propose {exp['seam_name']} once more (fixture-tamper)."
+             f"\n\nVERBATIM:\n{section}\nEND VERBATIM")
+    _, msg2 = send_branch_message_fn(g, branch.id, msg_b)
+    rt.run_until_idle()
+
+    requests = _lab_obs(g, "seam_proposal_request")
+    c.that(len(requests) == 2, f"second request assembled ({len(requests)})")
+    refs2 = ((requests[-1].data.get("metadata") or {})
+             .get("evidence_refs") or []) if requests else []
+    c.that(pend[0].id in refs2,
+           "a rejected decision on the SAME seam is cited")
+    c.that(rejected_publish.id not in refs2,
+           "the publish rejection stays uncited on the retry too")
+
+    c.that(len(charter_seams()) == 1,
+           f"tampered generation opens NO proposal ({len(charter_seams())} "
+           "charter seam artifacts)")
+    c.that(not [d for d in g.objects(type="decision")
+                if d.data.get("kind") == "self_modify"
+                and d.data.get("status") == "pending"
+                and (d.data.get("metadata") or {}).get("seam_name")
+                == exp["seam_name"]],
+           "no pending self_modify for the blocked attempt")
+    failed = _lab_obs(g, "seam_proposal_failed")
+    c.that(len(failed) == 1, f"seam_proposal_failed recorded ({len(failed)})")
+    diff = ((failed[0].data.get("metadata") or {})
+            .get("verbatim_diff") or []) if failed else []
+    c.that(bool(diff) and diff[0]["matched_chars"] < diff[0]["expected_chars"]
+           and bool(diff[0]["missing_text"]),
+           f"the observation records the diff (kept "
+           f"{diff[0]['matched_chars'] if diff else '?'} of "
+           f"{diff[0]['expected_chars'] if diff else '?'})")
+    replies = [x for x in g.objects(type="comm_response_candidate")
+               if x.data.get("created_by_behavior") == "lab.seam_writer"
+               and x.data.get("message_id") == msg2.id]
+    c.that(len(replies) == 1
+           and "NOT opened" in (replies[0].data.get("content") or ""),
+           f"the chat reply says the proposal was not opened ({len(replies)})")
+    print(f"  tamper: blocked — kept {diff[0]['matched_chars'] if diff else '?'}"
+          f"/{diff[0]['expected_chars'] if diff else '?'} chars; failed obs + "
+          "thread reply; same-seam rejection cited")
+    return c.done("seam_verbatim")
+
+
 def run_research_worker() -> bool:
     spec = _load("research_worker.yaml")
     print("\n" + "=" * 64)
@@ -1990,6 +2120,7 @@ def run_all() -> None:
         run_model_params(),
         run_research_worker(),
         run_seam_proposal(),
+        run_seam_verbatim(),
         run_github_read(),
         run_graph_code(),
         run_compat_regression(),

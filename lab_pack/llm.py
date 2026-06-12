@@ -228,17 +228,43 @@ class LabMockProvider:
             seam = seam_m[-1] if seam_m else "prompt.unknown"
             ev = re.findall(r"\b(?:decision|comm_message|artifact)#\d+", blob)
             cited = ", ".join(dict.fromkeys(ev[:4])) or "the request context"
+            # The request observation rides whole in the view; honor its
+            # verbatim_sections the way the live prompt instructs — except
+            # under the fixture-tamper marker, which reproduces the
+            # decision#195 failure mode (truncate, then paraphrase) so the
+            # post-generation check has something to catch.
+            verbatim: list[str] = []
+            for line in blob.splitlines():
+                if '"verbatim_sections"' not in line:
+                    continue
+                start, end = line.find("{"), line.rfind("}")
+                if start == -1 or end <= start:
+                    continue
+                try:
+                    odata = json.loads(line[start:end + 1])
+                except ValueError:
+                    continue
+                verbatim = list((odata.get("metadata") or {})
+                                .get("verbatim_sections") or [])
+                if verbatim:
+                    break
+            if verbatim and "fixture-tamper" in blob:
+                verbatim = [verbatim[0][:120]
+                            + " …and the rest restated in the mock's own words."]
             if seam.startswith("setting."):
                 parsed: Any = SeamProposal(
                     body="4",
                     rationale=f"Adjusted per the cited evidence ({cited}). [mock {digest}]")
             else:
+                body = (f"You are the {seam.split('.', 1)[1]} surface of a "
+                        "research lab. Revised per the operator's request: "
+                        "ground every claim in linked evidence, narrate "
+                        "provenance honestly, and treat failures as "
+                        f"findings. [mock proposal {digest}]")
+                if verbatim:
+                    body += "\n\n" + "\n\n".join(verbatim)
                 parsed = SeamProposal(
-                    body=(f"You are the {seam.split('.', 1)[1]} surface of a "
-                          "research lab. Revised per the operator's request: "
-                          "ground every claim in linked evidence, narrate "
-                          "provenance honestly, and treat failures as "
-                          f"findings. [mock proposal {digest}]"),
+                    body=body,
                     rationale=(f"Revision argued from the cited evidence "
                                f"({cited}). [mock {digest}]"))
         elif name == "BlogDraft":

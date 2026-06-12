@@ -224,7 +224,8 @@ def _rebuild_lab_registries(rt) -> None:
             # Phase 4: rejected decisions are the seam-proposal evidence pool.
             lb._REJECTED_DECISIONS.append({
                 "id": d.id, "kind": d.data.get("kind"),
-                "subject_ref": d.data.get("subject_ref")})
+                "subject_ref": d.data.get("subject_ref"),
+                "seam_name": (d.data.get("metadata") or {}).get("seam_name")})
     # 5a: observation provenance — actor + timestamp from each object.created
     # event (replay rebuilds objects, not the in-process provenance registry).
     created_by: dict[str, tuple[str, str]] = {}
@@ -703,7 +704,8 @@ def _narrate_created(g, obj_type: str, data: dict, obj_id: str,
     if obj_type == "comm_message" and data.get("channel") == "lab":
         via = (" (via MCP)" if (meta.get("source") == "operator_via_mcp") else "")
         return f"{data.get('sender_ref', 'owner')}{via} said: “{_shorten(data.get('content'), 130)}”"
-    if obj_type == "comm_response_candidate" and data.get("created_by_behavior") == "lab.answer":
+    if obj_type == "comm_response_candidate" and \
+            data.get("created_by_behavior") in ("lab.answer", "lab.seam_writer"):
         return f"Lab replied: “{_shorten(data.get('content'), 150)}”"
     if obj_type == "source" and data.get("kind") == "tool_result":
         cap = (data.get("metadata") or {}).get("capability")
@@ -1240,9 +1242,13 @@ def _chat_collect_reply(rt, message_id: str):
     events_before = len(rt.graph.events)
     rt.run_until_idle()
     _save(rt)
+    # lab.seam_writer replies too (a blocked VERBATIM proposal must reach the
+    # operator's chat, not just the log); objects() is creation-ordered, so
+    # the later failure notice supersedes answer's acknowledgement.
     cands = [c for c in rt.graph.objects(type="comm_response_candidate")
              if str(c.data.get("message_id")) == str(message_id)
-             and c.data.get("created_by_behavior") == "lab.answer"]
+             and c.data.get("created_by_behavior") in ("lab.answer",
+                                                       "lab.seam_writer")]
     if not cands:
         return None
     return {"content": cands[-1].data.get("content"),
