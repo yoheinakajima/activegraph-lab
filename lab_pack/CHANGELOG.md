@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Seam-proposal truncation + evidence relevance (decision#195 /
+  artifact#194): the chat-triggered seam_proposal_request capped the
+  operator's message at 500 chars, so the seam_writer drafted a charter
+  v2 from an excerpt — the proposed body cut off mid-VERBATIM and
+  resumed with v1 text. The request now carries the operator message
+  and the current body IN FULL (the seam_writer's view serializes the
+  observation whole; an excerpt there IS a truncation in the proposal).
+  Text the operator marks VERBATIM (`VERBATIM:` … `END VERBATIM`, or
+  to end of message) rides the request as verbatim_sections, the
+  seam_writer prompt instructs inclusion without paraphrase, and a
+  post-generation check requires it intact in the body (substring after
+  whitespace normalization) — failure opens NO proposal: a
+  seam_proposal_failed observation records the diff (matched/expected
+  chars + missing tail) and a lab.seam_writer reply lands in the branch
+  thread (the chat path returns it). Second defect, same proposal:
+  evidence selection is now seam-relevant — the operator message
+  always; rejected decisions only when the target is
+  prompt.draft_writer (publish rejections) or the decision references
+  the same seam, so charter proposals no longer cite publish
+  rejections. Locked by the seam_verbatim fixture (700-char section
+  end-to-end intact; tampered generation blocked; charter evidence
+  clean).
+
 - Model-parameter compatibility (the Opus incident): ADR-019 routing
   seams can point a behavior at a model that rejects the lab's hardcoded
   temperature (400 "may only be set to 1"), and the failure was misfiled

@@ -1,0 +1,34 @@
+# Verbatim seam proposals (the decision#195/artifact#194 truncation): the
+# operator's message reaches the seam_writer IN FULL (never an excerpt);
+# text the operator marked VERBATIM must survive intact into the proposed
+# body or the proposal is blocked (seam_proposal_failed records the diff and
+# a reply lands in the thread); and a charter proposal cites only
+# charter-relevant evidence — never the rejected publish decisions, which
+# speak to prompt.draft_writer.
+
+settings:
+  crawl_enabled: false
+
+mission:
+  title: Verbatim mission
+
+branch:
+  title: Charter steering branch
+  intent: Talk to the lab about its charter here.
+
+# ~700 characters, mirroring the production STANDING PORTFOLIO section.
+verbatim_section: |
+  STANDING PORTFOLIO — the lab maintains exactly these standing lines of
+  work, in this order of precedence. One: verify every capability claim
+  published on activegraph.ai against a runnable reproduction before any
+  artifact may cite it. Two: record upstream friction as observations the
+  moment it is hit, never batched retroactively. Three: keep one open
+  question per branch; a branch that accumulates a second question forks.
+  Four: drafts narrate failures as findings with the same care as
+  successes. Five: nothing publishes, and no seam changes, without an
+  approved decision — the gate is the operator's, not the lab's. Six: when
+  evidence and elegance conflict, evidence wins; cite object ids inline.
+
+expected_outputs:
+  seam_name: charter.mission
+  proposal_version: 2

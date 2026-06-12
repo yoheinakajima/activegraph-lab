@@ -1129,7 +1129,9 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
     _PENDING_BY_SUBJECT.pop(subject, None)
     if status == "rejected":
         _REJECTED_DECISIONS.append({"id": decision_id, "kind": kind,
-                                    "subject_ref": subject})
+                                    "subject_ref": subject,
+                                    "seam_name": (data.get("metadata") or {})
+                                    .get("seam_name")})
 
     if kind == "promote" and subject:
         new_status = "decided" if status == "approved" else "archived"
@@ -1466,7 +1468,7 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     output_schema=SeamProposal,
     model=None,
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
-    creates=["artifact", "decision", "observation"],
+    creates=["artifact", "decision", "observation", "comm_response_candidate"],
     max_tokens=4096,
     tools=[],
 )
@@ -1477,6 +1479,12 @@ def seam_writer(event, graph, ctx, out, *, settings: LabSettings):
     pending) via propose_seam_fn — the decision's evidence_refs carry the
     ids that informed the proposal (the operator's message, the rejected
     decisions), so the proposal event records them.
+
+    VERBATIM enforcement (decision#195): text the operator marked VERBATIM
+    must appear intact in the generated body (substring after whitespace
+    normalization). A body that drops or alters it never becomes a
+    proposal — a seam_proposal_failed observation records the diff and a
+    reply in the branch thread says so.
     """
     consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
@@ -1500,6 +1508,44 @@ def seam_writer(event, graph, ctx, out, *, settings: LabSettings):
             "metadata": {"lab": "seam_proposal_failed", "seam_name": seam_name,
                          "request_id": obs_id},
         })
+        return
+    diff = _verbatim_diff(body, list(meta.get("verbatim_sections") or []))
+    if diff:
+        first = diff[0]
+        graph.add_object("observation", {
+            "text": (f"Seam proposal for {seam_name} BLOCKED: the generated "
+                     "body dropped or altered operator-marked VERBATIM text "
+                     f"(kept {first['matched_chars']} of "
+                     f"{first['expected_chars']} normalized chars). No "
+                     "proposal was opened; the diff is on this observation."),
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "seam_proposal_failed", "seam_name": seam_name,
+                         "request_id": obs_id, "verbatim_diff": diff,
+                         "lab_branch_id": meta.get("lab_branch_id")},
+        })
+        reply = (f"The seam proposal for {seam_name} was NOT opened: the "
+                 "generated body dropped or altered the text you marked "
+                 f"VERBATIM (kept {first['matched_chars']} of "
+                 f"{first['expected_chars']} chars after whitespace "
+                 "normalization). The diff is recorded as a "
+                 "seam_proposal_failed observation — re-send the request to "
+                 "retry.\n\n— as of event " + str(event.id))
+        candidate = graph.add_object("comm_response_candidate", {
+            "message_id": meta.get("message_id"),
+            "thread_id": meta.get("thread_id"),
+            "channel": settings.answer_channel,
+            "content": reply,
+            "status": ("approved" if settings.auto_approve_answers
+                       else "proposed"),
+            "created_by_behavior": "lab.seam_writer",
+            "metadata": {"event_horizon": str(event.id),
+                         "lab": "seam_proposal_failed_reply",
+                         "request_id": obs_id,
+                         "provenance": {"branch_id": meta.get("lab_branch_id")}},
+        })
+        if meta.get("message_id"):
+            graph.add_relation(candidate.id, meta["message_id"], "response_to")
         return
     rationale = (getattr(out, "rationale", None) or "").strip() \
         or f"Operator-requested revision of {seam_name}."
@@ -1553,17 +1599,70 @@ def _current_seam_body(graph, seam_name: str) -> tuple[int, str]:
     return version, (body if body is not None else "")
 
 
+# Operator-marked verbatim text (the decision#195 truncation): everything
+# from a VERBATIM marker to END VERBATIM, or to the end of the message.
+# Uppercase only — the marker is a deliberate act, not the word in prose.
+# The END marker is CONSUMED (not a lookahead), so the scan never re-matches
+# the word inside "END VERBATIM" and captures trailing prose as a section.
+_VERBATIM_BLOCK_RE = re.compile(
+    r"\bVERBATIM\b:?[ \t]*\n?(.+?)(?:\bEND[ \t]+VERBATIM\b|\Z)", re.S)
+
+
+def _verbatim_sections(content: str) -> list[str]:
+    return [m.strip() for m in _VERBATIM_BLOCK_RE.findall(content or "")
+            if m.strip()]
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _verbatim_diff(body: str, sections: list[str]) -> list[dict]:
+    """VERBATIM sections the generated body dropped or altered: each entry
+    records how far (whitespace-normalized) the body got into the marked
+    text and the tail it lost — the diff the failure observation carries."""
+    nb = _normalize_ws(body)
+    failures = []
+    for s in sections:
+        ns = _normalize_ws(s)
+        if not ns or ns in nb:
+            continue
+        lo, hi = 0, len(ns)  # longest prefix of ns still present in the body
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if ns[:mid] in nb:
+                lo = mid
+            else:
+                hi = mid - 1
+        failures.append({"expected_chars": len(ns), "matched_chars": lo,
+                         "expected_head": ns[:120],
+                         "missing_text": ns[lo:]})
+    return failures
+
+
+def _rejected_for_seam(seam_name: str) -> list[dict]:
+    """Rejected decisions a proposal for `seam_name` may cite (decision#195's
+    second defect: a charter proposal cited publish rejections). Publish
+    rejections speak to the draft_writer's voice; a rejected decision on the
+    SAME seam speaks to that seam; everything else is noise here."""
+    relevant = [d for d in _REJECTED_DECISIONS
+                if d.get("seam_name") == seam_name
+                or (seam_name == "prompt.draft_writer"
+                    and d.get("kind") == "publish")]
+    return relevant[-6:]
+
+
 def _request_seam_proposal(graph, branch_id: str, msg_id: str,
                            content: str, seam_name: str) -> str:
     """Phase 4 rails: assemble the seam-proposal request the seam_writer
     behavior drafts from — current version verbatim plus the cited evidence
-    (the operator's message and the rejected decisions on the record). The
-    proposal itself goes through propose_seam_fn → the EXISTING gate;
-    nothing auto-applies."""
+    (the operator's message and the seam-relevant rejected decisions on the
+    record). The proposal itself goes through propose_seam_fn → the EXISTING
+    gate; nothing auto-applies."""
     version, body = _current_seam_body(graph, seam_name)
     evidence = [msg_id]
     rejected = []
-    for d in _REJECTED_DECISIONS[-6:]:
+    for d in _rejected_for_seam(seam_name):
         evidence.append(d["id"])
         item = {"decision_id": d["id"], "kind": d["kind"],
                 "subject_ref": d["subject_ref"]}
@@ -1573,21 +1672,33 @@ def _request_seam_proposal(graph, branch_id: str, msg_id: str,
             if d["subject_ref"] not in evidence:
                 evidence.append(d["subject_ref"])
         rejected.append(item)
+    verbatim = _verbatim_sections(content)
+    msg = graph.get_object(msg_id) if msg_id else None
+    text = (f"Seam proposal requested via chat: author the next version "
+            f"of {seam_name} (current v{version}), addressing the cited "
+            "evidence. The proposal opens a pending self_modify decision "
+            "— nothing applies without the gate.")
+    if verbatim:
+        text += (f" The operator marked {len(verbatim)} section(s) VERBATIM: "
+                 "they must appear in the proposed body without paraphrase.")
     graph.add_object("observation", {
-        "text": (f"Seam proposal requested via chat: author the next version "
-                 f"of {seam_name} (current v{version}), addressing the cited "
-                 "evidence. The proposal opens a pending self_modify decision "
-                 "— nothing applies without the gate."),
+        "text": text,
         "confidence": 1.0,
         "category": "fact",
+        # The operator's message and the current body ride IN FULL — the
+        # seam_writer's view serializes this object whole, so an excerpt
+        # here IS a truncation in the proposal (decision#195/artifact#194).
         "metadata": {"lab": "seam_proposal_request",
                      "seam_name": seam_name,
                      "current_version": version,
-                     "current_body": (body or "")[:4000],
-                     "operator_request": content[:500],
+                     "current_body": body or "",
+                     "operator_request": content,
+                     "verbatim_sections": verbatim,
                      "evidence_refs": evidence,
                      "rejected_decisions": rejected,
                      "lab_branch_id": branch_id,
+                     "thread_id": (msg.data.get("thread_id")
+                                   if msg is not None else None),
                      "message_id": msg_id},
     })
     return f"seam proposal requested for {seam_name} (gated, pending review)"
