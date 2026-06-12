@@ -214,6 +214,7 @@ def _rebuild_lab_registries(rt) -> None:
     for d in g.objects(type="decision"):
         if d.data.get("status") == "pending":
             lb._PENDING_BY_SUBJECT[d.data.get("subject_ref", "")] = d.id
+            lb.index_pending_decision(g, d.id, d.data)  # by branch (ADR-025)
             if d.data.get("kind") == "publish":
                 lb._PENDING_PUBLISH.add(d.id)
         elif d.data.get("kind") == "publish" and d.data.get("status") == "approved":

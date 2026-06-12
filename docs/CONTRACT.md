@@ -34,6 +34,8 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 - A user message is an event in the branch's log (a comm_message in a thread that discusses the branch — ADR-004).
 - Replies come from a fast answer behavior that reads graph state, never blocks on running work, and stamps its event horizon.
 - Steering takes effect at event boundaries.
+- Steering replies are truthful (ADR-025): mutations apply before the reply is composed; a reply may claim only actions whose `lab.steering_applied` event it cites; an action request no verb supports draws an explicit refusal naming the verb set.
+- Chat approve/reject keys by the thread's branch and is REFUSED for MCP-tagged messages — the inbox stays human-only (ADR-016/021/025).
 
 ## Workers
 

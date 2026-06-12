@@ -10,6 +10,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -309,6 +310,264 @@ def run_thread_equals_branch() -> bool:
         c.that(any(str(r.source) == thread_id and str(r.target) == branch.id for r in disc),
                "discusses(thread → branch) relation missing")
     return c.done("thread_equals_branch")
+
+
+def run_truthful_steering() -> bool:
+    spec = _load("truthful_steering.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: truthful_steering — post-mutation replies, activate verb, "
+          "decision keying (ADR-025)")
+    print("=" * 64)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+    rt.run_until_idle()
+    c = Check()
+
+    def chat(text, source=None):
+        _, msg = send_branch_message_fn(g, branch.id, text, source=source)
+        rt.run_until_idle()
+        cand = next((x for x in g.objects(type="comm_response_candidate")
+                     if x.data.get("message_id") == msg.id), None)
+        return (cand.data.get("content") or "") if cand else ""
+
+    def cited_event(reply):
+        m = re.search(r"recorded at (evt_\w+)", reply)
+        if not m:
+            return None
+        return next((e for e in g.events if str(e.id) == m.group(1)), None)
+
+    def steering_events():
+        return [e for e in g.events if str(e.type) == "lab.steering_applied"]
+
+    def b_status():
+        return g.get_object(branch.id).data.get("status")
+
+    # ── Phase 1: unsupported action → honest refusal naming the verb set ──
+    reply = chat("please archive this branch and clean out the junk claims")
+    c.that("I can't do that" in reply and "Supported verbs" in reply
+           and all(v in reply for v in spec["expected_outputs"]
+                   ["refusal_names_verbs"]),
+           f"unsupported action draws a refusal naming the verb set "
+           f"({reply[:90]!r})")
+    c.that(b_status() == "proposed" and not steering_events(),
+           "the refusal mutates nothing and claims nothing")
+
+    # ── Phase 1: supported verb → reply cites the mutation event id ───────
+    reply = chat("please pause this branch")
+    ev = cited_event(reply)
+    c.that("Applied: branch paused" in reply and ev is not None
+           and str(ev.type) == "lab.steering_applied"
+           and ev.payload.get("verb") == "pause",
+           "applied verb cites a real lab.steering_applied event")
+    c.that("is now paused" in reply and b_status() == "paused",
+           "the reply reports POST-mutation state")
+    n_steer = len(steering_events())
+    reply = chat("pause it again please")
+    c.that("already paused" in reply and len(steering_events()) == n_steer,
+           "a no-op verb says so and emits no applied event")
+    print("  Phase 1: refusal names verbs; applied pause cites its event")
+
+    # ── Phase 2: activate / deactivate round trip; MCP-allowed ────────────
+    chat("ok, resume it")
+    c.that(b_status() == "active", "resume from paused")
+    reply = chat("deactivate this branch for now")
+    c.that(b_status() == "proposed" and "deactivated" in reply,
+           "deactivate reverts an active branch to proposed")
+    reply = chat("Activate this branch. Rationale: first verify work under "
+                 "the charter.", source="operator_via_mcp")
+    ev = cited_event(reply)
+    c.that(b_status() == "active" and ev is not None
+           and ev.payload.get("verb") == "activate"
+           and ev.payload.get("source") == "operator_via_mcp",
+           "operator_via_mcp may activate (reversible, like pause)")
+    acts = [o for o in _lab_obs(g, "branch_activated")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+    c.that(len(acts) == 1
+           and "Rationale: first verify work" in (acts[0].data.get("text") or "")
+           and any(str(r.type) == "supported_by" and str(r.source) == branch.id
+                   and str(r.target) == acts[0].id for r in g.relations()),
+           "activation records the operator rationale, linked to the branch")
+    n_steer = len(steering_events())
+    reply = chat("activate it")
+    c.that("already active" in reply and len(steering_events()) == n_steer,
+           "re-activation is an honest no-op")
+    print("  Phase 2: deactivate→proposed; MCP activate→active + rationale obs")
+
+    # ── Phase 3: decision verbs keyed by branch ───────────────────────────
+    reply = chat("approve")
+    c.that("Nothing to approve" in reply,
+           "zero pending decisions → honest no-op reply")
+
+    def add_publish_decision(slug):
+        artifact = g.add_object("artifact", {
+            "kind": "blog_draft", "title": f"Draft {slug}",
+            "content": f"## {slug}", "format": "markdown", "status": "draft",
+            "metadata": {"lab": "blog_draft", "slug": slug,
+                         "lab_branch_id": branch.id},
+        })
+        d = g.add_object("decision", {
+            "subject_ref": artifact.id, "kind": "publish", "status": "pending",
+            "rationale": f"publish {slug}?", "evidence_refs": [],
+            "metadata": {"requested_by": "lab.draft_writer",
+                         "lab_branch_id": branch.id},
+        })
+        rt.run_until_idle()
+        return artifact, d
+
+    # exactly one pending — keyed by lab_branch_id, NOT subject_ref==branch
+    # (the production silent no-op: publish decisions key by artifact).
+    a1, d1 = add_publish_decision("keyed-by-branch")
+    reply = chat("approve")
+    ev = cited_event(reply)
+    c.that(g.get_object(d1.id).data.get("status") == "approved"
+           and ev is not None
+           and (ev.payload.get("refs") or {}).get("decision_id") == d1.id,
+           "one pending → chat approve resolves it (branch-keyed)")
+    c.that(g.get_object(a1.id).data.get("status") == "published",
+           "the gate then published the approved artifact")
+
+    # multiple pending → reply lists ids, nothing mutates
+    _, d2 = add_publish_decision("ambiguous-one")
+    _, d3 = add_publish_decision("ambiguous-two")
+    reply = chat("approve")
+    c.that(d2.id in reply and d3.id in reply
+           and g.get_object(d2.id).data.get("status") == "pending"
+           and g.get_object(d3.id).data.get("status") == "pending",
+           "multiple pending → ids listed, no mutation")
+
+    # operator_via_mcp → refused for approve AND reject; nothing mutates
+    for verb in ("approve", "reject"):
+        reply = chat(verb, source="operator_via_mcp")
+        c.that("human operator" in reply and "refused" in reply.lower()
+               and g.get_object(d2.id).data.get("status") == "pending"
+               and g.get_object(d3.id).data.get("status") == "pending",
+               f"MCP {verb} refused — the inbox stays human-only")
+    print("  Phase 3: no-op / apply+publish / ambiguous list / MCP refusal")
+    return c.done("truthful_steering")
+
+
+def run_crawl_stall() -> bool:
+    spec = _load("crawl_stall.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: crawl_stall — truncated envelope salvage, real-world "
+          "links, recrawl verb")
+    print("=" * 64)
+
+    import json as _json
+
+    base = spec["base_url"]
+    # Realistic Next.js shape: preload noise in the head, nav + prose early,
+    # a long inline SVG path after the prose — so the gateway's 10K default
+    # cuts the envelope exactly where production's source#45 was cut (inside
+    # the tail SVG), leaving the nav and prose in the salvageable prefix.
+    head_noise = "".join(
+        f'<link rel="preload" href="/_next/static/chunks/c{i:04d}.js'
+        f'?dpl=dpl_fixture" as="script" crossorigin=""/>'
+        for i in range(60))
+    tail_noise = ('<svg aria-hidden="true" viewBox="0 0 24 24"><path d="'
+                  + "M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91 "
+                  * 200 + '"/></svg>')
+    index_html = (spec["index_template"]
+                  .replace("__HEAD_NOISE__", head_noise)
+                  .replace("__TAIL_NOISE__", tail_noise))
+    pages = {base: index_html}
+    pages.update(spec["pages"])
+
+    calls: dict[str, int] = {}
+
+    def canned_fetch(url: str, **_kw) -> dict:
+        clean = url.rstrip("/")
+        calls[clean] = calls.get(clean, 0) + 1
+        for key, html in pages.items():
+            if key.rstrip("/") == clean:
+                return {"url": url, "status": 200, "content": html}
+        return {"url": url, "status": 404, "content": "", "error": "404"}
+
+    rt = _new_runtime(spec, with_gateway=True, with_comm=True)
+    register_web_fetch(canned_fetch, overwrite=True)
+    g = rt.graph
+    mission = create_mission_fn(g, "Crawl mission", target_url=base)
+    rt.run_until_idle()
+
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    # ── the fixture reproduces the production truncation shape ────────────
+    idx_call = next(x for x in g.objects(type="capability_call")
+                    if (x.data.get("input_data") or {}).get("url", "")
+                    .rstrip("/") == base.rstrip("/"))
+    idx_src = next(s for s in g.objects(type="source")
+                   if s.data.get("kind") == "tool_result"
+                   and (s.data.get("metadata") or {}).get("call_id")
+                   == idx_call.id)
+    stored = idx_src.data.get("content") or ""
+    truncated = False
+    try:
+        _json.loads(stored)
+    except ValueError:
+        truncated = True
+    c.that(len(stored) == exp["truncated_source_chars"] and truncated,
+           f"stored envelope is cut mid-JSON at the gateway cap "
+           f"({len(stored)} chars, parses={not truncated}) — the "
+           "production stall shape")
+
+    # ── the salvage parser keeps the crawl moving past page one ───────────
+    crawl = (g.get_object(mission.id).data.get("metadata") or {}).get("crawl") or {}
+    c.that(crawl.get("fetched") == exp["fetched_pages"]
+           and crawl.get("queued") == 0,
+           f"crawl reached every same-host page within the caps "
+           f"(fetched={crawl.get('fetched')}, want {exp['fetched_pages']})")
+    c.that(calls.get(f"{base}/docs") == 1,
+           f"fragment link (/docs#install) dedups with /docs — one fetch "
+           f"({calls.get(f'{base}/docs')})")
+    for url in exp["never_fetched"]:
+        c.that(url.rstrip("/") not in calls,
+               f"never fetched: {url} (off-host or beyond depth cap)")
+    claims = _lab_obs(g, "site_claim")
+    c.that(bool(claims) and all(
+        not any(ch in (o.data.get("text") or "") for ch in '<>{}\\')
+        for o in claims),
+        f"claims come from salvaged readable HTML, never escaped envelope "
+        f"soup ({len(claims)} claims)")
+    print(f"  truncated at {len(stored)} chars → salvaged: "
+          f"{crawl.get('fetched')} pages, {len(claims)} clean claims")
+
+    # ── recrawl steering verb: a fresh crawl episode via chat ─────────────
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+    rt.run_until_idle()
+    n_idx = calls[base.rstrip("/")]
+    _, msg = send_branch_message_fn(g, branch.id, "please recrawl the site",
+                                    source="operator_via_mcp")
+    rt.run_until_idle()
+    c.that(calls[base.rstrip("/")] == n_idx + 1,
+           f"recrawl re-fetches the mission target "
+           f"({calls[base.rstrip('/')]} fetches of the index)")
+    reqs = [s for s in g.objects(type="source")
+            if s.data.get("kind") == "crawl_request"]
+    c.that(len(reqs) == 1 and (reqs[0].data.get("metadata") or {})
+           .get("requested_by") == "operator",
+           "the verb created a crawl_request source ingest reacts to")
+    cand = next((x for x in g.objects(type="comm_response_candidate")
+                 if x.data.get("message_id") == msg.id), None)
+    content = (cand.data.get("content") or "") if cand else ""
+    m = re.search(r"recorded at (evt_\w+)", content)
+    ev = next((e for e in g.events if str(e.id) == (m.group(1) if m else "")),
+              None)
+    c.that(ev is not None and str(ev.type) == "lab.steering_applied"
+           and ev.payload.get("verb") == "recrawl",
+           "the reply cites the recrawl steering event")
+    crawl2 = (g.get_object(mission.id).data.get("metadata") or {}).get("crawl") or {}
+    c.that(crawl2.get("fetched") == exp["fetched_pages"],
+           f"the recrawl episode obeys the same caps "
+           f"(fetched={crawl2.get('fetched')})")
+    print(f"  recrawl: index fetched again ({calls[base.rstrip('/')]}x), "
+          "reply cites the steering event")
+    return c.done("crawl_stall")
 
 
 def run_capability_gap() -> bool:
@@ -1374,7 +1633,7 @@ def run_research_worker() -> bool:
         return {"url": url, "status": 503, "content": "",
                 "error": "HTTPError: 503 fixture outage"}
 
-    rt = _new_runtime(spec, with_gateway=True, with_comm=False)
+    rt = _new_runtime(spec, with_gateway=True, with_comm=True)
     register_web_fetch(canned_fetch, overwrite=True)
     g = rt.graph
     mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
@@ -1485,6 +1744,46 @@ def run_research_worker() -> bool:
            f"codebase routing untouched: gap recorded, task blocked "
            f"({len(gaps)})")
     print("  unhandled: codebase routing → gap, task blocked")
+
+    # ── ADR-025 Phase 2: operator activates a proposed branch over MCP; the
+    # EXISTING dispatch reacts and the worker runs end to end ───────────────
+    b_act = make("activated", status="proposed")
+    c.that(task_for(b_act.id) is None, "a proposed branch dispatches nothing")
+    _, msg = send_branch_message_fn(
+        g, b_act.id,
+        "Activate this branch. Rationale: first charter-category-1 verify "
+        "work to execute.",
+        source="operator_via_mcp")
+    rt.run_until_idle()
+    t_act = task_for(b_act.id)
+    c.that(t_act is not None and t_act.data.get("status") == "done",
+           f"MCP activate → status flip → dispatch → worker completed "
+           f"({t_act.data.get('status') if t_act else 'no task'})")
+    act_findings = [o for o in _lab_obs(g, "research_finding")
+                    if (o.data.get("metadata") or {}).get("lab_branch_id")
+                    == b_act.id]
+    c.that(bool(act_findings),
+           f"the worker wrote attributed findings for the activated branch "
+           f"({len(act_findings)})")
+    acts = [o for o in _lab_obs(g, "branch_activated")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == b_act.id]
+    c.that(len(acts) == 1 and "Rationale" in (acts[0].data.get("text") or ""),
+           "the activation observation records the operator rationale")
+    cand = next((x for x in g.objects(type="comm_response_candidate")
+                 if x.data.get("message_id") == msg.id), None)
+    content = (cand.data.get("content") or "") if cand else ""
+    m = re.search(r"recorded at (evt_\w+)", content)
+    ev = next((e for e in g.events if str(e.id) == (m.group(1) if m else "")),
+              None)
+    c.that(ev is not None and str(ev.type) == "lab.steering_applied"
+           and ev.payload.get("verb") == "activate",
+           "the reply cites the activation's steering event")
+    # deactivate reverts cleanly (the unhandled branch is still active)
+    send_branch_message_fn(g, b_gap.id, "deactivate this branch")
+    rt.run_until_idle()
+    c.that(g.get_object(b_gap.id).data.get("status") == "proposed",
+           "deactivate reverts an active branch to proposed")
+    print("  ADR-025: MCP activate → e2e worker run; deactivate reverts")
     return c.done("research_worker")
 
 
@@ -2109,6 +2408,7 @@ def run_all() -> None:
         run_claim_hygiene(),
         run_branch_lifecycle(),
         run_thread_equals_branch(),
+        run_truthful_steering(),
         run_capability_gap(),
         run_draft_writer(),
         run_editorial(),
@@ -2123,6 +2423,7 @@ def run_all() -> None:
         run_seam_verbatim(),
         run_github_read(),
         run_graph_code(),
+        run_crawl_stall(),
         run_compat_regression(),
         run_storage_selection(),
     ]
