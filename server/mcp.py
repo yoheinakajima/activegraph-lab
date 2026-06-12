@@ -18,7 +18,10 @@ Tool tiers (ADR-016; get_errors added by ADR-023; ADR-021 expansion):
   OPERATOR CONTROL (ADR-021; same authority as send_chat): set_budget,
             pause_lab, resume_lab — REVERSIBLE operational controls,
             categorically unlike promotions; each emits a public control
-            event.
+            event. annotate_decision (ADR-026) attaches a public,
+            operator_via_mcp-attributed note to a PENDING decision — it
+            does NOT and cannot resolve; annotation is commentary, not
+            authority.
   EXCLUDED BY DESIGN: approve/reject of decisions and seam promotion
             remain EXCLUDED from MCP — the inbox stays human-only.
 """
@@ -36,9 +39,11 @@ INSTRUCTIONS = (
     "back to the operator). send_chat posts to a branch thread AS the operator "
     "— it lands in the public log. set_budget and pause_lab/resume_lab are "
     "reversible operator controls (public control events; budgets clamp to a "
-    "kernel ceiling). Approving/rejecting decisions and seam promotion are "
-    "deliberately not available here — the inbox stays human-only "
-    "(ADR-016/021)."
+    "kernel ceiling). annotate_decision attaches a public pre-review note to "
+    "a pending decision — commentary, not authority: the operator's UI "
+    "prefills its rationale field from the latest note when they resolve. "
+    "Approving/rejecting decisions and seam promotion are deliberately not "
+    "available here — the inbox stays human-only (ADR-016/021/026)."
 )
 
 _DEFAULT_LIMIT = 30
@@ -209,6 +214,30 @@ TOOLS: list[dict] = [
                        "a public lab.resumed control event and drains queued "
                        "work immediately.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "annotate_decision",
+        "description": "OPERATOR (ADR-026): attach a public, "
+                       "operator_via_mcp-attributed annotation to a PENDING "
+                       "decision — pre-review notes, recommendations, draft "
+                       "rationale. It does NOT and cannot resolve: "
+                       "approve/reject remain EXCLUDED from MCP; annotation "
+                       "is commentary, not authority. When the operator "
+                       "later resolves in the UI, pending annotations are "
+                       "linked into the resolution's evidence and the "
+                       "rationale field is prefilled from the most recent "
+                       "annotation (the operator can edit before "
+                       "submitting).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decision_id": {"type": "string",
+                                "description": "A PENDING decision id, e.g. decision#7."},
+                "note": {"type": "string",
+                         "description": "The annotation text (public, lands in the log)."},
+            },
+            "required": ["decision_id", "note"],
+        },
     },
     {
         "name": "send_chat",
@@ -611,6 +640,41 @@ def _control_pause(msg_id: Any, paused: bool, *, get_rt, run_on_worker) -> dict:
     return _tool_result(msg_id, out)
 
 
+def _annotate_decision(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dict:
+    """ADR-026: commentary, not authority — the note attaches to a PENDING
+    decision and resolution stays in the human operator's inbox. The handler
+    can only create an observation and append its id to the decision's
+    metadata.annotation_refs; no code path here touches status."""
+    decision_id = (args.get("decision_id") or "").strip()
+    note = (args.get("note") or "").strip()
+    if not decision_id or not note:
+        return _tool_failure(msg_id, "decision_id and note are required")
+    get_rt()
+
+    def job(rt):
+        from lab_pack.tools import annotate_decision_fn
+        from server.lab_server import _save
+        obs = annotate_decision_fn(rt.graph, decision_id, note)
+        rt.run_until_idle()
+        _save(rt)
+        d = rt.graph.get_object(decision_id)
+        meta = d.data.get("metadata") or {}
+        return {
+            "decision_id": decision_id,
+            "status": d.data.get("status"),  # stays pending — by construction
+            "annotation_id": str(obs.id),
+            "annotation_count": len(meta.get("annotation_refs") or []),
+            "note": ("annotation recorded (public, operator_via_mcp). It does "
+                     "not resolve the decision — approve/reject stay in the "
+                     "operator's inbox (ADR-016/021/026)."),
+        }
+
+    try:
+        return _tool_result(msg_id, run_on_worker(job))
+    except ValueError as exc:
+        return _tool_failure(msg_id, str(exc))
+
+
 def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
                 rate_limited) -> tuple[int, Optional[dict]]:
     """One streamable-HTTP POST: a single JSON-RPC message in, a single JSON
@@ -649,7 +713,8 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name in ("send_chat", "set_budget", "pause_lab", "resume_lab"):
+        if name in ("send_chat", "set_budget", "pause_lab", "resume_lab",
+                    "annotate_decision"):
             if rate_limited():
                 return 429, _rpc_error(msg_id, -32000,
                                        "rate limited (30 mutations/min)")
@@ -659,6 +724,9 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
             if name == "set_budget":
                 return 200, _control_set_budget(msg_id, args, get_rt=get_rt,
                                                 run_on_worker=run_on_worker)
+            if name == "annotate_decision":
+                return 200, _annotate_decision(msg_id, args, get_rt=get_rt,
+                                               run_on_worker=run_on_worker)
             return 200, _control_pause(msg_id, name == "pause_lab",
                                        get_rt=get_rt,
                                        run_on_worker=run_on_worker)

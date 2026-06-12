@@ -25,12 +25,12 @@ data/        SQLite event log + memory store (created at first run)
 | `/feed.xml` | RSS 2.0, published posts only |
 | `/lab` | the open workshop: every branch (incl. proposed/decided/archived), every chat, every decision, filter row, deep links via `#branch=<id>` |
 | `/healthz` | backend, event count, pending decisions, paused, LLM calls/cost vs caps |
-| `POST /mcp` | MCP server, streamable HTTP (ADR-016) — read tools + `send_chat`, never decisions/pause/seams |
+| `POST /mcp` | MCP server, streamable HTTP (ADR-016/021/026) — read tools, `send_chat`, reversible controls (budget, pause/resume), decision annotations; never approve/reject or seam promotion |
 | `/.well-known/oauth-*`, `/register`, `/authorize`, `/token` | OAuth 2.1 + DCR for the MCP surface (ADR-017), stateless |
 
 ## MCP surface + claude.ai connector (ADR-016/017)
 
-`/mcp` accepts three equivalent credentials, all rooted in `LAB_MCP_TOKEN` (a separate secret from the operator token, revocable independently): an OAuth 2.1 bearer token, the legacy `Authorization: Bearer $LAB_MCP_TOKEN` header, or the legacy `/mcp/<LAB_MCP_TOKEN>` path token. Identical authority in all three — read tools plus `send_chat`; approving decisions, pause/resume, and seam promotion are excluded by design (the inbox is the one place only the human operator exists).
+`/mcp` accepts three equivalent credentials, all rooted in `LAB_MCP_TOKEN` (a separate secret from the operator token, revocable independently): an OAuth 2.1 bearer token, the legacy `Authorization: Bearer $LAB_MCP_TOKEN` header, or the legacy `/mcp/<LAB_MCP_TOKEN>` path token. Identical authority in all three — read tools, `send_chat`, the reversible operator controls (`set_budget`, `pause_lab`/`resume_lab` — ADR-021), and `annotate_decision` (public pre-review commentary on a pending decision — ADR-026); approving/rejecting decisions and seam promotion are excluded by design (the inbox is the one place only the human operator exists).
 
 The OAuth server is **stateless**: client ids, codes, and access/refresh tokens are HMAC-signed payloads keyed from `LAB_MCP_TOKEN`, verified by recomputation — nothing is stored, so rotating `LAB_MCP_TOKEN` revokes everything at once.
 

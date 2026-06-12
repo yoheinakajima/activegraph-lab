@@ -1,0 +1,34 @@
+description: |
+  Decision resolution carries rationale (ADR-026). The proposer's rationale
+  and the operator's resolution reason are separate fields: resolving with a
+  rationale lands metadata.resolution_rationale + resolved_by=operator on the
+  ONE resolution patch event, the rejected-decision registry stores and
+  exposes it (and survives a resume rebuild), and seam proposals cite the
+  operator's reasons, not just the proposer's pitch. Annotations
+  (annotate_decision, operator_via_mcp) attach to a PENDING decision only,
+  never change its status, surface in the inbox projection (full text — the
+  UI prefills the rationale field from the most recent one), and are linked
+  into the resolution's evidence when the operator resolves.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+proposer_rationale: "Draft ready: claims are cited, structure follows the contract."
+notes:
+  - "Pre-review: the throughput claim cites no evaluation object."
+  - "Recommend reject — ask for evt ids on every benchmark number."
+reject_rationale: "Rejecting: the throughput claim has no linked evidence; cite evt ids."
+approve_rationale: "Approving: scope is right and the evidence chain is complete."
+
+expected_outputs:
+  annotations_on_decision: 2
+  status_after_annotate: pending
+  resolved_by: operator
+  registry_carries_rationale: true
+  seam_pool_carries_rationale: true
+  survives_resume_rebuild: true

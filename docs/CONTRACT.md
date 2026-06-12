@@ -23,6 +23,7 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 - One bit per capability: `auto` or `gated`.
 - Publishing and self-modification are always gated. Self-modification additionally requires its enabling flag (`LAB_ALLOW_GRAPH_CODE=1` for graph code) — an approved decision alone is not enough (ADR-012).
+- Decision resolutions record the operator's reasons on the resolution event (`resolution_rationale`, `resolved_by` — ADR-026). MCP may annotate a pending decision (public, attributed commentary) but never resolve it: approve/reject remain EXCLUDED from MCP (ADR-016/021/026).
 
 ## Code residency (ADR-012)
 

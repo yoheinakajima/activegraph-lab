@@ -76,6 +76,15 @@ def build_bundle() -> dict:
             rt.run_until_idle()
         send_branch_message_fn(g, proposed[0].id, "what's the state here?")
         rt.run_until_idle()
+    # ADR-026: annotate one pending decision so the rendered inbox carries an
+    # annotation and the resolve form's prefill path is exercised.
+    from lab_pack.tools import annotate_decision_fn
+    pend = next((d for d in g.objects(type="decision")
+                 if d.data.get("status") == "pending"), None)
+    if pend is not None:
+        annotate_decision_fn(g, pend.id,
+                             "UI-check note: recommend approve — evidence chain complete.")
+        rt.run_until_idle()
     feed = _feed(rt)
 
     # Inspector fixtures: a branch, an observation, an artifact, and the
@@ -108,6 +117,11 @@ def static_fallback(bundle: dict) -> None:
         check(el in html, f"index.html declares {el}")
     check("/lab/feed" in js, "app.js polls /lab/feed")
     check("/lab/decision" in js, "app.js posts decisions to /lab/decision")
+    check("resolve-form" in js and "resolve-rationale" in js,
+          "app.js wires the optional resolution-rationale form (ADR-026)")
+    check("annotations" in js, "app.js renders decision annotations (ADR-026)")
+    check(all(isinstance(d.get("annotations"), list) for d in feed.get("inbox", [])),
+          "feed contract: inbox decisions expose annotations")
     check("/chat" in js, "app.js posts messages to /chat")
     check("/lab/entity" in js, "app.js fetches /lab/entity (the inspector)")
     check("/lab/log" in js, "app.js fetches /lab/log (the full event log)")

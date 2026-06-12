@@ -135,6 +135,13 @@ function decisionCard(d) {
   card.dataset.decisionId = d.id;
   const ev = (d.evidence || [])
     .map(x => `<li>${idLink(x.id)} ${linkifyIds(escapeHtml(x.text))}</li>`).join("");
+  /* ADR-026: pending annotations (annotate_decision over MCP) — public,
+     attributed pre-review notes. The most recent one prefills the rationale
+     field when the operator resolves. */
+  const notes = (d.annotations || [])
+    .map(a => `<li>${idLink(a.id)} note` +
+              (a.source === "operator_via_mcp" ? " (via MCP)" : "") +
+              `: ${linkifyIds(escapeHtml(a.text))}</li>`).join("");
   card.innerHTML =
     `<div class="kind"><span class="chip kind-${d.kind}">${d.kind}</span> awaiting approval` +
     ` · ${idLink(d.id)}</div>` +
@@ -144,15 +151,39 @@ function decisionCard(d) {
         (d.subject_title ? ` — ${escapeHtml(d.subject_title)}` : "") + `</div>`
       : "") +
     (ev ? `<ul class="evidence">${ev}</ul>` : "") +
+    (notes ? `<ul class="evidence annotations">${notes}</ul>` : "") +
     (isOperator()
       ? `<button class="approve">Approve</button><button class="reject">Reject</button>`
       : `<span class="observer-note">awaiting the operator</span>`) +
+    `<div class="resolve-form" hidden>` +
+      `<textarea class="resolve-rationale" rows="2"` +
+      ` placeholder="Why? Optional — recorded on the resolution event."></textarea>` +
+      `<button class="confirm"></button><button class="cancel">Cancel</button>` +
+    `</div>` +
     `<span class="decision-error"></span>`;
   if (isOperator()) {
-    card.querySelector(".approve").onclick = () => resolveDecision(card, d.id, true);
-    card.querySelector(".reject").onclick = () => resolveDecision(card, d.id, false);
+    card.querySelector(".approve").onclick = () => openResolveForm(card, d, true);
+    card.querySelector(".reject").onclick = () => openResolveForm(card, d, false);
   }
   return card;
+}
+
+/* ADR-026: approve/reject open an optional rationale field — skippable,
+   prefilled from the most recent annotation (editable before submitting). */
+function openResolveForm(card, d, approved) {
+  const form = card.querySelector(".resolve-form");
+  const field = card.querySelector(".resolve-rationale");
+  if (form.hidden) {
+    const notes = d.annotations || [];
+    field.value = notes.length ? notes[notes.length - 1].text : "";
+  }
+  form.hidden = false;
+  const confirm = card.querySelector(".confirm");
+  confirm.textContent = approved ? "Confirm approve" : "Confirm reject";
+  confirm.className = `confirm ${approved ? "approve" : "reject"}`;
+  confirm.onclick = () => resolveDecision(card, d.id, approved, field.value.trim());
+  card.querySelector(".cancel").onclick = () => { form.hidden = true; };
+  field.focus();
 }
 
 function escapeHtml(s) {
@@ -161,9 +192,11 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
-async function resolveDecision(card, id, approved) {
+async function resolveDecision(card, id, approved, rationale) {
   try {
-    const r = await mutate("/lab/decision", { decision_id: id, approved });
+    const body = { decision_id: id, approved };
+    if (rationale) body.rationale = rationale;
+    const r = await mutate("/lab/decision", body);
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       throw new Error(body.error || `server returned ${r.status}`);

@@ -223,10 +223,13 @@ def _rebuild_lab_registries(rt) -> None:
             lb._APPLIED_DECISIONS.add(d.id)
         if d.data.get("status") == "rejected":
             # Phase 4: rejected decisions are the seam-proposal evidence pool.
+            meta = d.data.get("metadata") or {}
             lb._REJECTED_DECISIONS.append({
                 "id": d.id, "kind": d.data.get("kind"),
                 "subject_ref": d.data.get("subject_ref"),
-                "seam_name": (d.data.get("metadata") or {}).get("seam_name")})
+                "seam_name": meta.get("seam_name"),
+                # ADR-026: the operator's resolution reason survives resume.
+                "resolution_rationale": meta.get("resolution_rationale")})
     # 5a: observation provenance — actor + timestamp from each object.created
     # event (replay rebuilds objects, not the in-process provenance registry).
     created_by: dict[str, tuple[str, str]] = {}
@@ -612,6 +615,7 @@ DEFAULT_TEMPLATES = {
     "research_finding": "Research finding: “{short_text}”",
     "seam_proposal_request": "{short_text}",
     "seam_proposal_failed": "{short_text}",
+    "decision_annotation": "Operator note (via MCP): “{short_text}”",
 }
 
 
@@ -722,6 +726,9 @@ def _narrate_patch(g, obj, diff: dict) -> Optional[str]:
     if obj.type == "branch" and status.get("new"):
         return f"Branch “{obj.data.get('title')}” moved to {status['new']}."
     if obj.type == "decision" and status.get("new") in ("approved", "rejected"):
+        rr = (obj.data.get("metadata") or {}).get("resolution_rationale")
+        if rr:  # ADR-026: the operator's reason narrates, not the pitch
+            return f"Decision {status['new']} — operator: {_shorten(rr, 100)}"
         return f"Decision {status['new']}: {_shorten(obj.data.get('rationale') or '', 100)}"
     if obj.type == "task" and status.get("new") in ("done", "rejected", "blocked"):
         word = {"done": "completed", "rejected": "failed", "blocked": "blocked"}[status["new"]]
@@ -1035,6 +1042,19 @@ def _pending_decisions(g) -> list[dict]:
                                      or o.data.get("rationale") or "", 200),
                 })
         subject = g.get_object(d.data.get("subject_ref"))
+        # ADR-026: pending annotations (annotate_decision), oldest first, text
+        # IN FULL — the UI prefills the rationale field from the most recent
+        # one, and a truncation here would corrupt the prefill (decision#195
+        # taught that lesson on the seam path).
+        annotations = []
+        for ref in (d.data.get("metadata") or {}).get("annotation_refs") or []:
+            o = g.get_object(ref)
+            if o is not None:
+                annotations.append({
+                    "id": str(o.id),
+                    "text": o.data.get("text") or "",
+                    "source": (o.data.get("metadata") or {}).get("source"),
+                })
         inbox.append({
             "id": str(d.id),
             "kind": d.data.get("kind"),
@@ -1044,6 +1064,7 @@ def _pending_decisions(g) -> list[dict]:
             "branch_id": _branch_of_object(g, "decision", d.data, d.id),
             "requested_at": (d.data.get("metadata") or {}).get("approval_requested_at"),
             "evidence": evidence,
+            "annotations": annotations,
         })
     return inbox
 
@@ -1069,6 +1090,9 @@ def _feed(rt, limit: int = 100) -> dict:
             "kind": d.data.get("kind"),
             "status": d.data.get("status"),
             "rationale": _shorten(d.data.get("rationale") or "", 200),
+            # ADR-026: the operator's reason, when one was recorded.
+            "resolution_rationale": _shorten(
+                (d.data.get("metadata") or {}).get("resolution_rationale") or "", 200),
             "subject_ref": d.data.get("subject_ref"),
             "subject_title": (subject.data.get("title") if subject is not None else None),
             "branch_id": _branch_of_object(g, "decision", d.data, d.id),
@@ -1950,8 +1974,11 @@ class Handler(BaseHTTPRequestHandler):
                 return ("error", 404, f"no such decision: {decision_id}")
             if d.data.get("status") != "pending":
                 return ("error", 409, f"decision is already {d.data.get('status')}")
+            # ADR-026: an optional operator rationale rides the resolution
+            # event (metadata.resolution_rationale, resolved_by=operator);
+            # absent means absent — no placeholder is recorded.
             approve_decision_fn(rt.graph, decision_id, approved,
-                                body.get("rationale") or "via /lab/decision")
+                                (body.get("rationale") or "").strip())
             rt.run_until_idle()
             _save(rt)
             d = rt.graph.get_object(decision_id)

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Decision resolution carries rationale (ADR-026): `POST /lab/decision`
+  takes an optional rationale; the ONE resolution patch event records
+  `metadata.resolution_rationale` + `resolved_by=operator` (the
+  proposer's rationale field stays untouched; no placeholder when
+  absent). The rejected-decision registry stores and exposes it —
+  surviving the resume rebuild — so seam proposals and draft-request
+  item contexts cite the OPERATOR's reasons, not just the proposer's
+  pitch; the feed narrates resolutions from the operator's reason.
+  Chat approve/reject resolves through the same path (the message is
+  the rationale). The UI's approve/reject buttons open an optional,
+  skippable rationale field. New MCP operator-tier tool
+  `annotate_decision(decision_id, note)`: a public,
+  operator_via_mcp-attributed annotation on a PENDING decision — the
+  handler can only create the observation and append its ref, no code
+  path touches status. On resolution, pending annotations link into
+  the decision's evidence and the UI prefills the rationale from the
+  most recent one. approve/reject remain EXCLUDED from MCP; annotation
+  is commentary, not authority. Backfill: nothing — append-only.
+  Locked by the decision_rationale fixture; covered in test_mcp,
+  the sentinel audit, and check_ui (two-step resolve form + prefill).
+
 - Truthful steering replies (ADR-025; the evt_3676 incident): steering
   mutations apply before the reply is composed, the reply reports
   POST-mutation state and cites the new `lab.steering_applied` marker

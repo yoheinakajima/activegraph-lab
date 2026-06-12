@@ -1019,6 +1019,133 @@ def run_operator_controls() -> bool:
     return c.done("operator_controls")
 
 
+def run_decision_rationale() -> bool:
+    spec = _load("decision_rationale.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: decision_rationale — resolution carries the operator's "
+          "reasons (ADR-026)")
+    print("=" * 64)
+
+    from lab_pack import behaviors as lb
+    from lab_pack.behaviors import _rejected_for_seam
+    from lab_pack.tools import annotate_decision_fn
+    from server.lab_server import (_build_entries, _pending_decisions,
+                                   _rebuild_lab_registries)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    branch = create_branch_fn(g, mission.id, "Evidence-base branch", "verify claims")
+    artifact = g.add_object("artifact", {
+        "kind": "blog_draft", "title": "A draft under review",
+        "content": "## body", "format": "markdown", "status": "draft",
+        "metadata": {"lab": "blog_draft", "lab_branch_id": branch.id},
+    })
+    publish = g.add_object("decision", {
+        "subject_ref": artifact.id, "kind": "publish", "status": "pending",
+        "rationale": spec["proposer_rationale"], "evidence_refs": [artifact.id],
+        "metadata": {"lab_branch_id": branch.id},
+    })
+    rt.run_until_idle()
+    c = Check()
+    exp = spec["expected_outputs"]
+
+    # ── annotate: commentary attaches, status never moves ───────────────────
+    for note in spec["notes"]:
+        annotate_decision_fn(g, publish.id, note)
+    rt.run_until_idle()
+    d = g.get_object(publish.id)
+    refs = (d.data.get("metadata") or {}).get("annotation_refs") or []
+    c.that(d.data.get("status") == exp["status_after_annotate"],
+           f"annotate cannot change status (got {d.data.get('status')})")
+    c.that(len(refs) == exp["annotations_on_decision"],
+           f"{exp['annotations_on_decision']} annotation refs on the decision "
+           f"({len(refs)})")
+    notes = [g.get_object(r) for r in refs]
+    c.that(all((n.data.get("metadata") or {}).get("lab") == "decision_annotation"
+               and (n.data.get("metadata") or {}).get("source") == "operator_via_mcp"
+               for n in notes),
+           "annotations are decision_annotation observations, operator_via_mcp")
+    inbox = [x for x in _pending_decisions(g) if x["id"] == publish.id]
+    c.that(bool(inbox) and [a["text"] for a in inbox[0]["annotations"]]
+           == spec["notes"],
+           "inbox projection exposes annotations IN FULL, oldest first "
+           "(the UI prefills from the most recent)")
+
+    # ── resolve with rationale: ONE patch event carries the reasons ─────────
+    approve_decision_fn(g, publish.id, False, spec["reject_rationale"])
+    rt.run_until_idle()
+    d = g.get_object(publish.id)
+    meta = d.data.get("metadata") or {}
+    c.that(d.data.get("status") == "rejected"
+           and meta.get("resolution_rationale") == spec["reject_rationale"]
+           and meta.get("resolved_by") == exp["resolved_by"],
+           "resolution lands resolution_rationale + resolved_by=operator on "
+           "the decision")
+    c.that(d.data.get("rationale") == spec["proposer_rationale"],
+           "the PROPOSER's rationale stays untouched")
+    c.that(all(r in (d.data.get("evidence_refs") or []) for r in refs),
+           "pending annotations are linked into the resolution's evidence")
+    resolution_events = [
+        e for e in g.events
+        if str(e.type) == "patch.applied"
+        and e.payload.get("target") == publish.id
+        and ((e.payload.get("diff") or {}).get("status") or {}).get("new")
+        == "rejected"]
+    c.that(len(resolution_events) == 1, "exactly one resolution event")
+    diff = resolution_events[0].payload.get("diff") or {}
+    new_meta = (diff.get("metadata") or {}).get("new") or {}
+    c.that(new_meta.get("resolution_rationale") == spec["reject_rationale"]
+           and new_meta.get("resolved_by") == exp["resolved_by"],
+           "the resolution EVENT records resolution_rationale + resolved_by")
+    entry = next(x for x in _build_entries(g)
+                 if x["event_id"] == str(resolution_events[0].id))
+    c.that("operator:" in entry["sentence"]
+           and spec["reject_rationale"][:40] in entry["sentence"],
+           f"the feed narrates the operator's reason ({entry['sentence']!r})")
+
+    # ── the registry learns reasons, not bits — and survives resume ─────────
+    entry = next(x for x in lb._REJECTED_DECISIONS if x["id"] == publish.id)
+    c.that(bool(exp["registry_carries_rationale"])
+           and entry.get("resolution_rationale") == spec["reject_rationale"],
+           "rejected-decision registry stores resolution_rationale")
+    pool = [x for x in _rejected_for_seam("prompt.draft_writer")
+            if x["id"] == publish.id]
+    c.that(bool(exp["seam_pool_carries_rationale"]) and pool
+           and pool[0].get("resolution_rationale") == spec["reject_rationale"],
+           "seam-proposal evidence pool exposes the operator's reason")
+    clear_lab_registry()
+    _rebuild_lab_registries(rt)
+    entry = next(x for x in lb._REJECTED_DECISIONS if x["id"] == publish.id)
+    c.that(bool(exp["survives_resume_rebuild"])
+           and entry.get("resolution_rationale") == spec["reject_rationale"],
+           "resolution_rationale survives the resume rebuild")
+
+    # ── annotate after resolve: refused; bare resolve: no placeholder ───────
+    try:
+        annotate_decision_fn(g, publish.id, "too late")
+        c.that(False, "annotating a resolved decision must raise")
+    except ValueError as exc:
+        c.that("already" in str(exc), f"refusal names the state ({exc})")
+    promote = g.add_object("decision", {
+        "subject_ref": branch.id, "kind": "promote", "status": "pending",
+        "rationale": "Promote: evidence threshold met.", "evidence_refs": [],
+        "metadata": {},
+    })
+    rt.run_until_idle()
+    approve_decision_fn(g, promote.id, True)  # skippable: no rationale sent
+    rt.run_until_idle()
+    pmeta = g.get_object(promote.id).data.get("metadata") or {}
+    c.that("resolution_rationale" not in pmeta
+           and pmeta.get("resolved_by") == "operator",
+           "a bare resolve records resolved_by but NO placeholder rationale")
+
+    print(f"  publish {publish.id}: {len(refs)} annotations → rejected with "
+          f"rationale on {resolution_events[0].id}; registry + seam pool + "
+          "resume all carry it")
+    return c.done("decision_rationale")
+
+
 def run_paused_boot() -> bool:
     spec = _load("paused_boot.yaml")
     print("\n" + "=" * 64)
@@ -2413,6 +2540,7 @@ def run_all() -> None:
         run_draft_writer(),
         run_editorial(),
         run_operator_controls(),
+        run_decision_rationale(),
         run_paused_boot(),
         run_seams(),
         run_charter(),
