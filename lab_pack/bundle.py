@@ -351,6 +351,29 @@ LIVE_FINDINGS: list[dict] = [
             "handling belongs next to the HTTP assembly in the provider."
         ),
     },
+    {
+        "key": "event_burst_budget_starvation",
+        "text": (
+            "Finding: the 2026-06-12 19:24–19:30 burst grew the log from "
+            "4,357 to 13,677 events in ~15 minutes, roughly 78% of it "
+            "no-op behavior bookkeeping — caused_by fan-out turned single "
+            "triggers into event cascades, and MCP reply timeouts arrived "
+            "as collateral (every projection walks the whole log). The "
+            "budget rails held: spend stayed capped. But they starved "
+            "silently — lab.plan went [lab-inert] on the per-behavior cap "
+            "with NO observation, because per-behavior exhaustion shared "
+            "the session-wide budget-recorded flag and any earlier budget "
+            "observation swallowed it, so a newly activated branch's "
+            "planning silently no-op'd. Fixed in this lab: per-behavior "
+            "exhaustion records one observation per behavior per run "
+            "episode plus a feed narration, mirroring the total-budget "
+            "path. Upstream-relevant: event-log growth under behavior "
+            "fan-out is a runtime-shaped cost every ActiveGraph "
+            "deployment will meet. Debounce/compaction design is "
+            "deliberately NOT decided here — it is reserved for the "
+            "lab's own investigation branch."
+        ),
+    },
 ]
 
 

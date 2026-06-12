@@ -352,6 +352,7 @@ _LLM_STATE: dict[str, Any] = {
     "operator_cost_cap": None,
     "paused": False,              # ADR-015; rebuilt from lab.paused/resumed
     "pause_skipped": set(),       # behaviors skipped THIS pause episode
+    "behavior_capped": set(),     # per-behavior exhaustion queued THIS run episode
     "last_model": None,
 }
 
@@ -445,7 +446,8 @@ def reset_llm_session() -> None:
                       daily_recorded=False, daily_cost=Decimal("0"),
                       daily_cost_recorded=False, cost_cap_override=None,
                       operator_cost_cap=None,
-                      paused=False, pause_skipped=set(), last_model=None)
+                      paused=False, pause_skipped=set(),
+                      behavior_capped=set(), last_model=None)
 
 
 def _operator_cap_now() -> Optional[float]:
@@ -498,8 +500,11 @@ def set_operator_budget(rt, amount_usd: float, *, today_only: bool,
 
 def reset_llm_run_counters() -> None:
     """Reset the per-behavior-run counters. Call once per run cycle (the
-    server and the overnight runner do this before each run_until_idle)."""
+    server and the overnight runner do this before each run_until_idle).
+    A new run cycle is a new exhaustion episode: a behavior capped last
+    cycle may record again if it exhausts this one."""
     _LLM_STATE["by_behavior"] = {}
+    _LLM_STATE["behavior_capped"] = set()
 
 
 def llm_usage() -> dict[str, Any]:
@@ -536,6 +541,16 @@ def consume_llm_anomalies(graph) -> list[str]:
                     + ("idle until the UTC day resets." if (daily or daily_cost)
                        else "queued work resumes next session."))
             lab_kind = "llm_budget"
+        elif a["kind"] == "behavior_budget":
+            # Per-behavior exhaustion mirrors the total-budget observation
+            # but keys by behavior (queue-side dedup, one per behavior per
+            # run episode): the cap silences ONE behavior for the rest of
+            # the run, not the lab, and the log must say so.
+            text = (f"LLM per-behavior budget exhausted: {a['detail']}. "
+                    "This behavior returns inert outputs for the rest of the "
+                    "current run cycle and fires normally on the next; other "
+                    "behaviors are unaffected.")
+            lab_kind = "llm_behavior_budget"
         elif a["kind"] == "call":
             # Provider/API/network failure: the call itself failed and no
             # model output exists. Distinct from parse — the Opus 400 was
@@ -763,10 +778,20 @@ class LabProviderWrapper:
             return _canned("llm budget exhausted (session cap)")
         used = _LLM_STATE["by_behavior"].get(behavior or "?", 0)
         if used >= self._max_per_behavior:
-            _LLM_STATE["anomalies"].append({
-                "kind": "budget", "behavior": behavior,
-                "detail": f"per-run cap {self._max_per_behavior} reached for "
-                          f"{behavior or 'unidentified behavior'}", "raw": None})
+            # Queued once per behavior per run episode (queue-side dedup,
+            # like the pause path). This anomaly used to share the
+            # session-wide budget_recorded flag, so any earlier budget
+            # observation swallowed it — during the 2026-06-12 burst a
+            # newly activated branch's planning went [lab-inert] with no
+            # observation at all.
+            key = behavior or "?"
+            if key not in _LLM_STATE["behavior_capped"]:
+                _LLM_STATE["behavior_capped"].add(key)
+                _LLM_STATE["anomalies"].append({
+                    "kind": "behavior_budget", "behavior": behavior,
+                    "detail": f"per-run cap {self._max_per_behavior} reached for "
+                              f"{behavior or 'unidentified behavior'}",
+                    "raw": None})
             return _canned("llm budget exhausted (per-behavior cap)")
 
         _LLM_STATE["total"] += 1

@@ -599,6 +599,7 @@ DEFAULT_TEMPLATES = {
     "fetch_failure":    "Couldn't fetch {url} (status {status}) — recorded as evidence.",
     "stall":            "{short_text}",
     "llm_budget":       "LLM budget exhausted — stopping model calls cleanly. {short_text}",
+    "llm_behavior_budget": "Per-behavior LLM cap hit for {behavior} — it goes inert for the rest of this run cycle; other behaviors keep working.",
     "llm_parse_failure": "Model output didn't parse in {behavior} — salvaged what I could, raw output kept.",
     "llm_call_failure": "Model call failed in {behavior} — no output produced; it fires again on its next trigger.",
     "finding":          "Logged a finding: \u201c{short_text}\u201d",

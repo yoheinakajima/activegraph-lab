@@ -1,0 +1,23 @@
+description: |
+  Budget starvation visibility (ADR-019 follow-up; the 2026-06-12 burst):
+  per-behavior budget exhaustion is observable. A capped behavior returns
+  inert outputs for the rest of the run episode and records ONE
+  llm_behavior_budget observation per behavior per episode (never one per
+  trigger), narrated on the feed — independent of the session-wide
+  budget_recorded flag, which previously swallowed it (lab.plan went
+  [lab-inert] with no observation while a newly activated branch waited
+  on it). A new run episode (counters reset) may record again.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+per_behavior_cap: 2
+
+expected_outputs:
+  episode_observations: 1          # one observation for two capped triggers
+  second_episode_observations: 2   # a new run episode may record again
