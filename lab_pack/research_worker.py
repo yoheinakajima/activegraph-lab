@@ -111,7 +111,8 @@ def _source_urls(graph, task_data: dict, cap: int) -> list[str]:
     operator named them deliberately, so the fetch cap must not starve them
     behind the defaults."""
     meta = task_data.get("metadata") or {}
-    texts = [task_data.get("description") or ""]
+    texts = [task_data.get("description") or "",
+             meta.get("activation_message") or ""]
     direction = (meta.get("operator_direction") or "").strip()
     candidates: list[str] = _URL_RE.findall(direction) if direction else []
     branch = graph.get_object(meta.get("lab_branch_id")) \

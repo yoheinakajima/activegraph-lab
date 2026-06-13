@@ -683,10 +683,14 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
     }
     # ADR-027: a branch carrying operator direction (a rejected promote's
     # resolution_rationale) dispatches it VERBATIM — the worker must be able
-    # to read what the operator ordered.
+    # to read what the operator ordered. The latest activation message rides
+    # too: URLs in it steer the worker's sources.
     directions = _OPERATOR_DIRECTIONS.get(branch_id) or []
     if directions:
         meta["operator_direction"] = directions[-1]
+    activation_msg = (branch_data.get("metadata") or {}).get("activation_message")
+    if activation_msg:
+        meta["activation_message"] = activation_msg
     task = graph.add_object("task", {
         "title": (branch_data.get("title") or "Lab task")[:120],
         "description": intent,
@@ -2131,8 +2135,17 @@ def _apply_steering(graph, branch_id: str, content: str,
         # dedup registry resets for this branch (the recrawl move — the
         # registry is a cache, the log is append-only) so work dispatches a
         # NEW task, which carries any operator_direction on the branch.
+        # The activation message rides on the branch metadata too: URLs the
+        # operator mentions at activation steer the worker's sources (the
+        # existing steering principle, extended to this verb — decision#266's
+        # direction named its sources without schemes, so the resurrection
+        # message must be able to supply fetchable ones).
         _DISPATCHED.discard(branch_id)
-        graph.patch_object(branch_id, {"status": "active"})
+        graph.patch_object(branch_id, {
+            "status": "active",
+            "metadata": {**(branch.data.get("metadata") or {}),
+                         "activation_message": content},
+        })
         summary = (("branch resurrected from archived (status=active); "
                     "dispatch reacts next") if resurrected else
                    f"branch activated from {status} (status=active); "

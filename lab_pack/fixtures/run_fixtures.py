@@ -2315,12 +2315,26 @@ def run_rejection_lifecycle() -> bool:
            "non-activate verbs on an archived branch are refused by name")
     _, res = send_branch_message_fn(
         g, legacy.id, "Activate this branch. Rationale: resurrecting the "
-        "fork inquiry deliberately.", source="operator_via_mcp")
+        "fork inquiry deliberately. Fetch https://example.com/docs as well.",
+        source="operator_via_mcp")
     rt.run_until_idle()
     c.that(g.get_object(legacy.id).data.get("status") in
            ("active", "interpreting"),
            f"archived → active resurrection works "
            f"({g.get_object(legacy.id).data.get('status')})")
+    # URLs in the activation message steer the worker's sources — the
+    # mechanism the branch#62 resurrection needs (decision#266's direction
+    # named its sources without schemes).
+    legacy_task = next((t for t in g.objects(type="task")
+                        if (t.data.get("metadata") or {}).get("lab_branch_id")
+                        == legacy.id), None)
+    legacy_calls = [(x.data.get("input_data") or {}).get("url", "")
+                    for x in g.objects(type="capability_call")
+                    if (x.data.get("metadata") or {}).get("task_id")
+                    == (legacy_task.id if legacy_task else None)]
+    c.that(any(u.rstrip("/") == "https://example.com/docs"
+               for u in legacy_calls),
+           f"the activation message's URL was fetched ({legacy_calls})")
     acts = [o for o in _lab_obs(g, "branch_activated")
             if (o.data.get("metadata") or {}).get("lab_branch_id") == legacy.id]
     c.that(len(acts) == 1

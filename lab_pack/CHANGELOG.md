@@ -13,7 +13,11 @@
   latest direction VERBATIM (`task.metadata.operator_direction`); the
   research worker fetches direction-named URLs first and its synthesis
   request carries the direction whole — metadata + a delimited OPERATOR
-  DIRECTION block in the text the model reads (mock-asserted). Archived
+  DIRECTION block in the text the model reads (mock-asserted). URLs in
+  the activation message itself steer the worker's sources too
+  (decision#266's direction named its sources without schemes). Legacy
+  rejections (rationale on the decision, no observation) rebuild into
+  the directions registry on resume — no backfill events. Archived
   branches accept exactly one steering verb (activate); everything else
   draws a refusal naming it, and questions get an honest archived
   notice. Locked by the rejection_lifecycle fixture; branch_lifecycle's
