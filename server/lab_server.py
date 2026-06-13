@@ -1438,7 +1438,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_unavailable(self):
         """ADR-024: the socket is bound but the runtime is still booting (or
-        boot failed) — everything except /healthz gets 503 + Retry-After."""
+        boot failed) — everything except /healthz (and the front door, below)
+        gets 503 + Retry-After."""
         body = json.dumps({"error": "the lab is starting",
                            "ready": False,
                            "phase": _BOOT_PHASE["phase"]}).encode()
@@ -1448,6 +1449,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_starting_page(self):
+        """ADR-030: while not-ready, the front door (GET /) returns 200 with a
+        minimal 'starting up' page instead of 503. The platform healthcheck
+        probes / and was logging ~24 failures per boot against an honest-but-
+        red 503; a 200 with a self-refresh stops the noise without lying —
+        /healthz still reports the true phase, and every OTHER not-ready route
+        keeps its 503 + Retry-After."""
+        phase = _BOOT_PHASE["phase"]
+        page = (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<meta http-equiv=\"refresh\" content=\"5\">"
+            "<title>activegraph-lab — starting</title></head>"
+            "<body style=\"font-family:system-ui,sans-serif;max-width:32rem;"
+            "margin:4rem auto;padding:0 1rem;color:#333\">"
+            "<h1>The lab is starting up.</h1>"
+            f"<p>Replaying the event log (phase: <code>{phase}</code>). "
+            "This page refreshes every few seconds.</p>"
+            "<p>Live status: <a href=\"/healthz\">/healthz</a>.</p>"
+            "</body></html>").encode()
+        self.send_response(200)
+        self.send_header("Retry-After", "5")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(page)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -1462,6 +1491,12 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_errors()
             return
         if not _ready():
+            # ADR-030: the front door answers 200 with a minimal starting
+            # page so the platform healthcheck's probe of / stops logging
+            # failures; every other route keeps the honest 503 + Retry-After.
+            if path == "/":
+                self._send_starting_page()
+                return
             self._send_unavailable()
             return
         try:

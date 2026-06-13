@@ -1454,6 +1454,62 @@ def _slugify(text: str) -> str:
 
 _FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
 
+# ADR-029: the provenance footer records the ACTUAL per-behavior model used,
+# not one flattened constant. The pipeline is per-role (draft_writer/plan on
+# the deliberate plane, answer/default on the fast plane — ADR-019); a single
+# "model X" footer rounded that routing up to one name. These are the LLM
+# behaviors whose output can become an artifact's evidence.
+_LLM_BEHAVIOR_NAMES = frozenset((
+    "draft_writer", "interpret", "plan", "research_worker", "answer",
+    "seam_writer"))
+
+
+_ENTITY_ID_RE = re.compile(
+    r"\b(?:observation|evaluation|task|branch|decision|artifact|source)#\d+")
+
+
+def _footnoted_entity_ids(body: str) -> list[str]:
+    """The entity ids the BODY actually footnotes — read from footnote
+    DEFINITION lines (`[^id]: …observation#42…`), in first-seen order. Phase 5
+    (ADR-029): under an operator brief the decision's evidence_refs and the
+    provenance block derive from these, not the queued-findings pile."""
+    ids: list[str] = []
+    for line in re.findall(r"(?m)^\[\^[^\]]+\]:\s*(.+)$", body or ""):
+        for m in _ENTITY_ID_RE.findall(line):
+            if m not in ids:
+                ids.append(m)
+    return ids
+
+
+def _actor_behavior(actor: Optional[str]) -> Optional[str]:
+    """Map an event actor ('lab.research_worker') to its behavior name, or
+    None if the creator was not an LLM behavior (system, ingest, digest…)."""
+    name = (actor or "").rsplit(".", 1)[-1]
+    return name if name in _LLM_BEHAVIOR_NAMES else None
+
+
+def _provenance_model_footer(meta: dict) -> str:
+    """The per-behavior model split for the footer: draft_writer always, plus
+    every LLM behavior that produced the cited evidence — each resolved to the
+    model actually recorded for it on its llm.responded events (via the
+    session's model_by_behavior cache, which carries the same value). Falls
+    back to last_model for any behavior with no recorded call (e.g. fixtures
+    on the raw mock)."""
+    usage = llm_usage()
+    model_map = usage.get("model_by_behavior") or {}
+    fallback = usage.get("last_model") or "mock"
+    contributors = ["draft_writer"]
+    for ctx in (meta.get("findings_context") or []):
+        name = _actor_behavior(ctx.get("created_by"))
+        if name and name not in contributors:
+            contributors.append(name)
+    pairs = []
+    for name in contributors:
+        model = model_map.get(name) or (fallback if name == "draft_writer" else None)
+        if model:
+            pairs.append(f"{name}={model}")
+    return ", ".join(pairs) if pairs else fallback
+
 # 5b: first-person process claims — "I was reading…", "during my review…",
 # "I examined…" — are narrative about HOW the lab worked. Without an evidence
 # ref to a matching event they are invention: the lab's findings were often
@@ -1467,15 +1523,41 @@ _PROCESS_CLAIM_RE = re.compile(
     re.I)
 
 
+# Phase 4 (ADR-029): a "specific factual claim" — a digit, a percentage, a
+# comparative/quantitative term, a code identifier (snake_case / camelCase),
+# an object-id reference, or a URL. A FIRST paragraph carrying none of these
+# is framing/intro and is exempt from the coverage flag, so a FIRED check
+# means a real unfootnoted SUBSTANTIVE claim rather than boilerplate the
+# escape hatch was overriding in 100% of posts.
+_FACTUAL_CLAIM_RE = re.compile(
+    r"\d|%"
+    r"|\b(?:more|less|fewer|faster|slower|larger|smaller|higher|lower|"
+    r"increased?|decreased?|reduced?|doubled|halved|outperforms?|than|"
+    r"percent|times|fold|exactly)\b"
+    r"|\b\w+_\w+\b"             # snake_case identifier
+    r"|[A-Za-z0-9_]+#\d+"       # object id reference (observation#42)
+    r"|https?://", re.I)
+_CAMELCASE_RE = re.compile(r"\b[A-Za-z]*[a-z][A-Z][A-Za-z]*\b")  # interior cap
+
+
+def _makes_factual_claim(para: str) -> bool:
+    return bool(_FACTUAL_CLAIM_RE.search(para)
+                or _CAMELCASE_RE.search(para))
+
+
 def _coverage_review(body: str) -> Optional[str]:
     """Claims-coverage check (draft contract): any substantive paragraph with
     zero evidence refs gets flagged in a review note — never silently
-    accepted. Extension (5b): first-person process claims without a footnote
-    are flagged separately as possible invented narrative. Orphan guard:
-    footnotes DEFINED but never cited are dead provenance (artifact#718
-    shipped an unused [^1]) — flagged like paragraph coverage."""
+    accepted. Phase 4 (ADR-029): a pure framing/intro OPENING paragraph (the
+    first substantive paragraph, if it makes no specific factual claim) is
+    exempt — the check fired on paragraph 1 in 100% of posts and was routinely
+    overridden, training the guardrail into noise. Extension (5b): first-person
+    process claims without a footnote are flagged separately as possible
+    invented narrative. Orphan guard: footnotes DEFINED but never cited are
+    dead provenance (artifact#718 shipped an unused [^1])."""
     flagged = []
     process_flagged = []
+    seen_body = False
     for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
         if not para or para.startswith("#") or para.startswith("[^"):
             continue
@@ -1484,7 +1566,13 @@ def _coverage_review(body: str) -> Optional[str]:
             process_flagged.append(i + 1)
         if len(para) < 80:
             continue  # headings, transitions — not claims
+        is_first_body = not seen_body
+        seen_body = True
         if not has_footnote:
+            # The opening framing paragraph gets one exemption — but only if it
+            # makes no specific factual claim. A substantive opener still flags.
+            if is_first_body and not _makes_factual_claim(para):
+                continue
             flagged.append(i + 1)
     # Defined-but-uncited footnotes: a definition line ([^id]: …) whose id is
     # cited nowhere in the prose. The definition's own marker is followed by
@@ -1570,6 +1658,14 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     for f in finding_ids:
         if f not in evidence:
             evidence.append(f)
+    # Phase 5 (ADR-029): under an operator brief, what the body footnotes is
+    # the truth of what the post rests on — the queued-findings pile in the
+    # request metadata may name unrelated digest findings (artifact#868/#882
+    # listed digest findings while the body cited the loop/verify entities).
+    if meta.get("operator_brief"):
+        footnoted = _footnoted_entity_ids(body)
+        if footnoted:
+            evidence = footnoted
     if not evidence:
         evidence.append(obs_id)
 
@@ -1598,14 +1694,14 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
         mission_meta = mission.data.get("metadata") or {}
 
     crawl_mode = mission_meta.get("crawl_mode", "live")
-    model = llm_usage().get("last_model") or "mock"
+    model_footer = _provenance_model_footer(meta)
     provenance = (
         "\n\n---\n"
         "*Provenance:* "
         f"branch `{branch_id or 'mission-level'}` · "
         f"evidence {', '.join(f'`{e}`' for e in evidence)} · "
         f"as of event `{event.id}` · "
-        f"model `{model}` · "
+        f"model `{model_footer}` · "
         f"crawl `{crawl_mode}`"
         + ("\n\n*Note: this run crawled a synthetic snapshot, not the live "
            "site — treat site claims accordingly.*" if crawl_mode == "synthetic" else "")
@@ -1770,11 +1866,15 @@ _STEER_PROPOSE = ("propose",)
 _STEER_ACTIVATE = ("activate",)
 _STEER_DEACTIVATE = ("deactivate",)
 _STEER_RECRAWL = ("recrawl", "re-crawl")
+# ADR-028: commentary, not control — records the operator's message as a
+# branch observation. The one steering verb that claims nothing and changes
+# nothing; MCP-allowed (it is not authority over the branch).
+_STEER_NOTE = ("note", "comment")
 
 # The verb set a refusal names (ADR-025). Order = documentation order.
 SUPPORTED_STEERING_VERBS = (
     "pause", "resume", "activate", "deactivate", "draft", "approve",
-    "reject", "recrawl", "propose <seam>")
+    "reject", "recrawl", "note", "propose <seam>")
 
 # Action-shaped requests no steering verb supports. When one of these appears
 # and no supported verb matched, the reply is an explicit refusal naming the
@@ -2043,10 +2143,12 @@ def _apply_steering(graph, branch_id: str, content: str,
     status = branch.data.get("status")
 
     # ADR-027: an archived branch is chat-able for ONE steering verb —
-    # activate (deliberate operator resurrection, handled below). Every other
-    # verb or action request draws an honest refusal naming it; plain
-    # questions fall through to answer, which states the archived status.
-    if status == "archived" and not _has_verb(low, _STEER_ACTIVATE):
+    # activate (deliberate operator resurrection, handled below). ADR-028
+    # adds `note`: commentary changes nothing, so it is safe in any state.
+    # Every other verb or action request draws an honest refusal naming it;
+    # plain questions fall through to answer, which states the archived status.
+    if status == "archived" and not _has_verb(low, _STEER_ACTIVATE) \
+            and not _has_verb(low, _STEER_NOTE):
         other_verbs = (_STEER_PAUSE + _STEER_RESUME + _STEER_DEACTIVATE
                        + _STEER_RECRAWL + _STEER_DRAFT + _STEER_APPROVE
                        + _STEER_REJECT + _STEER_PROPOSE)
@@ -2214,6 +2316,26 @@ def _apply_steering(graph, branch_id: str, content: str,
     if _has_verb(low, _STEER_REJECT):
         return _resolve_decision_verb(graph, branch_id, msg_id, "reject",
                                       source)
+    if _has_verb(low, _STEER_NOTE):
+        # ADR-028: operator commentary — record the FULL message as a branch
+        # observation (kind=operator_note), confirm with the recorded event
+        # id, claim nothing else. Checked AFTER every command verb so a real
+        # command ("pause this branch") still wins; this is the fallback for
+        # commentary that is not a command (the evt_17441 erratum, refused
+        # because no verb matched). Status is never touched. MCP-allowed.
+        obs = graph.add_object("observation", {
+            "text": content,
+            "confidence": 1.0,
+            "category": "fact",
+            "metadata": {"lab": "operator_note", "kind": "operator_note",
+                         "lab_branch_id": branch_id, "message_id": msg_id,
+                         "source": source or "operator"},
+        })
+        graph.add_relation(branch_id, obs.id, "supported_by")
+        summary = f"operator note recorded as observation {obs.id}"
+        event_id = _steering_event(graph, "note", branch_id, msg_id, summary,
+                                   source, refs={"note_observation": obs.id})
+        return _applied("note", summary, event_id)
     return None
 
 

@@ -19,7 +19,18 @@ branch:
     https://github.com/yoheinakajima/activegraph-lab/blob/main/README.md
     as a primary source.
 
+# Phase 1 (ADR-022/020): a task directed at a bare repo URL — the lab's own
+# proposed "fetch the actual implementation files" branch. The worker fetches
+# the (recursive) tree and then the CONTENTS of relevant files, capped.
+repo_branch:
+  title: Fetch the actual implementation files from the activegraph repo
+  intent: >
+    Fetch the actual replay and kernel implementation files from
+    https://github.com/yoheinakajima/activegraph to verify the replay claim.
+
 expected_outputs:
   allowed_repo: yoheinakajima/activegraph-lab
   refused_repo: somebody-else/private-stuff
   file_text: "# canned README: replay, fork, and diff any run."
+  repo: yoheinakajima/activegraph
+  repo_fetch_cap: 4   # 1 tree + up to 3 file fetches

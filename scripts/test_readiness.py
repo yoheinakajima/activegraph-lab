@@ -52,6 +52,15 @@ def get(base: str, path: str):
             return e.code, dict(e.headers), {}
 
 
+def get_raw(base: str, path: str):
+    """Returns (status, headers, text) without assuming JSON."""
+    try:
+        with urllib.request.urlopen(base + path, timeout=10) as r:
+            return r.status, dict(r.headers), (r.read() or b"").decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), (e.read() or b"").decode("utf-8", "replace")
+
+
 def post(base: str, path: str, body: dict):
     req = urllib.request.Request(base + path, method="POST",
                                  data=json.dumps(body).encode())
@@ -132,6 +141,18 @@ def main() -> int:
         s, _, errs = get(base, "/lab/errors")
         check(s == 200 and "errors" in errs,
               "/lab/errors stays readable during boot (diagnostics never gated)")
+
+        # ADR-030: the front door returns 200 (a minimal starting page) while
+        # not-ready, so the platform healthcheck's probe of / stops logging
+        # boot failures; other not-ready routes keep their 503.
+        s, h, text = get_raw(base, "/")
+        check(s == 200 and "text/html" in h.get("Content-Type", "")
+              and "starting" in text.lower(),
+              f"GET / returns 200 + starting page while booting ({s})")
+        check("draining" in text,
+              "the starting page names the true boot phase")
+        s2, _, _ = get_raw(base, "/posts/anything")
+        check(s2 == 503, f"other not-ready routes still 503 ({s2})")
 
         drain_release.set()
         lab_server._worker.ready.wait(60)
