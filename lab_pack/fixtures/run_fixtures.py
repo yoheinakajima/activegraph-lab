@@ -464,6 +464,31 @@ def run_truthful_steering() -> bool:
                and g.get_object(d3.id).data.get("status") == "pending",
                f"MCP {verb} refused — the inbox stays human-only")
     print("  Phase 3: no-op / apply+publish / ambiguous list / MCP refusal")
+
+    # ── Phase 4 (ADR-028): note/comment records commentary, claims nothing,
+    # changes nothing — and works over MCP (it is not authority) ────────────
+    status_before = b_status()
+    n_steer = len(steering_events())
+    reply = chat("note: the earlier replay finding cited the wrong event id; "
+                 "the correct one is evt_17440.", source="operator_via_mcp")
+    ev = cited_event(reply)
+    notes = [o for o in _lab_obs(g, "operator_note")
+             if (o.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+    c.that(len(notes) == 1
+           and "evt_17440" in (notes[0].data.get("text") or "")
+           and (notes[0].data.get("metadata") or {}).get("kind") == "operator_note",
+           "note records the full operator message as an operator_note observation")
+    c.that(ev is not None and ev.payload.get("verb") == "note"
+           and ev.payload.get("source") == "operator_via_mcp"
+           and "Applied: operator note recorded" in reply,
+           "note confirms with the recorded event id, over MCP")
+    c.that(b_status() == status_before and len(steering_events()) == n_steer + 1,
+           "note does not change branch status")
+    # A real command still wins over a trailing 'note' word.
+    reply = chat("pause this branch — just a note to self")
+    c.that(b_status() == "paused" and "Applied: branch paused" in reply,
+           "a command with the word 'note' still applies the command")
+    print("  Phase 4: operator note over MCP, status untouched; command still wins")
     return c.done("truthful_steering")
 
 
@@ -826,6 +851,32 @@ def run_draft_writer() -> bool:
                for a in drafts),
            "generated drafts cite every footnote they define")
     print("  orphan guard: [^2] flagged, [^1] clean")
+
+    # ── Phase 4 (ADR-029): framing intros are exempt; substantive claims flag ─
+    framing_clean = _coverage_review(
+        "## Intro\n\n"
+        "This note steps back to ask what the lab has actually learned about "
+        "itself this week, and whether the open-workshop framing still earns "
+        "its keep as the thread count grows.\n\n"
+        "The runtime recorded the outcome and linked it below.[^1]\n\n"
+        "[^1]: observation#1\n")
+    c.that(not framing_clean or "claims coverage" not in framing_clean,
+           f"pure framing intro + cited body passes clean ({framing_clean!r})")
+    substantive = _coverage_review(
+        "## Intro\n\n"
+        "The runtime replayed 1,847 events in under two seconds, materially "
+        "faster than the previous build, and that is the headline result.\n\n"
+        "[^1]: observation#1\n")
+    c.that(bool(substantive) and "claims coverage" in substantive,
+           "an unfootnoted substantive opener still flags")
+    named = _coverage_review(
+        "## Intro\n\n"
+        "The PostgresEventStore holds a single boot-lifetime connection that "
+        "serverless Postgres suspends, which is a real and specific failure "
+        "mode worth documenting up front.\n\n[^1]: observation#1\n")
+    c.that(bool(named) and "claims coverage" in named,
+           "a named-component opener (camelCase) is substantive, not framing")
+    print("  Phase 4: framing exempt; numeric + named openers flag")
     return c.done("draft_writer")
 
 
@@ -996,6 +1047,24 @@ def run_editorial() -> bool:
            f"the draft's footnotes are the evidence the brief names ({named})")
     c.that(unnamed and all(f"]: {e}" not in briefed_body for e in unnamed),
            "unnamed branch evidence stays available, not footnoted by default")
+    # ── Phase 5 (ADR-029): the decision's evidence_refs and the provenance
+    # block derive from what the body FOOTNOTES (named), not the queued pile
+    # (artifact#868/#882 listed digest findings the body never cited) ────────
+    briefed_artifact = drafts()[-1]
+    brief_decision = next((d for d in g.objects(type="decision")
+                           if d.data.get("kind") == "publish"
+                           and d.data.get("subject_ref") == briefed_artifact.id),
+                          None)
+    c.that(brief_decision is not None
+           and set(brief_decision.data.get("evidence_refs") or []) == set(named),
+           f"brief-governed decision.evidence_refs match the footnoted ids "
+           f"({brief_decision.data.get('evidence_refs') if brief_decision else None}"
+           f" vs {named})")
+    c.that(set(briefed_artifact.data.get("observation_ids") or []) == set(named),
+           "the artifact's observation_ids match the footnoted evidence too")
+    c.that(all(f"`{e}`" in briefed_body for e in named)
+           and all(f"`{u}`" not in briefed_body for u in unnamed),
+           "the provenance block lists the footnoted ids, not the queued pile")
     digest_meta = requests()[0].data.get("metadata") or {}
     c.that("operator_brief" not in digest_meta
            and "OPERATOR BRIEF" not in (requests()[0].data.get("text") or ""),
@@ -1610,14 +1679,30 @@ def run_github_read() -> bool:
     allowed = exp["allowed_repo"]
     file_text = exp["file_text"]
 
+    # A recursive tree with nested implementation files plus dirs/vendored
+    # paths the selector must skip. get_file content is canned per path.
+    repo_tree = [
+        {"path": "README.md", "type": "blob", "size": 52},
+        {"path": "lab_pack", "type": "tree"},
+        {"path": "lab_pack/kernel.py", "type": "blob", "size": 1800},
+        {"path": "lab_pack/replay.py", "type": "blob", "size": 2400},
+        {"path": "lab_pack/research_worker.py", "type": "blob", "size": 3100},
+        {"path": "server/lab_server.py", "type": "blob", "size": 5000},
+        {"path": "docs/ARCHITECTURE.md", "type": "blob", "size": 900},
+        {"path": "node_modules/dep/index.js", "type": "blob", "size": 200},
+        {"path": "tests/test_replay.py", "type": "blob", "size": 400},
+    ]
+
     def transport(url):
         if "/git/trees/" in url:
-            return 200, {"truncated": False, "tree": [
-                {"path": "README.md", "type": "blob", "size": 52},
-                {"path": "lab_pack", "type": "tree"}]}
+            return 200, {"truncated": False, "tree": repo_tree}
         if "/contents/" in url:
+            path = url.split("/contents/", 1)[1].split("?", 1)[0]
+            text = (file_text if path == "README.md"
+                    else f"# {path}: canned implementation source — replay is "
+                         f"deterministic from the event log.")
             return 200, {"type": "file", "encoding": "base64",
-                         "content": base64.b64encode(file_text.encode()).decode()}
+                         "content": base64.b64encode(text.encode()).decode()}
         if "/commits" in url:
             return 200, [{"sha": "abc1234def0", "commit": {"author": {
                 "name": "yohei", "date": "2026-06-11T00:00:00Z"},
@@ -1707,6 +1792,50 @@ def run_github_read() -> bool:
             for o in findings),
             f"findings attribute the github source ({len(findings)})")
         print("  research worker: github URL → gateway call → attributed findings")
+
+        # ── Phase 1 (ADR-022/020): a task directed at a BARE repo fetches the
+        # recursive tree AND the CONTENTS of relevant files (branch#62 fetched
+        # only the tree). The fetch cap binds across tree + file fetches. ─────
+        repo = exp["repo"]
+        rbspec = spec["repo_branch"]
+        rbranch = create_branch_fn(g, mission.id, rbspec["title"],
+                                   rbspec["intent"].strip(), status="active")
+        rt.run_until_idle()
+        rtask = next((t for t in g.objects(type="task")
+                      if (t.data.get("metadata") or {}).get("lab_branch_id")
+                      == rbranch.id), None)
+        c.that(rtask is not None and rtask.data.get("status") == "done",
+               f"bare-repo research task completed "
+               f"({rtask.data.get('status') if rtask else 'no task'})")
+        repo_calls = [x for x in g.objects(type="capability_call")
+                      if (x.data.get("metadata") or {}).get("task_id")
+                      == (rtask.id if rtask else None)]
+        tree_calls = [x for x in repo_calls
+                      if x.data.get("capability_name") == "get_tree"]
+        file_calls = [x for x in repo_calls
+                      if x.data.get("capability_name") == "get_file"]
+        c.that(len(tree_calls) == 1 and len(file_calls) >= 1,
+               f"the tree was fetched AND file contents were too "
+               f"(tree={len(tree_calls)}, files={len(file_calls)})")
+        c.that(len(repo_calls) == exp["repo_fetch_cap"],
+               f"the fetch cap binds across tree + files "
+               f"({len(repo_calls)} == {exp['repo_fetch_cap']})")
+        # The vendored / test paths are never selected (the skip rule).
+        fetched_paths = [(x.data.get("input_data") or {}).get("path")
+                         for x in file_calls]
+        c.that(not any("node_modules" in (p or "") or (p or "").startswith("tests/")
+                       for p in fetched_paths),
+               f"vendored/test paths are skipped ({fetched_paths})")
+        rfindings = [o for o in _lab_obs(g, "research_finding")
+                     if (o.data.get("metadata") or {}).get("lab_branch_id")
+                     == rbranch.id]
+        c.that(any(any("/blob/" in u for u in
+                       (o.data.get("metadata") or {}).get("source_urls") or [])
+                   for o in rfindings),
+               f"file CONTENTS became attributed evidence "
+               f"({len(rfindings)} finding(s))")
+        print(f"  Phase 1: bare repo → 1 tree + {len(file_calls)} file fetch(es), "
+              f"cap binds, contents attributed")
     finally:
         set_transport(None)
     return c.done("github_read")
@@ -2971,6 +3100,73 @@ def run_storage_selection() -> bool:
     return c.done("storage_selection")
 
 
+def run_provenance_footer() -> bool:
+    print("\n" + "=" * 64)
+    print("Fixture: provenance_footer — per-behavior model split (ADR-029)")
+    print("=" * 64)
+
+    import tempfile
+    from lab_pack.llm import (LabProviderWrapper, _lab_prompt_bodies,
+                              reset_llm_session)
+
+    reset_llm_session()
+    clear_lab_registry()
+    settings = LabSettings(crawl_enabled=False, research_worker_enabled=True,
+                           research_fetch_cap=2, dispatch_gap_check=False,
+                           drafts_dir=tempfile.mkdtemp())
+    rt = Runtime(Graph(), llm_provider=LabProviderWrapper(
+        LabMockProvider(), prompt_bodies=_lab_prompt_bodies()))
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(tg_pack, settings=ToolGatewaySettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=settings)
+    bind_live_behaviors(rt)
+
+    OPUS, SONNET = "claude-opus-4-8", "claude-sonnet-4-20250514"
+    # draft_writer on the deliberate plane, research_worker on the fast plane:
+    # the exact per-role split the flattened "model X" footer rounded up.
+    rt.get_behavior("lab.draft_writer").model = OPUS
+    rt.get_behavior("lab.research_worker").model = SONNET
+    g = rt.graph
+
+    register_web_fetch(lambda url, **_kw: {
+        "url": url, "status": 200,
+        "content": "<p>Replay rebuilds graph state deterministically from "
+                   "the event log.</p>"}, overwrite=True)
+    mission = create_mission_fn(g, "Footer mission", target_url="")
+    branch = create_branch_fn(
+        g, mission.id, "Verify the replay claim",
+        "Verify replay determinism using https://example.com/replay as the "
+        "primary source.", status="active")
+    rt.run_until_idle()
+
+    c = Check()
+    findings = [o for o in _lab_obs(g, "research_finding")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+    c.that(bool(findings), f"research_worker produced a finding ({len(findings)})")
+
+    # Operator asks for a draft → draft_writer (opus) cites the research_worker
+    # (sonnet) evidence; the footer must show BOTH, per role.
+    send_branch_message_fn(g, branch.id,
+                           "please draft a note about this replay finding")
+    rt.run_until_idle()
+    drafts = [a for a in g.objects(type="artifact")
+              if a.data.get("kind") == "blog_draft"
+              and (a.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+    c.that(len(drafts) == 1, f"one draft produced ({len(drafts)})")
+    content = drafts[0].data.get("content") if drafts else ""
+    footer = next((ln for ln in content.splitlines() if "model `" in ln), "")
+    c.that(f"draft_writer={OPUS}" in footer,
+           f"footer names draft_writer's actual model ({footer!r})")
+    c.that(f"research_worker={SONNET}" in footer,
+           "footer reflects the contributing research_worker's sonnet model")
+    c.that(OPUS in footer and SONNET in footer,
+           "the footer records the split, not one flattened model")
+    print(f"  footer: {footer.strip()[:120]}")
+    reset_llm_session()
+    return c.done("provenance_footer")
+
+
 def run_all() -> None:
     results = [
         run_bootstrap(),
@@ -2982,6 +3178,7 @@ def run_all() -> None:
         run_rejection_lifecycle(),
         run_draft_writer(),
         run_editorial(),
+        run_provenance_footer(),
         run_operator_controls(),
         run_budget_starvation(),
         run_decision_rationale(),

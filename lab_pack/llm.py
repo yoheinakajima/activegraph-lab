@@ -369,6 +369,11 @@ _LLM_STATE: dict[str, Any] = {
     "pause_skipped": set(),       # behaviors skipped THIS pause episode
     "behavior_capped": set(),     # per-behavior exhaustion queued THIS run episode
     "last_model": None,
+    # Per-behavior model resolution actually used at call time — the SAME
+    # value the runtime stamps on each llm.responded event (ADR-019). The
+    # provenance footer reads this so it records the real per-role model split
+    # instead of one flattened constant (ADR-029).
+    "model_by_behavior": {},
 }
 
 
@@ -462,7 +467,8 @@ def reset_llm_session() -> None:
                       daily_cost_recorded=False, cost_cap_override=None,
                       operator_cost_cap=None,
                       paused=False, pause_skipped=set(),
-                      behavior_capped=set(), last_model=None)
+                      behavior_capped=set(), last_model=None,
+                      model_by_behavior={})
 
 
 def _operator_cap_now() -> Optional[float]:
@@ -525,7 +531,8 @@ def reset_llm_run_counters() -> None:
 def llm_usage() -> dict[str, Any]:
     return {"total": _LLM_STATE["total"],
             "by_behavior": dict(_LLM_STATE["by_behavior"]),
-            "last_model": _LLM_STATE["last_model"]}
+            "last_model": _LLM_STATE["last_model"],
+            "model_by_behavior": dict(_LLM_STATE["model_by_behavior"])}
 
 
 def consume_llm_anomalies(graph) -> list[str]:
@@ -812,7 +819,10 @@ class LabProviderWrapper:
         _LLM_STATE["total"] += 1
         _LLM_STATE["daily_used"] += 1
         _LLM_STATE["by_behavior"][behavior or "?"] = used + 1
-        _LLM_STATE["last_model"] = kwargs.get("model") or self.default_model
+        resolved_model = kwargs.get("model") or self.default_model
+        _LLM_STATE["last_model"] = resolved_model
+        if behavior:
+            _LLM_STATE["model_by_behavior"][behavior] = resolved_model
 
         # The lab declares no temperature (the Opus incident): the framework
         # default reaching us means "not explicitly set", forwarded as the

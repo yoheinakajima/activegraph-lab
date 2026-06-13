@@ -58,6 +58,77 @@ _PROMPT = next(p.body for p in
 _URL_RE = re.compile(r"https?://[^\s)\"'<>\]]+")
 _EXCERPT_CHARS = 1500
 
+# ADR-022/020: file CONTENTS, not just the tree. When a task is directed at a
+# GitHub repo, the bare-repo URL routes to get_tree (recursive); the worker
+# then picks RELEVANT implementation files from the returned tree and fetches
+# their contents as further tool_gateway calls, within the per-task fetch cap.
+# The files become attributed evidence exactly like any other fetched source.
+#
+# "Relevant" is a heuristic, justified here: keep blob entries whose extension
+# is source/docs/config (skip binaries, lockfiles, vendored trees), score by
+# overlap with the task's intent/direction keywords, give shallow paths and
+# obvious entrypoints (README, __init__, main, kernel, pack manifests) a small
+# bonus, and break ties deterministically by path so fixtures are stable.
+_CODE_EXTS = {
+    ".py", ".md", ".rst", ".txt", ".js", ".ts", ".tsx", ".jsx", ".mjs",
+    ".go", ".rs", ".java", ".rb", ".c", ".h", ".cc", ".cpp", ".hpp",
+    ".toml", ".cfg", ".ini", ".yaml", ".yml", ".json", ".sh", ".sql",
+    ".html", ".css", ".tf", ".proto", ".swift", ".kt", ".php", ".scala",
+}
+_SKIP_PATH_RE = re.compile(
+    r"(?:^|/)(?:node_modules|vendor|dist|build|\.git|__pycache__|"
+    r"site-packages|third_party|fixtures?|tests?|test)/", re.I)
+_ENTRYPOINT_RE = re.compile(
+    r"(?:^|/)(?:readme|__init__|__main__|main|index|kernel|pack|setup|"
+    r"app|server|cli|core)\b", re.I)
+_MAX_FILE_BYTES = 400_000  # skip very large blobs; they truncate to noise
+_KEYWORD_RE = re.compile(r"[a-z][a-z0-9_]{3,}")
+_STOPWORDS = frozenset((
+    "this", "that", "with", "from", "into", "your", "have", "using", "use",
+    "verify", "research", "claim", "claims", "source", "sources", "primary",
+    "evidence", "find", "produce", "test", "tests", "code", "file", "files",
+    "implementation", "actual", "fetch", "repo", "repository", "github",
+    "about", "their", "they", "them", "what", "when", "which", "where",
+    "https", "http", "com", "www", "blob", "tree", "main", "master",
+))
+
+
+def _intent_keywords(text: str) -> set[str]:
+    return {w for w in _KEYWORD_RE.findall((text or "").lower())
+            if w not in _STOPWORDS}
+
+
+def _select_repo_files(entries: list, intent_text: str, budget: int) -> list[str]:
+    """Pick up to `budget` relevant implementation-file paths from a repo
+    tree's entries (each {path, type, size}). Deterministic ordering."""
+    if budget <= 0:
+        return []
+    keywords = _intent_keywords(intent_text)
+    scored: list[tuple] = []
+    for e in entries or []:
+        if (e.get("type") or "") != "blob":
+            continue
+        path = e.get("path") or ""
+        if not path or _SKIP_PATH_RE.search(path):
+            continue
+        dot = path.rfind(".")
+        ext = path[dot:].lower() if dot != -1 else ""
+        if ext not in _CODE_EXTS:
+            continue
+        size = e.get("size")
+        if isinstance(size, int) and size > _MAX_FILE_BYTES:
+            continue
+        low = path.lower()
+        score = sum(2 for kw in keywords if kw in low)
+        if _ENTRYPOINT_RE.search(low):
+            score += 1
+        depth = path.count("/")
+        # Higher score first; then shallower; then alphabetical path. Negate
+        # for ascending sort, path last so ties are fully deterministic.
+        scored.append((-score, depth, path))
+    scored.sort()
+    return [p for _s, _d, p in scored[:budget]]
+
 # ── registries (caches + dedup; rebuilt on resume, never the truth) ─────────
 _TASKS: dict[str, dict] = {}      # task_id → {pending, sources, branch_id, cap}
 _CALLS: dict[str, str] = {}       # capability_call id → task_id
@@ -172,6 +243,64 @@ def _patch_progress(graph, task_id: str, state: dict, last_url: str) -> None:
     graph.patch_object(task_id, {"metadata": meta})
 
 
+def _enqueue_file_fetch(graph, task_id: str, state: dict, repo: str,
+                        path: str, ref) -> None:
+    """Propose one github.get_file tool_gateway call and register it against
+    the task (counts toward the fetch cap)."""
+    input_data = {"repo": repo, "path": path}
+    if ref:
+        input_data["ref"] = ref
+    url = f"https://github.com/{repo}/blob/{ref or 'HEAD'}/{path}"
+    from .behaviors import _now
+    call = graph.add_object("capability_call", {
+        "provider_id": _ensure_github_provider(graph),
+        "provider_name": "github",
+        "capability_name": "get_file",
+        "input_data": input_data,
+        "risk_class": "low",
+        "status": "proposed",
+        "proposed_by": "lab.research_worker",
+        "proposed_at": _now(),
+        "metadata": {"lab_research": True, "task_id": task_id, "url": url,
+                     "from_tree": True},
+    })
+    _CALLS[call.id] = task_id
+    state["pending"].add(call.id)
+    state["issued"] += 1
+
+
+def _maybe_expand_repo_tree(graph, task_id: str, state: dict, call_id: str,
+                            tree_text: str) -> None:
+    """If a just-returned fetch was a github get_tree, pick relevant files and
+    enqueue get_file fetches for them within the remaining fetch-cap budget
+    (ADR-022/020). Only the first tree per task expands — the cap is a budget,
+    not a per-tree allowance."""
+    if state.get("tree_expanded"):
+        return
+    call = graph.get_object(call_id)
+    if call is None:
+        return
+    cdata = call.data
+    if cdata.get("provider_name") != "github" or \
+            cdata.get("capability_name") != "get_tree":
+        return
+    state["tree_expanded"] = True
+    budget = state["cap"] - state["issued"]
+    if budget <= 0:
+        return
+    try:
+        tree = json.loads(tree_text)
+        entries = tree.get("entries") or []
+    except (ValueError, AttributeError):
+        return  # a truncated/garbled tree degrades to no expansion, never a crash
+    repo = (cdata.get("input_data") or {}).get("repo") or tree.get("repo")
+    ref = (cdata.get("input_data") or {}).get("ref") or tree.get("ref")
+    if not repo:
+        return
+    for path in _select_repo_files(entries, state.get("intent") or "", budget):
+        _enqueue_file_fetch(graph, task_id, state, repo, path, ref)
+
+
 @behavior(
     name="research_intake",
     on=["object.created"],
@@ -228,6 +357,14 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
         from .behaviors import _ensure_web_provider, _now
         state = {"pending": set(), "sources": [], "failed": [],
                  "branch_id": branch_id, "cap": cap,
+                 # Total tool_gateway calls issued for this task (initial
+                 # sources + any tree-expansion file fetches): the per-task
+                 # fetch cap binds on ALL of them, not just the first round.
+                 "issued": len(urls),
+                 "tree_expanded": False,
+                 # The task intent steers which repo files are relevant.
+                 "intent": ((data.get("description") or "") + " "
+                            + (meta.get("operator_direction") or "")),
                  # ADR-027: the operator's continuation direction rides from
                  # the dispatched task into the synthesis request VERBATIM.
                  "direction": (meta.get("operator_direction") or "").strip()}
@@ -285,6 +422,9 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
             "source_id": obj_id,
             "excerpt": _strip_html(html)[:_EXCERPT_CHARS],
         })
+        # ADR-022/020: a repo tree expands into file-content fetches so the
+        # CONTENTS (not just the tree) become evidence — within the cap.
+        _maybe_expand_repo_tree(graph, task_id, state, call_id, html)
     _patch_progress(graph, task_id, state, url)
 
     if state["pending"]:

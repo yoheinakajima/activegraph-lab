@@ -268,7 +268,11 @@ def call_spec_for_url(url: str) -> tuple[str, str, dict]:
                                       "path": m.group(3)}
     m = _GH_TREE_RE.match(url)
     if m:
-        spec: dict = {"repo": m.group(1)}
+        # Recursive so the research worker sees the full file list and can
+        # fetch the CONTENTS of relevant implementation files, not just the
+        # top-level tree (ADR-022/020; branch#62 closed having fetched only
+        # the repo tree, never a file — the published verdict flagged it).
+        spec: dict = {"repo": m.group(1), "recursive": True}
         if m.group(2):
             spec["ref"] = m.group(2)
         return "github", "get_tree", spec
