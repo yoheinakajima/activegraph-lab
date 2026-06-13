@@ -440,6 +440,34 @@ def main() -> int:
         check(isinstance(err, str) and "no such branch" in err,
               "send_chat validates the branch exists")
 
+        print("== ADR-027: archived branches are chat-able for resurrection ==")
+        # The old hard refusal here was the production wall between
+        # decision#266's continuation direction and branch#62 (evt_13850).
+        from lab_pack.tools import create_branch_fn
+        mission = rt.graph.objects(type="mission")[0]
+        tomb = create_branch_fn(rt.graph, mission.id, "Archived inquiry",
+                                "re-examine the fork claim later",
+                                status="proposed")
+        rt.graph.patch_object(tomb.id, {"status": "archived"})
+        rt.run_until_idle()
+        s, _, out = call_tool(base, "send_chat",
+                              {"branch_id": str(tomb.id),
+                               "message": "draft this up please"})
+        reply = (out.get("reply") or "") if isinstance(out, dict) else ""
+        check(s == 200 and isinstance(out, dict) and out.get("status") == "ok"
+              and "archived" in reply and "activate" in reply,
+              "non-activate verbs on an archived branch draw the named refusal")
+        check(rt.graph.get_object(tomb.id).data.get("status") == "archived",
+              "the refusal mutates nothing")
+        s, _, out = call_tool(base, "send_chat",
+                              {"branch_id": str(tomb.id),
+                               "message": "Activate this branch. Rationale: "
+                                          "deliberate resurrection over MCP."})
+        check(s == 200 and isinstance(out, dict) and out.get("status") == "ok"
+              and rt.graph.get_object(tomb.id).data.get("status") != "archived",
+              f"MCP resurrection works (status="
+              f"{rt.graph.get_object(tomb.id).data.get('status')})")
+
         print("== send_chat reply timeout → structured partial, not a generic error ==")
         # Simulate a stuck worker for the reply phase only: the bounded wait
         # is the one call that passes an explicit timeout, so key on that.

@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- Rejection is teaching, not burial (ADR-027): a rejected promote lands
+  the branch on `decided` — never archived — and the operator's
+  `resolution_rationale` becomes an `operator_direction` observation in
+  the branch's evidence (the decision#266/branch#62 incident: the gate
+  buried the operator's continuation direction with the branch,
+  evt_13850). `activate` now works from decided AND archived (archived →
+  active is a recorded operator resurrection); a deliberate activation
+  resets the dispatch dedup, so a FRESH task dispatches carrying the
+  latest direction VERBATIM (`task.metadata.operator_direction`); the
+  research worker fetches direction-named URLs first and its synthesis
+  request carries the direction whole — metadata + a delimited OPERATOR
+  DIRECTION block in the text the model reads (mock-asserted). Archived
+  branches accept exactly one steering verb (activate); everything else
+  draws a refusal naming it, and questions get an honest archived
+  notice. Locked by the rejection_lifecycle fixture; branch_lifecycle's
+  old reject→archived assertion encoded the bug and was updated
+  deliberately.
+
+- Operator draft briefs ride verbatim (the evt_13857 compression, same
+  family as the seam truncation): the chat `draft` verb stores the
+  operator's FULL message on the draft request (`metadata.operator_brief`
+  plus a delimited OPERATOR BRIEF block in the request text the
+  draft_writer's view serializes). A brief governs scope — the queued
+  findings become available evidence, not the mandatory skeleton
+  (observation#714 answered a commissioned narrative with a 14-finding
+  digest); briefless digest requests are unchanged. Locked in the
+  editorial fixture.
+
+- The branch#64 silent path, closed twice: (1) task routing is
+  word-boundary matched — "implements" inside a claim description no
+  longer routes verification research to the nonexistent codebase pack
+  (the ADR-025 substring lesson, again); (2) `blocked` is a task OUTCOME —
+  a gap-blocked (or watchdog-released) task produces a task_outcome
+  evaluation (judgment=blocked, the gap text as its rationale), interpret
+  fires, and a promote decision surfaces instead of the branch dangling
+  active with pending stuck at zero. Locked in capability_gap and
+  research_worker.
+
+- Coverage review gains an orphan-footnote guard: footnotes defined but
+  never cited (artifact#718 shipped an unused [^1]) are flagged in the
+  review note like paragraph coverage.
+
+- UI: an open resolve-rationale form freezes its inbox block across
+  re-renders (poll/SSE/mobile-keyboard viewport churn) — the textarea
+  keeps its DOM node, typed text, and focus until explicit confirm or
+  cancel. check_ui drives the open-type-rerender-confirm path in jsdom.
+
 - Per-behavior budget exhaustion is observable (the 2026-06-12 burst):
   hitting the per-behavior cap records ONE `llm_behavior_budget`
   observation per behavior per run episode (queue-side dedup, like the

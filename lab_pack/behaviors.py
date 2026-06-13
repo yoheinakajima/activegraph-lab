@@ -42,6 +42,9 @@ resume — replay does not re-fire behaviors:
   _APPLIED_DECISIONS decision ids whose outcome gate already applied
   _APPROVED_PUBLISH  subject_refs with an approved publish decision
   _THREAD_TO_BRANCH  comm_thread id → branch id (discusses cache)
+  _OPERATOR_DIRECTIONS branch id → operator continuation directions, oldest
+                     first (ADR-027: a rejected promote's resolution_rationale
+                     is teaching, not burial — dispatch reads the latest)
 """
 
 from __future__ import annotations
@@ -137,6 +140,10 @@ _REJECTED_DECISIONS: list[dict] = []   # {id, kind, subject_ref, seam_name,
 _SEAM_PROPOSED: set[str] = set()       # seam_proposal_request ids handled
 _APPROVED_PUBLISH: set[str] = set()
 _THREAD_TO_BRANCH: dict[str, str] = {}
+# ADR-027: operator continuation directions per branch (from rejected promote
+# resolutions), oldest first. Rebuilt from operator_direction observations on
+# resume; dispatch stamps the LATEST onto the task it creates.
+_OPERATOR_DIRECTIONS: dict[str, list[str]] = {}
 _DRAFTED_OBS: set[str] = set()
 _FINDING_EMITTED: set[str] = set()
 _SLUGS: set[str] = set()
@@ -167,6 +174,7 @@ def clear_lab_registry() -> None:
     _PENDING_BY_BRANCH.clear()
     _APPLIED_DECISIONS.clear()
     _REJECTED_DECISIONS.clear()
+    _OPERATOR_DIRECTIONS.clear()
     _SEAM_PROPOSED.clear()
     _APPROVED_PUBLISH.clear()
     _THREAD_TO_BRANCH.clear()
@@ -644,9 +652,16 @@ def _routing_for_intent(intent: str) -> dict[str, Any]:
     task.metadata.routing = {"domain": ..., "capability": ...} plus
     metadata.tags. Verified at the current pin: no upstream pack reacts to
     core tasks, so dispatch surfaces capability gaps — which is evidence.
+
+    Word boundaries, deliberately (the branch#64 incident): the old substring
+    check matched "implement" inside "implements" in a claim DESCRIPTION
+    ("Verify that activegraph actually implements a shared graph structure…"),
+    routing verification research to a codebase pack that does not exist —
+    the same substring-match family ADR-025 fixed for steering verbs. A
+    mention of code is not a request to write code.
     """
     low = (intent or "").lower()
-    if any(w in low for w in ("code", "repo", "test", "implement")):
+    if re.search(r"\b(code|repo|test|implement)\b", low):
         return {"domain": "codebase", "capability": "code_task"}
     return {"domain": "research", "capability": "deep_research"}
 
@@ -657,20 +672,27 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
     _DISPATCHED.add(branch_id)
     intent = branch_data.get("intent") or branch_data.get("title") or ""
     routing = _routing_for_intent(intent)
+    meta: dict[str, Any] = {
+        "routing": routing,
+        "tags": ["lab", routing["domain"]],
+        "lab_branch_id": branch_id,
+        "progress_contract": {
+            "interval_seconds": settings.progress_interval_seconds,
+            "uninterruptible": False,
+        },
+    }
+    # ADR-027: a branch carrying operator direction (a rejected promote's
+    # resolution_rationale) dispatches it VERBATIM — the worker must be able
+    # to read what the operator ordered.
+    directions = _OPERATOR_DIRECTIONS.get(branch_id) or []
+    if directions:
+        meta["operator_direction"] = directions[-1]
     task = graph.add_object("task", {
         "title": (branch_data.get("title") or "Lab task")[:120],
         "description": intent,
         "status": "active",
         "priority": "medium",
-        "metadata": {
-            "routing": routing,
-            "tags": ["lab", routing["domain"]],
-            "lab_branch_id": branch_id,
-            "progress_contract": {
-                "interval_seconds": settings.progress_interval_seconds,
-                "uninterruptible": False,
-            },
-        },
+        "metadata": meta,
     })
     graph.add_relation(branch_id, task.id, "dispatched")
     if settings.dispatch_gap_check:
@@ -714,19 +736,25 @@ def _gap_check(graph, task_id: str) -> None:
     meta = task.data.get("metadata") or {}
     branch_id = meta.get("lab_branch_id")
     routing = meta.get("routing") or {}
+    gap_text = (
+        f"Capability gap: no loaded pack reacted to task '{task.data.get('title')}' "
+        f"(routing: {routing.get('domain')}.{routing.get('capability')}). "
+        "The lab cannot execute this work yet. A gap is evidence, not an error."
+    )
     obs = graph.add_object("observation", {
-        "text": (
-            f"Capability gap: no loaded pack reacted to task '{task.data.get('title')}' "
-            f"(routing: {routing.get('domain')}.{routing.get('capability')}). "
-            "The lab cannot execute this work yet. A gap is evidence, not an error."
-        ),
+        "text": gap_text,
         "confidence": 0.95,
         "category": "risk",
         "metadata": {"lab": "capability_gap", "lab_branch_id": branch_id, "task_id": task_id},
     })
     if branch_id:
         graph.add_relation(branch_id, obs.id, "supported_by")
-    graph.patch_object(task_id, {"status": "blocked"})
+    # The blocked patch carries the gap as the task's result_summary; work's
+    # outcome path (which now treats `blocked` as an outcome — the branch#64
+    # silent path) turns it into the evaluation interpret fires on.
+    new_meta = dict(meta)
+    new_meta["result_summary"] = gap_text
+    graph.patch_object(task_id, {"status": "blocked", "metadata": new_meta})
 
 
 def _mark_task_outcome(graph, task_id: str, status: str) -> None:
@@ -738,10 +766,11 @@ def _mark_task_outcome(graph, task_id: str, status: str) -> None:
         return
     meta = task.data.get("metadata") or {}
     branch_id = meta.get("lab_branch_id")
+    judgment = {"done": "completed_successfully", "blocked": "blocked"}.get(status, "failed")
     graph.add_object("evaluation", {
         "subject_id": task_id,
         "subject_type": "task",
-        "judgment": "completed_successfully" if status == "done" else "failed",
+        "judgment": judgment,
         "rationale": (meta.get("result_summary") or "")[:500],
         "evaluator": "lab.work",
         "metadata": {"lab": "task_outcome", "lab_branch_id": branch_id, "task_id": task_id},
@@ -792,8 +821,16 @@ def work(event, graph, ctx, *, settings: LabSettings):
         if not meta.get("lab_branch_id"):
             return
         status = diff.get("status") or {}
-        if status.get("new") in ("done", "rejected") or status.get("new") == "failed":
-            _mark_task_outcome(graph, target, "done" if status.get("new") == "done" else "failed")
+        new = status.get("new")
+        if new in ("done", "rejected", "failed", "blocked"):
+            # `blocked` is an outcome too (the branch#64 silent path): a
+            # gap-blocked or watchdog-released task used to exit the loop
+            # here — no task_outcome evaluation, so interpret never fired, no
+            # promote decision surfaced, and the branch dangled active with
+            # pending stuck at zero. The operator hears about every outcome.
+            _mark_task_outcome(graph, target,
+                               "done" if new == "done"
+                               else "blocked" if new == "blocked" else "failed")
             return
         if "metadata" in diff and meta.get("dispatch_probe") and settings.dispatch_gap_check:
             _gap_check(graph, target)
@@ -971,31 +1008,49 @@ def _drafting_capped(graph, settings: LabSettings, *, operator: bool) -> bool:
 
 def _request_draft(graph, *, post_kind_hint: str, item_ids: list[str],
                    requested_by: str, branch_id: Optional[str] = None,
-                   mission_id: Optional[str] = None, rationale: str = ""):
+                   mission_id: Optional[str] = None, rationale: str = "",
+                   operator_brief: Optional[str] = None):
     """Create the draft_request observation draft_writer triggers on. Its
     data is the assembled draft context: classification guidance (4a) and
     per-item provenance (5a) — the model can no longer not know where a
-    finding came from."""
+    finding came from.
+
+    `operator_brief` (the seam-truncation fix, mirrored): an operator's
+    drafting message rides VERBATIM — in metadata and as a delimited
+    OPERATOR BRIEF block in the request text the model reads. The brief
+    governs scope; the listed items become available evidence, not the
+    mandatory skeleton. evt_13857's commission ('Draft a research-kind post
+    about the rejection-to-self-modification loop…') was compressed to
+    'Operator requested a draft' + 160 chars, and observation#714 drafted a
+    14-finding digest instead."""
     contexts = [_item_context(graph, i) for i in item_ids]
     evidence: list[str] = []
     for c in contexts:
         for r in [c.get("finding_id")] + list(c.get("evidence_refs") or []):
             if r and r not in evidence:
                 evidence.append(r)
+    text = (f"Draft request ({post_kind_hint}): write one {post_kind_hint} "
+            f"post covering {len(item_ids)} item(s). {rationale} "
+            + _CLASSIFICATION_GUIDANCE)
+    meta = {"lab": "draft_request", "draft_request": True,
+            "post_kind_hint": post_kind_hint,
+            "finding_ids": list(item_ids),
+            "evidence_refs": evidence,
+            "findings_context": contexts,
+            "lab_branch_id": branch_id,
+            "mission_id": mission_id,
+            "requested_by": requested_by}
+    if operator_brief and operator_brief.strip():
+        meta["operator_brief"] = operator_brief
+        text += ("\n\nOPERATOR BRIEF (verbatim — this brief governs the "
+                 "post's scope and content; the listed findings are "
+                 "available evidence, not a mandatory skeleton):\n"
+                 + operator_brief)
     req = graph.add_object("observation", {
-        "text": (f"Draft request ({post_kind_hint}): write one {post_kind_hint} "
-                 f"post covering {len(item_ids)} item(s). {rationale} "
-                 + _CLASSIFICATION_GUIDANCE),
+        "text": text,
         "confidence": 1.0,
         "category": "fact",
-        "metadata": {"lab": "draft_request", "draft_request": True,
-                     "post_kind_hint": post_kind_hint,
-                     "finding_ids": list(item_ids),
-                     "evidence_refs": evidence,
-                     "findings_context": contexts,
-                     "lab_branch_id": branch_id,
-                     "mission_id": mission_id,
-                     "requested_by": requested_by},
+        "metadata": meta,
     })
     for i in item_ids:
         _COVERED_FINDINGS.add(i)
@@ -1244,17 +1299,36 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
                                         meta.get("resolution_rationale")})
 
     if kind == "promote" and subject:
-        new_status = "decided" if status == "approved" else "archived"
-        if status == "rejected":
-            _BRANCH_COUNT["open"] = max(0, _BRANCH_COUNT["open"] - 1)
+        # ADR-027: a rejected promote no longer archives. Rejection is the
+        # operator teaching through the gate — the branch lands on `decided`
+        # either way, and the resolution_rationale (when given) becomes an
+        # operator_direction observation in the branch's evidence, which a
+        # later activation dispatches verbatim. The old reject→archived path
+        # buried decision#266's continuation direction with branch#62
+        # (evt_13850): the first operator attempt to steer a continuation
+        # archived the student instead.
         try:
             graph.patch_object(subject, {
-                "status": new_status,
+                "status": "decided",
                 "metadata": {**((graph.get_object(subject).data.get("metadata")) or {}),
                              "decision_id": decision_id},
             })
         except Exception:
             pass
+        if status == "rejected":
+            meta = data.get("metadata") or {}
+            direction = (meta.get("resolution_rationale") or "").strip()
+            if direction:
+                obs = graph.add_object("observation", {
+                    "text": direction,
+                    "confidence": 1.0,
+                    "category": "fact",
+                    "metadata": {"lab": "operator_direction",
+                                 "lab_branch_id": subject,
+                                 "decision_id": decision_id},
+                })
+                graph.add_relation(subject, obs.id, "supported_by")
+                _OPERATOR_DIRECTIONS.setdefault(subject, []).append(direction)
         if status == "approved":
             _maybe_research_request(graph, subject, decision_id,
                                     data.get("rationale") or "", settings)
@@ -1305,7 +1379,8 @@ def gate(event, graph, ctx, *, settings: LabSettings):
     On: decision created (pending) → approval-request event (a decision patch
         stamping approval_requested_at; the feed pins it as the inbox).
         decision patched to approved/rejected → outcome applied (promote →
-        branch decided/archived; publish → artifact published/rejected).
+        branch decided either way, a rejection recording its direction as
+        evidence — ADR-027; publish → artifact published/rejected).
         artifact created/patched to status=published WITHOUT an approved
         publish decision → reverted to proposed + violation observation.
     NOTHING publishes or self-modifies without an approved decision.
@@ -1392,7 +1467,9 @@ def _coverage_review(body: str) -> Optional[str]:
     """Claims-coverage check (draft contract): any substantive paragraph with
     zero evidence refs gets flagged in a review note — never silently
     accepted. Extension (5b): first-person process claims without a footnote
-    are flagged separately as possible invented narrative."""
+    are flagged separately as possible invented narrative. Orphan guard:
+    footnotes DEFINED but never cited are dead provenance (artifact#718
+    shipped an unused [^1]) — flagged like paragraph coverage."""
     flagged = []
     process_flagged = []
     for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
@@ -1405,6 +1482,12 @@ def _coverage_review(body: str) -> Optional[str]:
             continue  # headings, transitions — not claims
         if not has_footnote:
             flagged.append(i + 1)
+    # Defined-but-uncited footnotes: a definition line ([^id]: …) whose id is
+    # cited nowhere in the prose. The definition's own marker is followed by
+    # ':' and therefore never counts as a citation.
+    defined = re.findall(r"(?m)^\[\^([^\]]+)\]:", body or "")
+    cited = set(re.findall(r"\[\^([^\]]+)\](?!:)", body or ""))
+    orphaned = [d for d in defined if d not in cited]
     notes = []
     if flagged:
         notes.append(
@@ -1419,6 +1502,12 @@ def _coverage_review(body: str) -> Optional[str]:
             "“during my review…”) with no evidence ref to a matching "
             "event — possible invented narrative. The injected draft context "
             "says where each finding actually came from; verify or cut.")
+    if orphaned:
+        notes.append(
+            "> **Review note (orphan footnotes):** footnote(s) "
+            + ", ".join(f"[^{o}]" for o in orphaned)
+            + " are defined but never cited in the text — dead provenance. "
+            "Cite or cut before approving.")
     if not notes:
         return None
     return "\n\n" + "\n\n".join(notes)
@@ -1949,6 +2038,23 @@ def _apply_steering(graph, branch_id: str, content: str,
         return None
     status = branch.data.get("status")
 
+    # ADR-027: an archived branch is chat-able for ONE steering verb —
+    # activate (deliberate operator resurrection, handled below). Every other
+    # verb or action request draws an honest refusal naming it; plain
+    # questions fall through to answer, which states the archived status.
+    if status == "archived" and not _has_verb(low, _STEER_ACTIVATE):
+        other_verbs = (_STEER_PAUSE + _STEER_RESUME + _STEER_DEACTIVATE
+                       + _STEER_RECRAWL + _STEER_DRAFT + _STEER_APPROVE
+                       + _STEER_REJECT + _STEER_PROPOSE)
+        if _has_verb(low, other_verbs) or _unsupported_action(low):
+            return {"kind": "refused", "verb": "archived", "event_id": None,
+                    "summary": (
+                        "This branch is archived. The only steering verb an "
+                        "archived branch accepts is 'activate' — a deliberate "
+                        "operator resurrection, recorded as such. Nothing was "
+                        "changed.")}
+        return None
+
     # Checked before the draft verb — "propose an improved draft_writer
     # prompt" contains 'draft' but is a proposal request.
     if _has_verb(low, _STEER_PROPOSE):
@@ -1993,28 +2099,51 @@ def _apply_steering(graph, branch_id: str, content: str,
         # (ADR-021's argument). Activation records the operator's rationale
         # as an observation and lets the EXISTING dispatch react to the
         # status patch (work fires on status→active; nothing new dispatches).
+        # ADR-027 widens the verb: decided → active is a continuation (the
+        # rejected-promote path leaves direction on the branch); archived →
+        # active is a deliberate operator resurrection, recorded as such.
         if status == "active":
             return _noop("activate", "This branch is already active.")
         if status == "paused":
             return _noop("activate", "This branch is paused — use resume.")
-        if status not in ("proposed", "scoped"):
+        if status not in ("proposed", "scoped", "decided", "archived"):
             return _noop("activate",
-                         f"This branch is {status} — only a proposed or "
-                         "scoped branch can be activated.")
+                         f"This branch is {status} — only a proposed, "
+                         "scoped, decided, or archived branch can be "
+                         "activated.")
+        resurrected = status == "archived"
         obs = graph.add_object("observation", {
-            "text": (f"Branch activated by the operator. Rationale: "
-                     f"{content[:400]}"),
+            "text": ((f"Branch resurrected from archived by the operator "
+                      f"(deliberate resurrection). Rationale: {content[:400]}")
+                     if resurrected else
+                     (f"Branch activated by the operator"
+                      + (f" (from {status})" if status == "decided" else "")
+                      + f". Rationale: {content[:400]}")),
             "confidence": 1.0,
             "category": "fact",
             "metadata": {"lab": "branch_activated", "lab_branch_id": branch_id,
+                         "previous_status": status,
+                         "resurrected": resurrected,
                          "message_id": msg_id, "source": source or "operator"},
         })
         graph.add_relation(branch_id, obs.id, "supported_by")
+        # A deliberate operator activation is a fresh dispatch episode: the
+        # dedup registry resets for this branch (the recrawl move — the
+        # registry is a cache, the log is append-only) so work dispatches a
+        # NEW task, which carries any operator_direction on the branch.
+        _DISPATCHED.discard(branch_id)
         graph.patch_object(branch_id, {"status": "active"})
-        summary = "branch activated (status=active); dispatch reacts next"
+        summary = (("branch resurrected from archived (status=active); "
+                    "dispatch reacts next") if resurrected else
+                   f"branch activated from {status} (status=active); "
+                   "dispatch reacts next")
+        directions = _OPERATOR_DIRECTIONS.get(branch_id) or []
+        if directions:
+            summary += " — the operator direction on record rides with the task"
         event_id = _steering_event(graph, "activate", branch_id, msg_id,
                                    summary, source,
-                                   refs={"rationale_observation": obs.id})
+                                   refs={"rationale_observation": obs.id,
+                                         "previous_status": status})
         return _applied("activate", summary, event_id)
     if _has_verb(low, _STEER_RECRAWL):
         # ADR-025/crawl fix: replay never re-fires behaviors, so a resumed
@@ -2048,6 +2177,8 @@ def _apply_steering(graph, branch_id: str, content: str,
     if _has_verb(low, _STEER_DRAFT):
         # 4b escape hatch: the operator can request a draft on anything.
         # Explicit attention — bypasses the pending-publish cap (ADR-014).
+        # The full message rides as the OPERATOR BRIEF (the evt_13857
+        # compression: only this 160-char rationale used to survive).
         evidence = _branch_evidence_ids(graph, branch_id)
         hint = "research" if status == "decided" else "note"
         req = _request_draft(
@@ -2056,6 +2187,7 @@ def _apply_steering(graph, branch_id: str, content: str,
             mission_id=branch.data.get("mission_id"),
             rationale=(f"Operator requested a draft on branch "
                        f"'{branch.data.get('title')}': {content[:160]}"),
+            operator_brief=content,
         )
         summary = (f"draft requested on this branch ({hint}; operator "
                    "escape hatch)")
@@ -2171,6 +2303,12 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
             if branch is not None:
                 reply += (f"Branch “{branch.data.get('title')}” is currently "
                           f"{b_status}.")
+        if b_status == "archived":
+            # ADR-027: honesty about the archive, deterministically — the
+            # model's narration must not paper over a branch that will not
+            # react to anything but resurrection.
+            reply = ("Note: this branch is archived — it accepts no steering "
+                     "except 'activate' (operator resurrection).\n\n" + reply)
     reply += f"\n\n— as of event {event.id}"
 
     candidate = graph.add_object("comm_response_candidate", {

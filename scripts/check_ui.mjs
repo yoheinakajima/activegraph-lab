@@ -152,6 +152,23 @@ if (annotated) {
   check(field.value === "", "rationale prefilled empty (skippable)");
 }
 field.value = "ui-check: reason recorded on the resolution event";
+
+console.log("== rationale persists across re-renders (the mobile keyboard case) ==");
+// The 3s poll / SSE push re-renders mid-composition; on mobile the soft
+// keyboard's viewport churn makes this near-certain on first focus. The open
+// form must keep its DOM node (text + focus) until explicit confirm/cancel.
+window.eval("render()");
+await new Promise((r) => setTimeout(r, 50));
+const cardAfter = doc.querySelector(`[data-decision-id="${decisionId}"]`);
+const formAfter = cardAfter && cardAfter.querySelector(".resolve-form");
+const fieldAfter = cardAfter && cardAfter.querySelector(".resolve-rationale");
+check(!!formAfter && formAfter.hidden === false,
+  "re-render mid-composition keeps the rationale form open");
+check(!!fieldAfter && fieldAfter.value === "ui-check: reason recorded on the resolution event",
+  "typed rationale survives the re-render");
+check(fieldAfter === field,
+  "the textarea keeps its DOM node (focus/keyboard not dismissed)");
+
 firstCard.querySelector("button.confirm").click();
 await new Promise((r) => setTimeout(r, 50));
 const hit = posts.find((p) => p.url === "/lab/decision");

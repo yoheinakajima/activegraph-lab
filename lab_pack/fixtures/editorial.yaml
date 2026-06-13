@@ -28,5 +28,5 @@ expected_outputs:
   synthesis_draft:
     post_kind: research
   drafting_idle_observations: 1
-  blog_drafts_total: 4          # digest + research + synthesis + operator
-  draft_requests_total: 4
+  blog_drafts_total: 5          # digest + research + synthesis + operator + briefed
+  draft_requests_total: 5

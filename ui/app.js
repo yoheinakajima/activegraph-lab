@@ -207,6 +207,10 @@ async function resolveDecision(card, id, approved, rationale) {
     if (slot) slot.textContent = ` could not apply: ${e.message}`;
     return;
   }
+  /* Explicit confirm ends the composing episode — close the form so the
+     next render rebuilds the inbox (composingIn no longer freezes it). */
+  const form = card.querySelector(".resolve-form");
+  if (form) form.hidden = true;
   refresh();
 }
 
@@ -554,26 +558,39 @@ function branchGroupNode(b) {
   return g;
 }
 
+/* A rationale in progress must survive re-renders (the 3s poll, SSE pushes,
+   and — on mobile — the resize/viewport churn the soft keyboard causes):
+   while a resolve form is open inside a container, the container is NOT
+   rebuilt, so the textarea keeps its DOM node, its typed text, and its
+   focus until explicit confirm or cancel. */
+function composingIn(container) {
+  return !!container.querySelector(".resolve-form:not([hidden])");
+}
+
 function renderFeed() {
   renderFilters();
 
   // Inbox: pending decisions pinned on top — this IS the inbox, not a page.
-  // Resolved decisions are the collapsed history beneath it (3a).
+  // Resolved decisions are the collapsed history beneath it (3a). A resolve
+  // form in progress freezes the inbox block (composingIn) — the rest of
+  // the feed keeps refreshing.
   const inbox = $("inbox");
-  inbox.innerHTML = "";
-  const pending = FEED.inbox.filter(d => !FILTERS.decision || d.kind === FILTERS.decision);
-  if (pending.length) {
-    inbox.insertAdjacentHTML("beforeend", `<h3 class="register">Inbox — gated decisions</h3>`);
-    pending.forEach(d => inbox.appendChild(decisionCard(d)));
-  }
-  const resolved = (FEED.resolved || [])
-    .filter(d => !FILTERS.decision || d.kind === FILTERS.decision);
-  if (resolved.length) {
-    const det = document.createElement("details");
-    det.className = "history";
-    det.innerHTML = `<summary>Decision history — ${resolved.length} resolved</summary>`;
-    resolved.forEach(d => det.appendChild(resolvedRow(d)));
-    inbox.appendChild(det);
+  if (!composingIn(inbox)) {
+    inbox.innerHTML = "";
+    const pending = FEED.inbox.filter(d => !FILTERS.decision || d.kind === FILTERS.decision);
+    if (pending.length) {
+      inbox.insertAdjacentHTML("beforeend", `<h3 class="register">Inbox — gated decisions</h3>`);
+      pending.forEach(d => inbox.appendChild(decisionCard(d)));
+    }
+    const resolved = (FEED.resolved || [])
+      .filter(d => !FILTERS.decision || d.kind === FILTERS.decision);
+    if (resolved.length) {
+      const det = document.createElement("details");
+      det.className = "history";
+      det.innerHTML = `<summary>Decision history — ${resolved.length} resolved</summary>`;
+      resolved.forEach(d => det.appendChild(resolvedRow(d)));
+      inbox.appendChild(det);
+    }
   }
 
   // Branches: open ones expanded; proposed / decided / archived collapsed (3a).
@@ -660,9 +677,11 @@ function renderThread() {
     linkifyIds(escapeHtml(d.intent || ""));
 
   const ti = $("thread-inbox");
-  ti.innerHTML = "";
-  FEED.inbox.filter(x => x.branch_id === VIEW.branchId)
-    .forEach(x => ti.appendChild(decisionCard(x)));
+  if (!composingIn(ti)) {
+    ti.innerHTML = "";
+    FEED.inbox.filter(x => x.branch_id === VIEW.branchId)
+      .forEach(x => ti.appendChild(decisionCard(x)));
+  }
 
   // ONE scroll: run events and chat messages interleaved, oldest first.
   const tl = $("timeline");

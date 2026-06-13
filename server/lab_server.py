@@ -243,6 +243,11 @@ def _rebuild_lab_registries(rt) -> None:
         meta = o.data.get("metadata") or {}
         if meta.get("lab") == "capability_gap" and meta.get("task_id"):
             lb._GAP_CHECKED.add(meta["task_id"])
+        if meta.get("lab") == "operator_direction" and meta.get("lab_branch_id"):
+            # ADR-027: continuation directions survive resume — objects are
+            # creation-ordered, so the latest direction stays last.
+            lb._OPERATOR_DIRECTIONS.setdefault(
+                str(meta["lab_branch_id"]), []).append(o.data.get("text") or "")
         if meta.get("lab") == "site_claim":
             lb._PLANNED_OBS.add(o.id)
         if meta.get("lab"):
@@ -617,6 +622,8 @@ DEFAULT_TEMPLATES = {
     "seam_proposal_request": "{short_text}",
     "seam_proposal_failed": "{short_text}",
     "decision_annotation": "Operator note (via MCP): “{short_text}”",
+    "operator_direction": "Operator direction recorded for the continuation: “{short_text}”",
+    "branch_activated": "{short_text}",
 }
 
 

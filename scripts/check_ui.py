@@ -119,6 +119,9 @@ def static_fallback(bundle: dict) -> None:
     check("/lab/decision" in js, "app.js posts decisions to /lab/decision")
     check("resolve-form" in js and "resolve-rationale" in js,
           "app.js wires the optional resolution-rationale form (ADR-026)")
+    check("composingIn" in js and ".resolve-form:not([hidden])" in js,
+          "app.js freezes the inbox while a rationale is being composed "
+          "(mobile keyboard fix)")
     check("annotations" in js, "app.js renders decision annotations (ADR-026)")
     check(all(isinstance(d.get("annotations"), list) for d in feed.get("inbox", [])),
           "feed contract: inbox decisions expose annotations")

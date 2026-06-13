@@ -2,7 +2,12 @@ description: |
   Full branch lifecycle with both gate outcomes: two branches are activated,
   their tasks dispatched and completed (a fixture stands in for the worker),
   interpret turns the outcomes into evidence + pending promote decisions, and
-  the owner approves one and rejects the other.
+  the owner approves one and rejects the other. ADR-027: BOTH outcomes land
+  on decided — a rejected promote no longer archives, and its resolution
+  rationale becomes an operator_direction observation in the branch's
+  evidence. (This fixture's old reject->archived assertion encoded the
+  decision#266/branch#62 bug: the gate buried the operator's continuation
+  direction with the branch.)
 
 mission:
   title: Grow activegraph.ai's evidence base
@@ -28,7 +33,7 @@ branches:
       result_summary: Behavior dispatch traced; inconclusive on scheduling internals.
       success: true
     resolution: reject
-    expected_final_status: archived
+    expected_final_status: decided   # ADR-027: rejection teaches, never buries
 
 expected_outputs:
   tasks:
@@ -41,3 +46,5 @@ expected_outputs:
     count: 2
     approval_requested: true   # gate stamped approval_requested_at on each
     statuses: [approved, rejected]
+  operator_direction_observations:
+    count: 1                   # the reject rationale, linked to its branch

@@ -276,6 +276,21 @@ class LabMockProvider:
                     seen.append(r_)
             ev = seen[:3] or [f"evidence-{digest}"]
             finding = _extract_field(messages, "text") or f"a finding ({digest})"
+            # An OPERATOR BRIEF in the request governs scope (ADR-014 escape
+            # hatch + the evt_13857 fix): the mock plays a brief-honoring
+            # model — evidence ids the brief names become the footnote set,
+            # so fixtures can assert the brief actually reached the context
+            # and scoped the draft (a brief the plumbing dropped cannot
+            # scope anything).
+            brief_m = re.search(r'"operator_brief":\s*"((?:[^"\\]|\\.)*)"', blob)
+            if brief_m:
+                brief = brief_m.group(1)
+                brief_ids = list(dict.fromkeys(re.findall(
+                    r"\b(?:observation|evaluation|task|branch|decision|artifact)#\d+",
+                    brief)))
+                if brief_ids:
+                    ev = brief_ids
+                    finding = brief[:200].replace("\\n", " ")
             footnotes = "\n".join(f"[^{i+1}]: {e}" for i, e in enumerate(ev))
             cites = "".join(f"[^{i+1}]" for i in range(len(ev)))
             hint_m = re.findall(r'"post_kind_hint":\s*"(note|research|build)"', blob)
