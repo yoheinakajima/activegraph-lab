@@ -2212,13 +2212,32 @@ def run_rejection_lifecycle() -> bool:
     print(f"  reject → decided + direction obs {dirs[0].id if dirs else '?'} "
           "(not archived)")
 
-    # ── the registry survives a resume rebuild ──────────────────────────────
+    # ── the registry survives a resume rebuild — both direction shapes ─────
+    # A LEGACY rejection (pre-ADR-027, the decision#266 shape): the rationale
+    # sits on the decision metadata with NO operator_direction observation.
+    # The rebuild reads it too — no events appended, the cache learns to
+    # read what is already there — so branch#62's recorded teaching is
+    # reachable after redeploy.
+    legacy_branch = create_branch_fn(g, mission.id, "Legacy-rejected inquiry",
+                                     "verify the diff claim")
+    g.add_object("decision", {
+        "subject_ref": legacy_branch.id, "kind": "promote",
+        "status": "rejected", "rationale": "proposer pitch",
+        "evidence_refs": [],
+        "metadata": {"resolved_by": "operator",
+                     "resolution_rationale": "legacy direction: fetch the "
+                                             "primary docs next time"},
+    })
     saved_contexts = list(provider.contexts)
     clear_lab_registry()
     _rebuild_lab_registries(rt)
     provider.contexts = saved_contexts
     c.that((lb._OPERATOR_DIRECTIONS.get(branch.id) or [])[-1:] == [direction],
            "operator direction survives the resume rebuild")
+    c.that((lb._OPERATOR_DIRECTIONS.get(legacy_branch.id) or [])
+           == ["legacy direction: fetch the primary docs next time"],
+           "a pre-ADR-027 rejection's rationale rebuilds from decision "
+           "metadata (the decision#266 shape)")
 
     # ── reactivate via chat: cited steering, fresh dispatch WITH direction ──
     _, msg = send_branch_message_fn(
