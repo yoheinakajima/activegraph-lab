@@ -16,7 +16,7 @@ Inside a thread: run events and chat messages interleaved in ONE scroll, ordered
 
 ## Inbox resolution (ADR-026)
 
-Approve/reject open an optional rationale field (skippable; recorded on the resolution event as `resolution_rationale`, `resolved_by=operator`). Pending decisions render their MCP annotations (`annotate_decision` — public, `operator_via_mcp`-attributed commentary, never authority); the rationale field prefills from the most recent annotation and the operator can edit before confirming. On resolve, annotations link into the decision's evidence.
+Approve/reject open an optional rationale field (skippable; recorded on the resolution event as `resolution_rationale`, `resolved_by=operator`). Pending decisions render their MCP annotations (`annotate_decision` — public, `operator_via_mcp`-attributed commentary, never authority); the rationale field prefills from the most recent annotation and the operator can edit before confirming. On resolve, annotations link into the decision's evidence. An open rationale form freezes its inbox block across re-renders (the 3s poll, SSE pushes, and the mobile keyboard's viewport churn): the textarea keeps its DOM node — typed text and focus — until explicit confirm or cancel.
 
 ## Feed
 
@@ -32,7 +32,7 @@ Forking anchors to a committed event only (`branch.fork_event_id`). In-flight wo
 
 ## Steering verbs
 
-Inside a branch thread (word-boundary matched): `pause` → branch status `paused` (ADR-007); `resume` → `active` (only from paused); `activate` → `active` from proposed/scoped, recording the operator's rationale as an observation and letting the existing dispatch react; `deactivate` → back to `proposed` (ADR-025; both MCP-allowed — reversible, like pause); `draft` → operator draft request (ADR-014, bypasses the pending cap); `recrawl` → a fresh crawl request for the mission target_url; `propose <seam>` → seam proposal through the gate; `approve`/`reject` → resolves the branch's single pending decision — several pending lists the ids without mutating, zero is an honest no-op, and MCP-tagged messages are refused (the inbox is human-only, ADR-016/021).
+Inside a branch thread (word-boundary matched): `pause` → branch status `paused` (ADR-007); `resume` → `active` (only from paused); `activate` → `active` from proposed/scoped/decided/archived, recording the operator's rationale as an observation, resetting the dispatch dedup so a fresh task dispatches (carrying any operator_direction on the branch verbatim — ADR-027), and letting the existing dispatch react; archived → active is a deliberate operator resurrection, recorded as such; `deactivate` → back to `proposed` (ADR-025; both MCP-allowed — reversible, like pause); `draft` → operator draft request (ADR-014, bypasses the pending cap; the full message rides as the OPERATOR BRIEF and governs scope); `recrawl` → a fresh crawl request for the mission target_url; `propose <seam>` → seam proposal through the gate; `approve`/`reject` → resolves the branch's single pending decision — several pending lists the ids without mutating, zero is an honest no-op, and MCP-tagged messages are refused (the inbox is human-only, ADR-016/021). An ARCHIVED branch accepts exactly one steering verb — `activate`; every other verb draws an honest refusal naming it, and plain questions get an explicit archived notice.
 
 Replies are composed AFTER the mutation, from post-mutation state, and cite the `lab.steering_applied` event id; an action no verb supports draws a refusal naming this verb set (ADR-025). The mutation lands at the event boundary.
 

@@ -1,0 +1,63 @@
+description: |
+  ADR-027 — rejection is teaching, not burial. The production shape: the
+  operator rejected promote decision#266 with a resolution_rationale carrying
+  explicit continuation direction (primary sources, named repos/papers); the
+  gate's reject path auto-archived branch#62 (evt_13850), archived branches
+  were not steerable, and the direction sat recorded but unreachable.
+
+  This fixture drives the full corrected arc: worker run → promote decision →
+  REJECT with direction → branch decided (not archived) + operator_direction
+  observation in its evidence → operator re-activates via chat (cited
+  steering) → a FRESH task dispatches carrying the direction verbatim → the
+  worker fetches the direction's named source and its synthesis context
+  contains the direction (mock-asserted) → a new promote decision surfaces.
+  Plus: archived → active is a deliberate operator resurrection, recorded as
+  such; archived branches refuse every other steering verb by name; plain
+  questions on an archived branch draw an honest archived notice.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: true
+  research_worker_enabled: true
+
+branch:
+  title: Verify the replay claim from primary sources
+  intent: >
+    Verify replay determinism using https://example.com/replay as the
+    primary source.
+
+# The operator's reject rationale — the continuation direction. It names a
+# source the first run never fetched; the marker string is what the
+# mock-assert greps for in the worker's synthesis context.
+direction: >
+  Rejecting for now: one promotional source cannot verify an implementation
+  claim. Direction for the continuation (fixture-direction-marker): spend
+  the remaining fetch budget on the primary documentation at
+  https://example.com/docs and promote only when the verdict rests on
+  implementation evidence, not description.
+
+archived_branch:
+  title: Legacy archived inquiry
+  intent: >
+    Re-examine the fork claim using https://example.com/replay as the
+    source.
+
+pages:
+  https://example.com/replay: >
+    <p>Replay rebuilds graph state deterministically from the append-only
+    event log, the page claims, with every behavior decision auditable.</p>
+  https://example.com/docs: >
+    <p>The documentation describes the replay API: every event is appended
+    before projection, and any run can be replayed from event zero with
+    identical results. Implementation evidence lives here.</p>
+
+expected_outputs:
+  status_after_reject: decided        # NOT archived (the bug this locks out)
+  direction_observations: 1
+  tasks_after_reactivation: 2         # the original + the fresh dispatch
+  direction_fetch_url: https://example.com/docs
+  synthesis_context_marker: fixture-direction-marker

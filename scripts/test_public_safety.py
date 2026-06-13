@@ -93,11 +93,13 @@ def _run() -> int:
         # DATABASE_URL point nowhere; backend() still reads them, which is
         # exactly what we audit.
         rt = build_lab(
-            # max_total=5: under ADR-014 the digest drafts once, so the
-            # session makes few LLM calls — 5 leaves plan one proposal and
+            # max_total=6: under ADR-014 the digest drafts once, so the
+            # session makes few LLM calls — 6 leaves plan one proposal and
             # still exhausts mid-run (each keyed live finding adds a call;
-            # paused-boot and model-parameter-compatibility did).
-            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=5,
+            # paused-boot and model-parameter-compatibility did, and the
+            # seeded branch's gap-blocked task now spends one interpret call
+            # too — blocked is an outcome since the branch#64 fix).
+            llm_provider=LabProviderWrapper(LabMockProvider(), max_total=6,
                                             prompt_bodies=_lab_prompt_bodies()),
             lab_settings=LabSettings(drafts_dir=tempfile.mkdtemp()),
             fetch_handler=fetch)

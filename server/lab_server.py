@@ -211,7 +211,22 @@ def _rebuild_lab_registries(rt) -> None:
         if b.data.get("status") != "archived":
             open_count += 1
     lb._BRANCH_COUNT["open"] = open_count
+    # ADR-027: rejected promotes carry continuation direction. Legacy
+    # rejections (pre-ADR-027, e.g. decision#266) recorded the rationale on
+    # the decision but never got an operator_direction observation; the
+    # registry reads BOTH shapes so the recorded teaching is reachable —
+    # no events are appended (ADR-026's no-backfill stance: the log stays
+    # honest; only the cache learns to read what is already there).
+    legacy_directions: dict[str, list[tuple[str, str]]] = {}
     for d in g.objects(type="decision"):
+        if (d.data.get("kind") == "promote"
+                and d.data.get("status") == "rejected"):
+            rationale = ((d.data.get("metadata") or {})
+                         .get("resolution_rationale") or "").strip()
+            subject = d.data.get("subject_ref") or ""
+            if rationale and subject:
+                legacy_directions.setdefault(subject, []).append(
+                    (str(d.id), rationale))
         if d.data.get("status") == "pending":
             lb._PENDING_BY_SUBJECT[d.data.get("subject_ref", "")] = d.id
             lb.index_pending_decision(g, d.id, d.data)  # by branch (ADR-025)
@@ -230,6 +245,7 @@ def _rebuild_lab_registries(rt) -> None:
                 "seam_name": meta.get("seam_name"),
                 # ADR-026: the operator's resolution reason survives resume.
                 "resolution_rationale": meta.get("resolution_rationale")})
+    covered_direction_decisions: set[str] = set()
     # 5a: observation provenance — actor + timestamp from each object.created
     # event (replay rebuilds objects, not the in-process provenance registry).
     created_by: dict[str, tuple[str, str]] = {}
@@ -243,6 +259,12 @@ def _rebuild_lab_registries(rt) -> None:
         meta = o.data.get("metadata") or {}
         if meta.get("lab") == "capability_gap" and meta.get("task_id"):
             lb._GAP_CHECKED.add(meta["task_id"])
+        if meta.get("lab") == "operator_direction" and meta.get("lab_branch_id"):
+            # ADR-027: continuation directions survive resume — objects are
+            # creation-ordered, so the latest direction stays last.
+            lb._OPERATOR_DIRECTIONS.setdefault(
+                str(meta["lab_branch_id"]), []).append(o.data.get("text") or "")
+            covered_direction_decisions.add(str(meta.get("decision_id") or ""))
         if meta.get("lab") == "site_claim":
             lb._PLANNED_OBS.add(o.id)
         if meta.get("lab"):
@@ -268,6 +290,15 @@ def _rebuild_lab_registries(rt) -> None:
                 lb._COVERED_FINDINGS.add(f)
             if meta.get("requested_by") == "lab.gate" and meta.get("lab_branch_id"):
                 lb._RESEARCH_REQUESTED.add(meta["lab_branch_id"])
+    # Legacy directions (decision metadata only, no observation) PREPEND:
+    # they predate every observation-recorded direction, so "latest" — the
+    # one dispatch stamps — stays correct.
+    for branch_id, entries in legacy_directions.items():
+        older = [r for d_id, r in entries
+                 if d_id not in covered_direction_decisions]
+        if older:
+            lb._OPERATOR_DIRECTIONS[branch_id] = (
+                older + lb._OPERATOR_DIRECTIONS.get(branch_id, []))
     for e in g.objects(type="evaluation"):
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "task_outcome" and meta.get("task_id"):
@@ -617,6 +648,8 @@ DEFAULT_TEMPLATES = {
     "seam_proposal_request": "{short_text}",
     "seam_proposal_failed": "{short_text}",
     "decision_annotation": "Operator note (via MCP): “{short_text}”",
+    "operator_direction": "Operator direction recorded for the continuation: “{short_text}”",
+    "branch_activated": "{short_text}",
 }
 
 

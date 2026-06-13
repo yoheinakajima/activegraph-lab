@@ -510,8 +510,12 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
         reply_wait = _reply_wait_seconds(rt.graph)
     if status is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
-    if status == "archived":
-        return _tool_failure(msg_id, f"branch {branch_id} is archived (not chat-able)")
+    # ADR-027: archived branches ARE chat-able — for the activate verb
+    # (operator resurrection); the answer behavior refuses everything else
+    # by name and states the archive honestly. The old hard refusal here was
+    # the production wall between decision#266's continuation direction and
+    # branch#62 (evt_13850): the surface that recorded the teaching could
+    # not deliver the resurrection.
     reset_llm_run_counters()
     try:
         posted = run_on_worker(

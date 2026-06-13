@@ -106,10 +106,15 @@ def _source_urls(graph, task_data: dict, cap: int) -> list[str]:
     """Candidate sources for a research task, deduped and capped: the
     branch's claim observation URL, the mission's target URL, and any URLs
     written into the task description / claim text (the operator can steer
-    sources by mentioning links)."""
+    sources by mentioning links). An operator_direction on the task
+    (ADR-027) is scanned the same way — direction URLs come FIRST: the
+    operator named them deliberately, so the fetch cap must not starve them
+    behind the defaults."""
     meta = task_data.get("metadata") or {}
-    texts = [task_data.get("description") or ""]
-    candidates: list[str] = []
+    texts = [task_data.get("description") or "",
+             meta.get("activation_message") or ""]
+    direction = (meta.get("operator_direction") or "").strip()
+    candidates: list[str] = _URL_RE.findall(direction) if direction else []
     branch = graph.get_object(meta.get("lab_branch_id")) \
         if meta.get("lab_branch_id") else None
     if branch is not None:
@@ -222,7 +227,10 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
             return
         from .behaviors import _ensure_web_provider, _now
         state = {"pending": set(), "sources": [], "failed": [],
-                 "branch_id": branch_id, "cap": cap}
+                 "branch_id": branch_id, "cap": cap,
+                 # ADR-027: the operator's continuation direction rides from
+                 # the dispatched task into the synthesis request VERBATIM.
+                 "direction": (meta.get("operator_direction") or "").strip()}
         _TASKS[obj_id] = state
         for url in urls:
             # github.com sources route to the read-only GitHub tools
@@ -294,19 +302,30 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
     _SYNTH_REQUESTED.add(task_id)
     task = graph.get_object(task_id)
     intent = (task.data.get("description") or "") if task is not None else ""
+    text = (f"Research synthesis request: synthesize "
+            f"{len(state['sources'])} fetched source(s) for task "
+            f"'{task.data.get('title') if task else task_id}'. Every "
+            "finding must attribute the source URL(s) it rests on.")
+    meta = {"lab": "research_synthesis_request",
+            "task_id": task_id,
+            "lab_branch_id": state["branch_id"],
+            "intent": intent[:300],
+            "sources": state["sources"],
+            "failed_fetches": state["failed"]}
+    direction = state.get("direction") or ""
+    if direction:
+        # The worker must be able to read what the operator ordered: the
+        # direction rides whole in the request's metadata AND as a delimited
+        # block in the text the model's view serializes (ADR-027 — the seam
+        # truncation lesson: an excerpt here IS a truncation in the output).
+        meta["operator_direction"] = direction
+        text += ("\n\nOPERATOR DIRECTION (verbatim — this direction governs "
+                 "source selection and synthesis focus):\n" + direction)
     graph.add_object("observation", {
-        "text": (f"Research synthesis request: synthesize "
-                 f"{len(state['sources'])} fetched source(s) for task "
-                 f"'{task.data.get('title') if task else task_id}'. Every "
-                 "finding must attribute the source URL(s) it rests on."),
+        "text": text,
         "confidence": 1.0,
         "category": "fact",
-        "metadata": {"lab": "research_synthesis_request",
-                     "task_id": task_id,
-                     "lab_branch_id": state["branch_id"],
-                     "intent": intent[:300],
-                     "sources": state["sources"],
-                     "failed_fetches": state["failed"]},
+        "metadata": meta,
     })
 
 

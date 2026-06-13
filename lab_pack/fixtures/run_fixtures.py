@@ -258,6 +258,23 @@ def run_branch_lifecycle() -> bool:
         c.that(results.get(bspec["key"]) == bspec["expected_final_status"],
                f"{bspec['key']}: expected final status {bspec['expected_final_status']}, "
                f"got {results.get(bspec['key'])}")
+    # ADR-027: nothing archived; the reject rationale is an operator_direction
+    # observation linked supported_by into the rejected branch's evidence.
+    c.that(not [b for b in g.objects(type="branch")
+                if b.data.get("status") == "archived"],
+           "no branch is archived by a rejection (ADR-027)")
+    directions = _lab_obs(g, "operator_direction")
+    c.that(len(directions) == exp["operator_direction_observations"]["count"],
+           f"reject rationale recorded as operator_direction "
+           f"({len(directions)})")
+    if directions:
+        d_meta = directions[0].data.get("metadata") or {}
+        c.that(directions[0].data.get("text") == "fixture: reject"
+               and any(str(r.type) == "supported_by"
+                       and str(r.source) == d_meta.get("lab_branch_id")
+                       and str(r.target) == directions[0].id
+                       for r in g.relations()),
+               "direction carries the rationale verbatim, linked to the branch")
     return c.done("branch_lifecycle")
 
 
@@ -605,6 +622,44 @@ def run_capability_gap() -> bool:
                   if str(r.type) == "supported_by" and str(r.source) == branch.id
                   and gaps and str(r.target) == gaps[0].id]
         c.that(bool(linked), "gap observation not linked supported_by to the branch")
+
+    # The branch#64 silent path, closed: blocked is an outcome. The gap rides
+    # the blocked patch as result_summary → task_outcome evaluation
+    # (judgment=blocked) → interpret fires → pending promote decision.
+    outcomes = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "task_outcome"]
+    c.that(len(outcomes) == exp["task_outcome_evaluations"]["count"]
+           and outcomes[0].data.get("judgment")
+           == exp["task_outcome_evaluations"]["judgment"]
+           and "Capability gap" in (outcomes[0].data.get("rationale") or ""),
+           f"blocked task yields a task_outcome evaluation carrying the gap "
+           f"({[e.data.get('judgment') for e in outcomes]})")
+    pend = [d for d in g.objects(type="decision")
+            if d.data.get("kind") == "promote"
+            and d.data.get("subject_ref") == branch.id
+            and d.data.get("status") == "pending"]
+    c.that(len(pend) == exp["pending_promote_decisions"]["count"]
+           and bool(_lab_obs(g, "interpretation")),
+           f"interpret fired on the gap outcome → pending promote decision "
+           f"({len(pend)} pending)")
+    c.that(g.get_object(branch.id).data.get("status") == "interpreting",
+           "the branch reaches interpreting — not a silent dangling active")
+    print(f"  loop closed: gap → evaluation(blocked) → interpret → "
+          f"{len(pend)} pending promote decision")
+
+    # The branch#64 misroute (the same substring family as ADR-025's verbs):
+    # a claim DESCRIPTION mentioning implementation routes research; a real
+    # code-action intent still routes codebase.
+    from lab_pack.behaviors import _routing_for_intent
+    prod_intent = ("Verify that activegraph actually implements a shared "
+                   "graph structure with the claimed components (beliefs, "
+                   "tasks, evidence, decisions, dependencies) and confirm "
+                   "it's derived from an append-only event log.")
+    c.that(_routing_for_intent(prod_intent)["domain"] == "research",
+           "branch#64's production intent now routes research (word boundary)")
+    c.that(_routing_for_intent("Implement code in the repo to test the parser "
+                               "end to end.")["domain"] == "codebase",
+           "a real code-action intent still routes codebase")
     return c.done("capability_gap")
 
 
@@ -752,6 +807,25 @@ def run_draft_writer() -> bool:
                and not any(d.data.get("subject_ref") == a.id and d.data.get("status") == "approved"
                            for d in pubs)]
         c.that(not bad, f"artifacts published without approved decision: {bad}")
+
+    # ── orphan-footnote guard (artifact#718 shipped an unused [^1]) ─────────
+    from lab_pack.behaviors import _coverage_review
+    orphan_note = _coverage_review(
+        "A paragraph that cites its evidence.[^1]\n\n"
+        "[^1]: observation#1\n[^2]: observation#2\n") or ""
+    orphan_line = next((l for l in orphan_note.splitlines()
+                        if "orphan footnotes" in l), "")
+    c.that("[^2]" in orphan_line and "[^1]" not in orphan_line,
+           f"defined-but-uncited footnote flagged, cited one not "
+           f"({orphan_line[:80]!r})")
+    clean = _coverage_review(
+        "A paragraph that cites its evidence.[^1]\n\n[^1]: observation#1\n")
+    c.that(not clean or "orphan footnotes" not in clean,
+           "a fully cited body draws no orphan note")
+    c.that(all("Review note (orphan footnotes)" not in (a.data.get("content") or "")
+               for a in drafts),
+           "generated drafts cite every footnote they define")
+    print("  orphan guard: [^2] flagged, [^1] clean")
     return c.done("draft_writer")
 
 
@@ -890,6 +964,44 @@ def run_editorial() -> bool:
     c.that(len(drafts()) == n_drafts + 1,
            f"operator request bypasses the pending cap ({len(drafts())})")
     print(f"  D: operator 'draft' in chat → draft despite the cap")
+
+    # ── E: an operator BRIEF governs scope (the evt_13857 compression) ──────
+    # The drafting message used to survive only as 160 chars of rationale —
+    # observation#714 answered a commissioned narrative with a 14-finding
+    # digest. Now the full message rides verbatim (metadata + an OPERATOR
+    # BRIEF block in the request text), and evidence ids the brief names
+    # become the draft's footnote set: queued findings are available
+    # evidence, not the mandatory skeleton.
+    rich_ev = [str(r.target) for r in g.relations()
+               if str(r.type) == "supported_by" and str(r.source) == rich.id]
+    named, unnamed = rich_ev[:2], rich_ev[2:]
+    brief = ("Draft a research post focused ONLY on the replay verification "
+             f"arc, for a reader who has never seen this lab: build it "
+             f"around {named[0]} and {named[1]}. The other findings are "
+             "background evidence, not the skeleton.")
+    n_before_brief = len(drafts())
+    send_branch_message_fn(g, rich.id, brief)
+    rt.run_until_idle()
+    req = requests()[-1]
+    rmeta = req.data.get("metadata") or {}
+    c.that(rmeta.get("operator_brief") == brief,
+           f"the draft request stores the operator's message IN FULL "
+           f"({len(str(rmeta.get('operator_brief')))} of {len(brief)} chars)")
+    c.that("OPERATOR BRIEF" in (req.data.get("text") or "")
+           and "not a mandatory skeleton" in (req.data.get("text") or ""),
+           "the request text carries the delimited OPERATOR BRIEF block")
+    c.that(len(drafts()) == n_before_brief + 1, "briefed draft created")
+    briefed_body = drafts()[-1].data.get("content") or ""
+    c.that(all(f"]: {e}" in briefed_body for e in named),
+           f"the draft's footnotes are the evidence the brief names ({named})")
+    c.that(unnamed and all(f"]: {e}" not in briefed_body for e in unnamed),
+           "unnamed branch evidence stays available, not footnoted by default")
+    digest_meta = requests()[0].data.get("metadata") or {}
+    c.that("operator_brief" not in digest_meta
+           and "OPERATOR BRIEF" not in (requests()[0].data.get("text") or ""),
+           "the briefless digest path is unchanged")
+    print(f"  E: operator brief verbatim → draft scoped to {named}, "
+          "digest path untouched")
 
     c.that(len(drafts()) == exp["blog_drafts_total"],
            f"expected {exp['blog_drafts_total']} drafts total, got {len(drafts())}")
@@ -1947,7 +2059,16 @@ def run_research_worker() -> bool:
            and t_gap is not None and t_gap.data.get("status") == "blocked",
            f"codebase routing untouched: gap recorded, task blocked "
            f"({len(gaps)})")
-    print("  unhandled: codebase routing → gap, task blocked")
+    # Phase 3 (branch#64): blocked is an outcome — even with the worker
+    # loaded, an unhandled routing surfaces a promote decision instead of
+    # dangling silently.
+    c.that(g.get_object(b_gap.id).data.get("status") == "interpreting"
+           and any(d.data.get("kind") == "promote"
+                   and d.data.get("subject_ref") == b_gap.id
+                   and d.data.get("status") == "pending"
+                   for d in g.objects(type="decision")),
+           "gap-blocked branch reaches interpret → pending promote decision")
+    print("  unhandled: codebase routing → gap, task blocked → decision surfaces")
 
     # ── ADR-025 Phase 2: operator activates a proposed branch over MCP; the
     # EXISTING dispatch reacts and the worker runs end to end ───────────────
@@ -1982,13 +2103,257 @@ def run_research_worker() -> bool:
     c.that(ev is not None and str(ev.type) == "lab.steering_applied"
            and ev.payload.get("verb") == "activate",
            "the reply cites the activation's steering event")
-    # deactivate reverts cleanly (the unhandled branch is still active)
-    send_branch_message_fn(g, b_gap.id, "deactivate this branch")
-    rt.run_until_idle()
-    c.that(g.get_object(b_gap.id).data.get("status") == "proposed",
-           "deactivate reverts an active branch to proposed")
-    print("  ADR-025: MCP activate → e2e worker run; deactivate reverts")
+    # deactivate (active → proposed) stays covered by truthful_steering: with
+    # blocked-as-outcome no branch here remains plain `active` to revert.
+    print("  ADR-025: MCP activate → e2e worker run")
     return c.done("research_worker")
+
+
+def run_rejection_lifecycle() -> bool:
+    spec = _load("rejection_lifecycle.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: rejection_lifecycle — reject teaches: decided + direction, "
+          "reactivate dispatches it verbatim (ADR-027)")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from server.lab_server import _rebuild_lab_registries
+
+    pages = spec["pages"]
+
+    def canned_fetch(url: str, **_kw) -> dict:
+        clean = url.rstrip("/")
+        for key, html in pages.items():
+            if key.rstrip("/") == clean:
+                return {"url": url, "status": 200, "content": html}
+        return {"url": url, "status": 404, "content": "", "error": "404"}
+
+    class RecordingProvider:
+        """Delegates to the mock, recording each call's full assembled
+        context per output schema — the mock-assert surface for 'the worker
+        could READ the operator direction'."""
+        default_model = LabMockProvider.default_model
+
+        def __init__(self):
+            self.inner = LabMockProvider()
+            self.contexts: list[tuple[str, str]] = []
+
+        def complete(self, **kw):
+            name = getattr(kw.get("output_schema"), "__name__", "")
+            blob = str(kw.get("system") or "") + " " + " ".join(
+                str(getattr(m, "content", m)) for m in (kw.get("messages") or []))
+            self.contexts.append((name, blob))
+            return self.inner.complete(**kw)
+
+        def estimate_cost(self, **kw):
+            return self.inner.estimate_cost(**kw)
+
+        def count_tokens(self, **kw):
+            return self.inner.count_tokens(**kw)
+
+        def recognizes_model(self, name):
+            return True
+
+    clear_lab_registry()
+    provider = RecordingProvider()
+    rt = Runtime(Graph(), llm_provider=provider)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(tg_pack, settings=ToolGatewaySettings())
+    rt.load_pack(comm_pack, settings=CommunicationSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
+    register_web_fetch(canned_fetch, overwrite=True)
+    g = rt.graph
+    c = Check()
+    exp = spec["expected_outputs"]
+    direction = spec["direction"].strip()
+
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    bspec = spec["branch"]
+    branch = create_branch_fn(g, mission.id, bspec["title"],
+                              bspec["intent"].strip(), status="active")
+    rt.run_until_idle()
+
+    def tasks():
+        return [t for t in g.objects(type="task")
+                if (t.data.get("metadata") or {}).get("lab_branch_id")
+                == branch.id]
+
+    def pending_promote():
+        return [d for d in g.objects(type="decision")
+                if d.data.get("kind") == "promote"
+                and d.data.get("subject_ref") == branch.id
+                and d.data.get("status") == "pending"]
+
+    # ── run 1: worker completes, promote decision pends ─────────────────────
+    c.that(len(tasks()) == 1 and tasks()[0].data.get("status") == "done",
+           "first worker run completed")
+    pend = pending_promote()
+    c.that(len(pend) == 1, f"promote decision pending ({len(pend)})")
+
+    # ── REJECT with direction: decided + direction evidence, NOT archived ──
+    approve_decision_fn(g, pend[0].id, False, direction)
+    rt.run_until_idle()
+    c.that(g.get_object(branch.id).data.get("status")
+           == exp["status_after_reject"],
+           f"rejected promote → {exp['status_after_reject']}, never archived "
+           f"(got {g.get_object(branch.id).data.get('status')})")
+    dirs = [o for o in _lab_obs(g, "operator_direction")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+    c.that(len(dirs) == exp["direction_observations"]
+           and dirs[0].data.get("text") == direction
+           and (dirs[0].data.get("metadata") or {}).get("decision_id")
+           == pend[0].id,
+           "the resolution_rationale is an operator_direction observation, "
+           "verbatim, citing its decision")
+    c.that(any(str(r.type) == "supported_by" and str(r.source) == branch.id
+               and str(r.target) == dirs[0].id for r in g.relations()),
+           "the direction sits in the branch's evidence (supported_by)")
+    print(f"  reject → decided + direction obs {dirs[0].id if dirs else '?'} "
+          "(not archived)")
+
+    # ── the registry survives a resume rebuild — both direction shapes ─────
+    # A LEGACY rejection (pre-ADR-027, the decision#266 shape): the rationale
+    # sits on the decision metadata with NO operator_direction observation.
+    # The rebuild reads it too — no events appended, the cache learns to
+    # read what is already there — so branch#62's recorded teaching is
+    # reachable after redeploy.
+    legacy_branch = create_branch_fn(g, mission.id, "Legacy-rejected inquiry",
+                                     "verify the diff claim")
+    g.add_object("decision", {
+        "subject_ref": legacy_branch.id, "kind": "promote",
+        "status": "rejected", "rationale": "proposer pitch",
+        "evidence_refs": [],
+        "metadata": {"resolved_by": "operator",
+                     "resolution_rationale": "legacy direction: fetch the "
+                                             "primary docs next time"},
+    })
+    saved_contexts = list(provider.contexts)
+    clear_lab_registry()
+    _rebuild_lab_registries(rt)
+    provider.contexts = saved_contexts
+    c.that((lb._OPERATOR_DIRECTIONS.get(branch.id) or [])[-1:] == [direction],
+           "operator direction survives the resume rebuild")
+    c.that((lb._OPERATOR_DIRECTIONS.get(legacy_branch.id) or [])
+           == ["legacy direction: fetch the primary docs next time"],
+           "a pre-ADR-027 rejection's rationale rebuilds from decision "
+           "metadata (the decision#266 shape)")
+
+    # ── reactivate via chat: cited steering, fresh dispatch WITH direction ──
+    _, msg = send_branch_message_fn(
+        g, branch.id,
+        "Activate this branch. Rationale: continue under the rejection "
+        "direction.", source="operator_via_mcp")
+    rt.run_until_idle()
+    cand = next((x for x in g.objects(type="comm_response_candidate")
+                 if x.data.get("message_id") == msg.id), None)
+    reply = (cand.data.get("content") or "") if cand else ""
+    m = re.search(r"recorded at (evt_\w+)", reply)
+    ev = next((e for e in g.events if str(e.id) == (m.group(1) if m else "")),
+              None)
+    c.that(ev is not None and str(ev.type) == "lab.steering_applied"
+           and ev.payload.get("verb") == "activate"
+           and (ev.payload.get("refs") or {}).get("previous_status") == "decided",
+           "activate on a DECIDED branch applies and is steering_applied-cited")
+    c.that("operator direction on record rides with the task" in reply,
+           "the reply says the direction travels")
+    c.that(len(tasks()) == exp["tasks_after_reactivation"],
+           f"reactivation dispatched a FRESH task "
+           f"({len(tasks())} of {exp['tasks_after_reactivation']})")
+    task2 = tasks()[-1]
+    c.that((task2.data.get("metadata") or {}).get("operator_direction")
+           == direction,
+           "the dispatched task carries the operator direction VERBATIM")
+
+    # ── the worker reads and follows the direction ───────────────────────────
+    c.that(task2.data.get("status") == "done", "second worker run completed")
+    calls2 = [x for x in g.objects(type="capability_call")
+              if (x.data.get("metadata") or {}).get("task_id") == task2.id]
+    c.that(any((x.data.get("input_data") or {}).get("url", "").rstrip("/")
+               == exp["direction_fetch_url"].rstrip("/") for x in calls2),
+           f"the direction's named source was fetched "
+           f"({[(x.data.get('input_data') or {}).get('url') for x in calls2]})")
+    synth = [o for o in _lab_obs(g, "research_synthesis_request")
+             if (o.data.get("metadata") or {}).get("task_id") == task2.id]
+    c.that(bool(synth)
+           and (synth[0].data.get("metadata") or {}).get("operator_direction")
+           == direction
+           and "OPERATOR DIRECTION" in (synth[0].data.get("text") or ""),
+           "the synthesis request carries the direction whole + the block")
+    marker = exp["synthesis_context_marker"]
+    synth_ctx = [blob for name, blob in provider.contexts
+                 if name == "ResearchSynthesis"]
+    c.that(bool(synth_ctx) and marker in synth_ctx[-1],
+           "the worker's ACTUAL synthesis context contains the direction "
+           "(mock-asserted)")
+    c.that(len(pending_promote()) == 1,
+           "the continuation surfaced a fresh promote decision")
+    print(f"  reactivate → task {task2.id} carries the direction; worker "
+          f"fetched {exp['direction_fetch_url']}; context mock-asserted")
+
+    # ── archived → active is a recorded resurrection; all else refused ──────
+    aspec = spec["archived_branch"]
+    legacy = create_branch_fn(g, mission.id, aspec["title"],
+                              aspec["intent"].strip(), status="proposed")
+    g.patch_object(legacy.id, {"status": "archived"})  # pre-ADR-027 archive
+    rt.run_until_idle()
+    _, q = send_branch_message_fn(g, legacy.id, "what happened here?")
+    rt.run_until_idle()
+    qc = next((x for x in g.objects(type="comm_response_candidate")
+               if x.data.get("message_id") == q.id), None)
+    c.that(qc is not None and "archived" in (qc.data.get("content") or ""),
+           "a question on an archived branch states the archive honestly")
+    _, ref = send_branch_message_fn(g, legacy.id, "draft this up please")
+    rt.run_until_idle()
+    rc = next((x for x in g.objects(type="comm_response_candidate")
+               if x.data.get("message_id") == ref.id), None)
+    rtext = (rc.data.get("content") or "") if rc else ""
+    c.that("archived" in rtext and "activate" in rtext
+           and not [r_ for r_ in _lab_obs(g, "draft_request")
+                    if (r_.data.get("metadata") or {}).get("lab_branch_id")
+                    == legacy.id],
+           "non-activate verbs on an archived branch are refused by name")
+    _, res = send_branch_message_fn(
+        g, legacy.id, "Activate this branch. Rationale: resurrecting the "
+        "fork inquiry deliberately. Fetch https://example.com/docs as well.",
+        source="operator_via_mcp")
+    rt.run_until_idle()
+    c.that(g.get_object(legacy.id).data.get("status") in
+           ("active", "interpreting"),
+           f"archived → active resurrection works "
+           f"({g.get_object(legacy.id).data.get('status')})")
+    # URLs in the activation message steer the worker's sources — the
+    # mechanism the branch#62 resurrection needs (decision#266's direction
+    # named its sources without schemes).
+    legacy_task = next((t for t in g.objects(type="task")
+                        if (t.data.get("metadata") or {}).get("lab_branch_id")
+                        == legacy.id), None)
+    legacy_calls = [(x.data.get("input_data") or {}).get("url", "")
+                    for x in g.objects(type="capability_call")
+                    if (x.data.get("metadata") or {}).get("task_id")
+                    == (legacy_task.id if legacy_task else None)]
+    c.that(any(u.rstrip("/") == "https://example.com/docs"
+               for u in legacy_calls),
+           f"the activation message's URL was fetched ({legacy_calls})")
+    acts = [o for o in _lab_obs(g, "branch_activated")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == legacy.id]
+    c.that(len(acts) == 1
+           and (acts[0].data.get("metadata") or {}).get("resurrected") is True
+           and "resurrected" in (acts[0].data.get("text") or ""),
+           "the resurrection is recorded as a deliberate operator act")
+    rcand = next((x for x in g.objects(type="comm_response_candidate")
+                  if x.data.get("message_id") == res.id), None)
+    rm = re.search(r"recorded at (evt_\w+)",
+                   (rcand.data.get("content") or "") if rcand else "")
+    rev = next((e for e in g.events
+                if str(e.id) == (rm.group(1) if rm else "")), None)
+    c.that(rev is not None and rev.payload.get("verb") == "activate"
+           and (rev.payload.get("refs") or {}).get("previous_status")
+           == "archived",
+           "the resurrection cites its steering_applied event")
+    print("  archived: question → honest notice; draft → refusal; "
+          "activate → recorded resurrection")
+    return c.done("rejection_lifecycle")
 
 
 def run_model_routing() -> bool:
@@ -2614,6 +2979,7 @@ def run_all() -> None:
         run_thread_equals_branch(),
         run_truthful_steering(),
         run_capability_gap(),
+        run_rejection_lifecycle(),
         run_draft_writer(),
         run_editorial(),
         run_operator_controls(),
