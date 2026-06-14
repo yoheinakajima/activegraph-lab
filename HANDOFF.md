@@ -23,10 +23,11 @@ Setup: `uv pip install --system -e .` (plain pip can't resolve activegraph-packs
       via _submit_to_worker; removed _reply_wait_seconds. mcp_reply_wait_seconds
       RETIRED IN PLACE (no-op; kernel whitelist NOT edited — kept untouchable).
       Updated test_mcp, test_chat_robustness, test_oauth. GREEN.
-- [ ] PHASE 3 — pin "accident became policy" properties: (a) daily budget cap
-      rebuilds across restart; (b) seam cannot activate except via gate-approved
-      hot-load. Named regression tests. Seed a keyed finding. REPORT if a
-      property does NOT hold.
+- [x] PHASE 3 — pinned both properties; BOTH HELD UNDER TEST. New fixtures
+      budget_cap_restart (blocked attempts counted, cap survives restart) +
+      seam_no_bypass (only gate approval activates a seam). Keyed finding
+      accident_became_policy_pinned added to LIVE_FINDINGS. Fixtures 29→31.
+      No ADR (no invariant moved; pins ADR-012/015/019). GREEN.
 - [ ] PHASE 4 — operator_note/annotate reachability over MCP (finish ADR-028).
       Verify bare branch-annotate over MCP exists; add if not (operator-tier,
       records operator_note observation, no status change).

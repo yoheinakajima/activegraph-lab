@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Pinned two "accident became policy" safety properties (Phase 3) with named
+  regression fixtures — a beneficial accident is one refactor from gone
+  unless a test pins it. (1) `budget_cap_restart`: the daily budget cap
+  rebuilds correctly across a restart WITH blocked attempts counted (a
+  cost-capped LLM attempt logs an llm.requested event before the provider
+  returns inert; sync_daily_budget rebuilds the count from those log events,
+  not the in-session counter — so bouncing the process cannot reset the cap).
+  (2) `seam_no_bypass`: a seam cannot activate except through a gate-approved
+  hot-load (a proposed-but-unapproved seam is inert through proposal, the
+  gate's approval-request, and a simulated boot rebuild; live ONLY on
+  approval). Both properties HELD under test. New keyed finding
+  `accident_became_policy_pinned` (LIVE_FINDINGS) records that they are now
+  pinned. No runtime change. Fixture count 29 → 31.
+
 - MCP send_chat is commit-and-return (ADR-034): a successful comm_message
   append now returns `status=accepted` with the committed message event ids
   IMMEDIATELY — no bounded reply wait, never a timeout error after a

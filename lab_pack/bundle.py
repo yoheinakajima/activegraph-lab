@@ -374,6 +374,30 @@ LIVE_FINDINGS: list[dict] = [
             "lab's own investigation branch."
         ),
     },
+    {
+        "key": "accident_became_policy_pinned",
+        "text": (
+            "Finding: two of the lab's safety properties began life as "
+            "beneficial ACCIDENTS — the published posts described them as "
+            "durable features, but a beneficial accident is one refactor from "
+            "gone unless a test pins it. Both are now pinned by named "
+            "regression tests (Phase 3). (1) The daily budget cap rebuilds "
+            "correctly across a restart WITH blocked attempts counted: a "
+            "cost-capped LLM attempt is logged as an llm.requested event "
+            "before the provider returns inert, and sync_daily_budget rebuilds "
+            "the used-count from those log events — not the in-session "
+            "counter, which never increments for blocked calls — so bouncing "
+            "the process cannot reset the cap (fixture budget_cap_restart). "
+            "(2) A seam cannot activate except through a gate-approved "
+            "hot-load: a proposed-but-unapproved seam is invisible to "
+            "resolution (full-graph scan honors only status=approved; "
+            "behaviors resolve cache-only, and the cache is written only by "
+            "hot_load on approval and apply_approved at boot) — it stays inert "
+            "through proposal, the gate's approval-request, and a simulated "
+            "boot, going live ONLY on approval (fixture seam_no_bypass). Both "
+            "properties HELD under test; the tests now keep them honest."
+        ),
+    },
 ]
 
 

@@ -1943,6 +1943,179 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_budget_cap_restart() -> bool:
+    spec = _load("budget_cap_restart.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: budget_cap_restart — the daily cap rebuilds across a "
+          "restart, blocked attempts counted (ADR-015/019, Phase 3)")
+    print("=" * 64)
+
+    from datetime import datetime, timezone
+    from lab_pack.behaviors import emit_lab_event
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, _lab_prompt_bodies,
+                              reset_llm_session, sync_daily_budget)
+
+    clear_lab_registry()
+    reset_llm_session()
+    cap = float(spec["cost_cap_usd"])
+    spend = float(spec["synthetic_spend"])
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=10, max_daily=200,
+                                 max_daily_cost_usd=cap,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt = Runtime(Graph(), llm_provider=wrapper)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def requested_today():
+        return [e for e in g.events if str(e.type) == "llm.requested"
+                and str(getattr(e, "timestamp", "") or "").startswith(today)]
+
+    def proposed():
+        return [b for b in g.objects(type="branch")
+                if b.data.get("status") == "proposed"]
+
+    # Push spend over the cap (native cost accounting, ADR-015), rebuild state.
+    emit_lab_event(g, "llm.responded", {"cost_usd": spend, "model": "fixture",
+                                        "behavior": "fixture"})
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           f"spend rebuilds over the cap from llm.responded "
+           f"(${float(_LLM_STATE['daily_cost']):.2f} >= ${cap:.2f})")
+
+    # Behaviors fire and are BLOCKED by the cost cap — each blocked attempt
+    # still emits an llm.requested event BEFORE the provider returns inert.
+    req_before = len(requested_today())
+    n_claims = int(spec["claims_after_cap"])
+    for i in range(n_claims):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id}})
+        rt.run_until_idle()
+    c.that(len(proposed()) == 0,
+           f"cost cap blocks plan — no branches proposed ({len(proposed())})")
+    blocked_reqs = len(requested_today()) - req_before
+    c.that(blocked_reqs >= n_claims,
+           f"each blocked attempt still logged an llm.requested event "
+           f"({blocked_reqs} for {n_claims} blocked claims)")
+    # The in-session counter does NOT increment for blocked calls — so the
+    # only way the count survives a restart is the log rebuild. This is the
+    # accident-became-policy property: the count lives in the log.
+    c.that(_LLM_STATE["daily_used"] < len(requested_today()),
+           f"in-session daily_used ({_LLM_STATE['daily_used']}) is BEHIND the "
+           f"logged llm.requested count ({len(requested_today())}) — blocked "
+           "attempts only count via the log rebuild")
+
+    # THE PROPERTY: restart (reset session + rebuild from the log).
+    reset_llm_session()
+    c.that(_LLM_STATE["daily_used"] == 0
+           and float(_LLM_STATE["daily_cost"]) == 0.0,
+           "restart clears in-process budget state")
+    used = sync_daily_budget(rt)
+    c.that(used == len(requested_today()),
+           f"daily_used rebuilds to the llm.requested count — blocked attempts "
+           f"included ({used})")
+    c.that(used >= blocked_reqs and used > 0,
+           "the blocked attempts are part of the rebuilt count")
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           "the cost cap is restart-proof: bouncing the process cannot reset it")
+
+    # …and it STAYS enforced after the restart: a fresh trigger is still blocked.
+    n_before = len(proposed())
+    g.add_object("observation", {
+        "text": "Post-restart claim: replay is deterministic for sure.",
+        "confidence": 0.7, "category": "fact",
+        "metadata": {"lab": "site_claim", "mission_id": mission.id}})
+    rt.run_until_idle()
+    c.that(len(proposed()) == n_before,
+           "post-restart: the rebuilt cap still blocks new LLM work")
+    print(f"  {blocked_reqs} blocked attempts logged; restart rebuilds "
+          f"daily_used={used}, cost=${float(_LLM_STATE['daily_cost']):.2f} >= "
+          f"${cap:.2f}; cap holds")
+    return c.done("budget_cap_restart")
+
+
+def run_seam_no_bypass() -> bool:
+    spec = _load("seam_no_bypass.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seam_no_bypass — a seam cannot activate except through a "
+          "gate-approved hot-load (ADR-012, Phase 3)")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.seams import (active_version, apply_approved, clear_seam_cache,
+                                propose_seam_fn, resolve)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    create_mission_fn(g, "No-bypass mission", target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    seam_name = spec["seam_name"]
+    marker = spec["file_default_marker"]
+    plan_b = next(b for b in lb.BEHAVIORS if b.name == "plan")
+    file_default = plan_b.description
+    c.that(marker not in file_default,
+           "precondition: the seam body marker is not in the file default")
+
+    # Propose the seam → a DRAFT artifact + a PENDING self_modify decision.
+    art = propose_seam_fn(g, seam_name, spec["body"], "no-bypass fixture")
+    rt.run_until_idle()
+    c.that(g.get_object(art.id).data.get("status") == "draft",
+           f"proposed seam artifact is a draft, not approved "
+           f"({g.get_object(art.id).data.get('status')})")
+    pending = next((d for d in g.objects(type="decision")
+                    if d.data.get("kind") == "self_modify"
+                    and d.data.get("subject_ref") == art.id
+                    and d.data.get("status") == "pending"), None)
+    c.that(pending is not None, "a PENDING self_modify decision gates it")
+
+    # Bypass attempt 1 — resolution. A full-graph scan honors only approved
+    # artifacts; a behavior (cache-only) sees the file default on a miss.
+    c.that(resolve(g, seam_name, "FILE") == (0, "FILE"),
+           "full-graph resolve ignores the draft seam (file default)")
+    c.that(active_version(g, seam_name) == 0,
+           "active_version is 0 — nothing is live")
+    c.that(marker not in plan_b.description
+           and marker not in rt.get_behavior("lab.plan").description,
+           "the live behavior description still holds the file default")
+
+    # Bypass attempt 2 — the gate ran (approval-request emitted) but did NOT
+    # approve. The seam stays inert.
+    c.that(marker not in rt.get_behavior("lab.plan").description,
+           "the gate's approval-request does not activate the seam")
+
+    # Bypass attempt 3 — a simulated boot: apply_approved clears the cache and
+    # re-applies ONLY approved seams. The pending draft is not among them.
+    clear_seam_cache()
+    apply_approved(g)
+    c.that(resolve(g, seam_name, "FILE") == (0, "FILE")
+           and marker not in rt.get_behavior("lab.plan").description,
+           "a boot rebuild (apply_approved) does not load the unapproved seam")
+
+    # The ONLY path that activates it: a gate-approved decision → hot-load.
+    approve_decision_fn(g, pending.id, True, "fixture: approve the seam")
+    rt.run_until_idle()
+    c.that(g.get_object(art.id).data.get("status") == "approved",
+           "approval patches the artifact to approved")
+    c.that(rt.get_behavior("lab.plan").description.startswith(spec["body"]),
+           "ONLY after gate approval does the hot-load make the seam live")
+    c.that(active_version(g, seam_name) == 1,
+           "the now-active seam reports its version")
+    print("  draft seam inert through proposal, approval-request, and a boot "
+          "rebuild; live ONLY after gate approval")
+    return c.done("seam_no_bypass")
+
+
 def run_github_read() -> bool:
     spec = _load("github_read.yaml")
     print("\n" + "=" * 64)
@@ -3470,6 +3643,8 @@ def run_all() -> None:
         run_decision_rationale(),
         run_paused_boot(),
         run_seams(),
+        run_budget_cap_restart(),
+        run_seam_no_bypass(),
         run_charter(),
         run_model_routing(),
         run_model_params(),
