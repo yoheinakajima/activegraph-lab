@@ -1,0 +1,36 @@
+# Phase 1 (ADR-006 routing; extends ADR-025's routing contract): a task ROUTES
+# BY ITS ACTION, not by the nouns it mentions. Reading source to verify/check a
+# claim is research even when it names a repo, files, or tools; only an
+# imperative WRITE/MODIFY/GENERATE-code intent routes codebase. Locks the two
+# production misroutes — branch#847 (a verification task that NAMED the repo)
+# and branch#64 ("implements" describing the subject) — to research.
+cases:
+  - intent: >
+      Fetch the actual implementation files from the activegraph repo and
+      verify the replay claim against the source.
+    domain: research
+    note: branch#847 — the production misroute (verification that names the repo)
+  - intent: >
+      Verify that activegraph actually implements a shared graph structure with
+      the claimed components (beliefs, tasks, evidence, decisions) and confirm
+      it is derived from an append-only event log.
+    domain: research
+    note: branch#64 — "implements" describes the subject, not a command
+  - intent: Examine the get_file source and check the get_tree handler against the docs.
+    domain: research
+    note: reading source to check a claim — names tools, writes nothing
+  - intent: Survey the replay and forks pages for primary-source evidence.
+    domain: research
+    note: a plain research survey
+  - intent: Verify the code in the activegraph repo backs the claimed replay test.
+    domain: research
+    note: the word code is the noun here — reading to verify, not a write command
+  - intent: Write, refactor, and implement a new pack for the codebase.
+    domain: codebase
+    note: a genuine code-write task
+  - intent: Implement code in the repo to test the parser end to end.
+    domain: codebase
+    note: write code (the research_worker fixture's unhandled case)
+  - intent: Refactor the dispatch behavior module and add a new schema migration.
+    domain: codebase
+    note: modify code — a write verb acting on a code object

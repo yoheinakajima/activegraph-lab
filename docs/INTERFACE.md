@@ -22,6 +22,10 @@ Approve/reject open an optional rationale field (skippable; recorded on the reso
 
 The home view: reverse-chron entries projected from lab events via `GET /lab/feed`, grouped by branch. Each entry is one human sentence derived from event type + payload — template-based; LLM narration is a later branch. Pending decisions are pinned at the top — that is the inbox, not a separate page.
 
+## Branch listing
+
+`GET /lab/branches?status=<proposed|active|decided|archived|all>` (and the MCP READ tool `list_branches`) is a read-only projection of branch state — one row per branch (id, title, status, authority, intent, pending-decision count), newest first, optionally filtered by status. It exists so proposed branches can be enumerated and activated (via a chat `activate` message) without hand-fetching ids from the UI. Pure projection, public; the HTTP and MCP views share one function so they cannot drift.
+
 ## Event-horizon stamps
 
 Every answer is stamped with the last event it could see ("as of event N"). If work is in flight, the stamp tells the user how stale the answer might be.

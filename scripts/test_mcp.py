@@ -184,8 +184,8 @@ def main() -> int:
         s, b = rpc(base, "tools/list")
         tools = {t["name"] for t in (b.get("result") or {}).get("tools", [])}
         expected = {"get_status", "get_feed", "get_branch", "get_pending_decisions",
-                    "get_post", "list_posts", "list_seams", "get_errors",
-                    "get_log", "get_entity", "github_read",
+                    "get_post", "list_posts", "list_seams", "list_branches",
+                    "get_errors", "get_log", "get_entity", "github_read",
                     "send_chat", "set_budget", "pause_lab", "resume_lab",
                     "annotate_decision"}
         check(tools == expected,
@@ -247,6 +247,31 @@ def main() -> int:
         s, _, seams = call_tool(base, "list_seams")
         check("seams" in seams or "graph_code" in seams,
               f"list_seams projects the seams view ({list(seams)[:4]})")
+
+        # list_branches — parity with branch state, status filter, and
+        # byte-identical to GET /lab/branches (the HTTP/MCP no-drift contract).
+        s, _, allb = call_tool(base, "list_branches")
+        check(s == 200 and allb.get("status") == "all"
+              and allb.get("count") == len(allb.get("branches", []))
+              and any(b["id"] == seed_branch.id for b in allb.get("branches", [])),
+              f"list_branches lists every branch ({allb.get('count')})")
+        check(all(b.get("id") and b.get("status") for b in allb.get("branches", [])),
+              "every listed branch carries its id and status")
+        seed_status = next(b["status"] for b in allb["branches"]
+                           if b["id"] == seed_branch.id)
+        s, _, filt = call_tool(base, "list_branches", {"status": seed_status})
+        check(filt.get("status") == seed_status
+              and all(b["status"] == seed_status for b in filt.get("branches", []))
+              and any(b["id"] == seed_branch.id for b in filt.get("branches", [])),
+              f"status filter binds: only {seed_status} branches "
+              f"({filt.get('count')})")
+        s_http, http_b = http(base, f"/lab/branches?status={seed_status}", "GET", None)
+        check(s_http == 200 and http_b == filt,
+              "list_branches is byte-identical to GET /lab/branches (no drift)")
+        s, _, none = call_tool(base, "list_branches", {"status": "archived"})
+        check(none.get("count") == 0 or all(b["status"] == "archived"
+                                            for b in none.get("branches", [])),
+              "an unmatched status filter returns only matching branches")
 
         s, _, errs = call_tool(base, "get_errors")
         check(s == 200 and "errors" in errs and "note" in errs,
