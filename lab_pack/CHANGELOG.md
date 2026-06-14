@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- MCP send_chat is commit-and-return (ADR-034): a successful comm_message
+  append now returns `status=accepted` with the committed message event ids
+  IMMEDIATELY — no bounded reply wait, never a timeout error after a
+  successful append. The reply (answer behavior or a steering verb's
+  confirmation) runs fire-and-forget on the worker and is read via
+  get_branch. Supersedes the bounded-wait approach: `status=ok`-with-reply
+  and `status=reply_pending`-on-timeout are gone from the MCP path. Fixes the
+  recurring production timeouts (evt_14234, evt_16799) where the mutation
+  committed but the operator's call timed out under load. The
+  `mcp_reply_wait_seconds` setting is retired in place (a documented no-op;
+  kept to avoid a kernel-manifest edit). HTTP POST /chat is unchanged.
+
 - Overclaim lint in drafts (ADR-033): `draft_writer` gains a graph-grounded
   sibling to the coverage check (`behaviors._overclaim_review`). It flags
   overclaiming language the cited evidence contradicts — "independent" over

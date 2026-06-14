@@ -436,14 +436,13 @@ def main() -> int:
         s, _, out = call_tool(base, "send_chat",
                               {"branch_id": seed_branch.id,
                                "message": "what is the state of this branch?"})
-        check(s == 200 and out.get("status") == "ok"
-              and out.get("reply") and "as of event" in out["reply"],
-              "send_chat returns status=ok with the stamped reply")
-        check(out.get("event_horizon") is not None, "event horizon returned")
+        check(s == 200 and out.get("status") == "accepted",
+              "send_chat returns status=accepted immediately (ADR-034) "
+              f"({out.get('status') if isinstance(out, dict) else out})")
         check(len(out.get("message_event_ids", [])) >= 1,
               f"message event ids returned ({len(out.get('message_event_ids', []))})")
-        check(len(out.get("created_event_ids", [])) >= 1,
-              f"created event ids returned ({len(out.get('created_event_ids', []))})")
+        check("get_branch" in (out.get("detail") or ""),
+              "the accepted response points the caller to get_branch")
         msg = rt.graph.get_object(out["message_id"])
         check(msg is not None
               and (msg.data.get("metadata") or {}).get("source") == "operator_via_mcp",
@@ -451,15 +450,19 @@ def main() -> int:
         check(msg is not None and msg.data.get("sender_ref") == "operator",
               "sender is the operator (no client-chosen identity)")
         # ADR-016 invariant: the source tag is provenance, never an answer
-        # predicate — the via-MCP message drew exactly one lab.answer reply.
+        # predicate — the via-MCP message drew exactly one lab.answer reply
+        # (which ran on the worker, inline in test mode, after the call).
         mcp_cands = [c for c in rt.graph.objects(type="comm_response_candidate")
                      if str(c.data.get("message_id")) == str(out["message_id"])
                      and c.data.get("created_by_behavior") == "lab.answer"]
         check(len(mcp_cands) == 1,
               f"operator_via_mcp message answered exactly once ({len(mcp_cands)})")
+        check(mcp_cands and "as of event" in (mcp_cands[0].data.get("content") or ""),
+              "the worker's reply carries the event-horizon stamp")
         s, _, br = call_tool(base, "get_branch", {"branch_id": seed_branch.id})
         check(any("(via MCP)" in e["sentence"] for e in br.get("entries", [])),
-              "branch timeline interleaves the MCP chat, marked (via MCP)")
+              "branch timeline interleaves the MCP chat, marked (via MCP) — "
+              "the reply is read here, not in the send_chat response")
         s, _, err = call_tool(base, "send_chat",
                               {"branch_id": "branch#999", "message": "hi"})
         check(isinstance(err, str) and "no such branch" in err,
@@ -478,123 +481,73 @@ def main() -> int:
         s, _, out = call_tool(base, "send_chat",
                               {"branch_id": str(tomb.id),
                                "message": "draft this up please"})
-        reply = (out.get("reply") or "") if isinstance(out, dict) else ""
-        check(s == 200 and isinstance(out, dict) and out.get("status") == "ok"
-              and "archived" in reply and "activate" in reply,
-              "non-activate verbs on an archived branch draw the named refusal")
+        check(s == 200 and isinstance(out, dict) and out.get("status") == "accepted",
+              "non-activate chat on an archived branch is accepted (reply via "
+              "get_branch)")
+        refusal = next((c.data.get("content") or ""
+                        for c in rt.graph.objects(type="comm_response_candidate")
+                        if str(c.data.get("message_id")) == str(out.get("message_id"))
+                        and c.data.get("created_by_behavior") == "lab.answer"), "")
+        check("archived" in refusal and "activate" in refusal,
+              "the worker's reply names the archived refusal (only activate)")
         check(rt.graph.get_object(tomb.id).data.get("status") == "archived",
               "the refusal mutates nothing")
         s, _, out = call_tool(base, "send_chat",
                               {"branch_id": str(tomb.id),
                                "message": "Activate this branch. Rationale: "
                                           "deliberate resurrection over MCP."})
-        check(s == 200 and isinstance(out, dict) and out.get("status") == "ok"
+        check(s == 200 and isinstance(out, dict) and out.get("status") == "accepted"
               and rt.graph.get_object(tomb.id).data.get("status") != "archived",
-              f"MCP resurrection works (status="
-              f"{rt.graph.get_object(tomb.id).data.get('status')})")
+              f"MCP resurrection works — the steering mutation applied on the "
+              f"worker (status={rt.graph.get_object(tomb.id).data.get('status')})")
 
-        print("== send_chat reply timeout → structured partial, not a generic error ==")
-        # Simulate a stuck worker for the reply phase only: the bounded wait
-        # is the one call that passes an explicit timeout, so key on that.
-        real_row = lab_server._run_on_worker
-        seen_waits: list = []
-        def stuck_reply(fn, timeout=180):
-            if timeout != 180:
-                seen_waits.append(timeout)
-                raise TimeoutError("simulated: runtime worker did not finish in time")
-            return real_row(fn, timeout)
-        lab_server._run_on_worker = stuck_reply
-        try:
-            s, _, out = call_tool(base, "send_chat",
-                                  {"branch_id": seed_branch.id,
-                                   "message": "does the timeout path stay structured?"})
-        finally:
-            lab_server._run_on_worker = real_row
-        check(s == 200 and isinstance(out, dict)
-              and out.get("status") == "reply_pending",
-              f"timed-out reply → structured partial success ({out.get('status') if isinstance(out, dict) else out})")
-        check(seen_waits == [15],
-              f"reply wait defaults to 15s — under claude.ai's tool timeout "
-              f"({seen_waits})")
-        check(len(out.get("message_event_ids", [])) >= 1,
-              "partial carries the committed message event ids")
-        check("get_branch" in (out.get("detail") or ""),
-              "partial tells the caller to poll get_branch")
-        pending_msg_id = out.get("message_id")
-        check(rt.graph.get_object(pending_msg_id) is not None,
-              "the message itself DID land in the log")
-        # Drain the runtime (the worker finishing late) — the reply arrives,
-        # exactly once: re-triggering must not double-fire the answer.
-        rt.run_until_idle()
-        late = [c for c in rt.graph.objects(type="comm_response_candidate")
-                if str(c.data.get("message_id")) == str(pending_msg_id)
-                and c.data.get("created_by_behavior") == "lab.answer"]
-        check(len(late) == 1,
-              f"late reply lands exactly once after the drain ({len(late)})")
-        s, _, br = call_tool(base, "get_branch", {"branch_id": seed_branch.id})
-        check(any("timeout path" in e["sentence"] for e in br.get("entries", [])),
-              "get_branch shows the pending message (the advertised poll path)")
-
-        print("== reply wait is a seam setting; slow reply → reply_pending within the bound ==")
+        print("== ADR-034: send_chat commits and returns immediately, even under load ==")
         import time
-        from lab_pack.seams import propose_seam_fn
-        propose_seam_fn(rt.graph, "setting.mcp_reply_wait_seconds", "1",
-                        "test_mcp: tighten the MCP reply wait")
-        rt.run_until_idle()
-        dw = next(d for d in rt.graph.objects(type="decision")
-                  if d.data.get("kind") == "self_modify"
-                  and d.data.get("status") == "pending"
-                  and (d.data.get("metadata") or {}).get("seam_name")
-                  == "setting.mcp_reply_wait_seconds")
-        approve_decision_fn(rt.graph, dw.id, True, "test_mcp: approve reply wait seam")
-        rt.run_until_idle()
-        # A reply phase slower than the bound: test mode runs jobs inline and
-        # ignores the timeout, so enforce it for real here — and substitute a
-        # reply collector that cannot land within the 1s seam bound. The
-        # sleeper never touches the runtime, so the side thread is safe.
-        real_collect = lab_server._chat_collect_reply
-        def slow_collect(rt_, message_id):
-            time.sleep(6)
-            return None
-        def bounded_row(fn, timeout=180):
-            if timeout == 180:
-                return real_row(fn, timeout)
-            seen_waits.append(timeout)
-            box: dict = {}
-            def run():
-                try:
-                    box["result"] = fn(lab_server._rt)
-                except BaseException as exc:
-                    box["error"] = exc
-            t = threading.Thread(target=run, daemon=True)
-            t.start()
-            t.join(timeout)
-            if t.is_alive():
-                raise TimeoutError("runtime worker did not finish in time")
-            if "error" in box:
-                raise box["error"]
-            return box.get("result")
-        seen_waits.clear()
-        lab_server._chat_collect_reply = slow_collect
-        lab_server._run_on_worker = bounded_row
-        t0 = time.monotonic()
+        # Simulate a worker that has NOT yet gotten to the reply job: capture
+        # the fire-and-forget submission instead of running it inline. The
+        # append already committed, so send_chat must return accepted with the
+        # message event ids regardless — there is no bounded wait to lose
+        # (the evt_14234/16799 production timeouts are gone with it).
+        real_submit = lab_server._submit_to_worker
+        captured: list = []
+        lab_server._submit_to_worker = lambda fn: captured.append(fn)
         try:
+            t0 = time.monotonic()
             s, _, out = call_tool(base, "send_chat",
                                   {"branch_id": seed_branch.id,
-                                   "message": "does a slow reply stay within the bound?"})
+                                   "message": "does send_chat return under load?"})
+            elapsed = time.monotonic() - t0
         finally:
-            lab_server._chat_collect_reply = real_collect
-            lab_server._run_on_worker = real_row
-        elapsed = time.monotonic() - t0
-        check(seen_waits == [1],
-              f"approved seam overrides the reply wait (15 → 1) ({seen_waits})")
+            lab_server._submit_to_worker = real_submit
         check(s == 200 and isinstance(out, dict)
-              and out.get("status") == "reply_pending" and elapsed < 5,
-              f"slow reply → reply_pending within the bound ({elapsed:.1f}s)")
-        check(rt.graph.get_object(out.get("message_id")) is not None
-              if isinstance(out, dict) else False,
-              "the slow-path message still landed in the log")
-        rt.run_until_idle()  # drain the pending answer before later sections
+              and out.get("status") == "accepted" and elapsed < 5,
+              f"send_chat returns accepted immediately under load "
+              f"({out.get('status') if isinstance(out, dict) else out}, "
+              f"{elapsed:.2f}s)")
+        check(len(out.get("message_event_ids", [])) >= 1,
+              "accepted response carries the committed message event ids")
+        loaded_msg_id = out.get("message_id")
+        check(rt.graph.get_object(loaded_msg_id) is not None,
+              "the message landed in the log before the call returned")
+        check(len(captured) == 1,
+              f"exactly one reply job was queued (fire-and-forget), not blocked "
+              f"on ({len(captured)})")
+        not_yet = [c for c in rt.graph.objects(type="comm_response_candidate")
+                   if str(c.data.get("message_id")) == str(loaded_msg_id)
+                   and c.data.get("created_by_behavior") == "lab.answer"]
+        check(len(not_yet) == 0,
+              f"no reply landed while the worker was still busy ({len(not_yet)})")
+        # The worker catches up and runs the queued job — the reply lands once.
+        captured[0](lab_server._rt)
+        landed = [c for c in rt.graph.objects(type="comm_response_candidate")
+                  if str(c.data.get("message_id")) == str(loaded_msg_id)
+                  and c.data.get("created_by_behavior") == "lab.answer"]
+        check(len(landed) == 1,
+              f"the reply lands exactly once once the worker catches up "
+              f"({len(landed)})")
+        s, _, br = call_tool(base, "get_branch", {"branch_id": seed_branch.id})
+        check(any("under load" in e["sentence"] for e in br.get("entries", [])),
+              "the message is readable via get_branch (the advertised poll path)")
 
         print("== rate limiter shared with the rest of the server ==")
         lab_server._mutation_times.clear()

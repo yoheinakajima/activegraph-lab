@@ -18,9 +18,11 @@ Setup: `uv pip install --system -e .` (plain pip can't resolve activegraph-packs
 - [x] PHASE 1 — overclaim lint in drafts. ADR-033. `_overclaim_review` in
       behaviors.py (sibling to `_coverage_review`), wired into draft_writer.
       Fixture: draft_writer Phase 1. GREEN.
-- [ ] PHASE 2 — MCP send_chat fully async (commit-and-return, no reply-wait).
-      ADR amending ADR-016/023 send_chat behavior. Touch server/mcp.py +
-      lab_server.py; remove/repurpose mcp_reply_wait_seconds setting.
+- [x] PHASE 2 — MCP send_chat commit-and-return. ADR-034 (amends ADR-016/023).
+      _send_chat returns status=accepted immediately + fire-and-forget reply
+      via _submit_to_worker; removed _reply_wait_seconds. mcp_reply_wait_seconds
+      RETIRED IN PLACE (no-op; kernel whitelist NOT edited — kept untouchable).
+      Updated test_mcp, test_chat_robustness, test_oauth. GREEN.
 - [ ] PHASE 3 — pin "accident became policy" properties: (a) daily budget cap
       rebuilds across restart; (b) seam cannot activate except via gate-approved
       hot-load. Named regression tests. Seed a keyed finding. REPORT if a
