@@ -904,6 +904,11 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
     code_task = (branch_data.get("metadata") or {}).get("code_task")
     if code_task:
         meta["code_task"] = code_task
+        # Surface the prose bug description as task.metadata.brief too (ADR-036):
+        # the authoring brief the code worker's diff step reads, alongside the
+        # structured {repo, command} the sandbox runs.
+        if code_task.get("brief"):
+            meta["brief"] = code_task["brief"]
     task = graph.add_object("task", {
         "title": (branch_data.get("title") or "Lab task")[:120],
         "description": intent,
@@ -1285,8 +1290,13 @@ def _propose_code_fix_branch(graph, *, repo: str, command: str,
     propose_pr asks the code worker to open a gated submit_pr once the fix
     proves. Shared by self_repair (status=proposed, the planner) and the
     operator 'fix' verb (Phase 2, activated by the operator)."""
+    # The code_task spec IS the routing signal AND the worker's runnable
+    # contract (ADR-035/036): repo + command (never absent — both paths default
+    # them), the optional candidate diff, and the prose bug description as the
+    # authoring brief. _dispatch_branch copies this verbatim onto the task so
+    # the code worker has something runnable — the branch#935 fix.
     code_task: dict[str, Any] = {"repo": repo, "command": command,
-                                 "propose_pr": True}
+                                 "propose_pr": True, "brief": reason}
     if diff:
         code_task["diff"] = diff
     ev = ", ".join(evidence) if evidence else "the linked defect observation"
