@@ -192,6 +192,8 @@ def clear_lab_registry() -> None:
     _IDLE_LOGGED["capped"] = False
     from .research_worker import clear_research_worker_registry
     clear_research_worker_registry()
+    from .code_worker import clear_code_worker_registry
+    clear_code_worker_registry()
     clear_seam_cache()
     # Seam hot-loads mutate live behavior descriptions (module originals AND
     # the bound runtime copies); restore file defaults (prompt body + CHARTER
@@ -728,6 +730,12 @@ def _available_capabilities(graph, settings) -> set[tuple[str, str]]:
             caps.add(("research", "deep_research"))
     except Exception:
         pass
+    try:
+        from .code_worker import code_lane_available
+        if code_lane_available(settings):
+            caps.add(("codebase", "code_task"))
+    except Exception:
+        pass
     return caps
 
 
@@ -735,14 +743,21 @@ def _available_tools(settings) -> frozenset[str]:
     """The concrete tool names the lab can call right now (ADR-031/032),
     grounded in the research lane's tool list when it is live — the same set
     the capability self-check and the phantom-work guard reason over."""
+    tools: frozenset[str] = frozenset()
     try:
         from .research_worker import (RESEARCH_WORKER_TOOLS,
                                       research_lane_available)
         if research_lane_available(settings):
-            return RESEARCH_WORKER_TOOLS
+            tools = tools | RESEARCH_WORKER_TOOLS
     except Exception:
         pass
-    return frozenset()
+    try:
+        from .code_worker import CODE_WORKER_TOOLS, code_lane_available
+        if code_lane_available(settings):
+            tools = tools | CODE_WORKER_TOOLS
+    except Exception:
+        pass
+    return tools
 
 
 # ── phantom-work guard (ADR-032) ──────────────────────────────────────────────
@@ -848,7 +863,13 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
         return
     _DISPATCHED.add(branch_id)
     intent = branch_data.get("intent") or branch_data.get("title") or ""
-    routing = _routing_for_intent(intent)
+    # ADR-035: an explicit code-task spec (repo + command, optionally a fix
+    # diff) is a deliberate "this is code-execution work" signal — it routes
+    # codebase.code_task regardless of the intent's verb (a "run the tests"
+    # task carries no code-WRITE verb, but it is still the code worker's lane).
+    code_task = (branch_data.get("metadata") or {}).get("code_task")
+    routing = ({"domain": "codebase", "capability": "code_task"}
+               if code_task else _routing_for_intent(intent))
     meta: dict[str, Any] = {
         "routing": routing,
         "tags": ["lab", routing["domain"]],
@@ -868,6 +889,12 @@ def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSett
     activation_msg = (branch_data.get("metadata") or {}).get("activation_message")
     if activation_msg:
         meta["activation_message"] = activation_msg
+    # ADR-035: a branch carrying a code-task spec (repo, command, optional fix
+    # diff) dispatches it onto the task so the code worker can clone + run +
+    # prove it. The spec rides verbatim — the self-repair loop's last mile.
+    code_task = (branch_data.get("metadata") or {}).get("code_task")
+    if code_task:
+        meta["code_task"] = code_task
     task = graph.add_object("task", {
         "title": (branch_data.get("title") or "Lab task")[:120],
         "description": intent,
@@ -891,8 +918,9 @@ def _task_reacted(graph, task_id: str) -> bool:
     change away from 'active'. The lab's own research worker claims through
     a registry too (BehaviorGraph cannot iterate relations — ADR-020)."""
     from .compat import decode_relation, relation_touches
+    from .code_worker import task_claimed as code_task_claimed
     from .research_worker import task_claimed
-    if task_claimed(task_id):
+    if task_claimed(task_id) or code_task_claimed(task_id):
         return True
     try:
         for r in graph.relations():
@@ -1500,6 +1528,87 @@ def index_pending_decision(graph, decision_id: str, data: dict) -> None:
             bucket.append(decision_id)
 
 
+def _apply_submit_pr(graph, artifact_id: str, decision_id: str,
+                     status: str, decision_data: dict) -> None:
+    """Apply a resolved submit_pr decision (ADR-035). Approved → exercise the
+    write token to open a PR and record the outcome; rejected → record the
+    rationale, touch no token. The write token never appears in anything this
+    writes to the graph."""
+    artifact = graph.get_object(artifact_id)
+    a_meta = (artifact.data.get("metadata") or {}) if artifact else {}
+    branch_id = a_meta.get("lab_branch_id")
+    spec = a_meta.get("submit_pr") or {}
+    repo = spec.get("repo") or (decision_data.get("metadata") or {}).get("repo")
+
+    if status != "approved":
+        # Rejection is a verdict, not a write. Record it; no token is touched.
+        try:
+            graph.patch_object(artifact_id, {"status": "rejected"})
+        except Exception:
+            pass
+        rationale = ((decision_data.get("metadata") or {})
+                     .get("resolution_rationale") or "").strip()
+        obs = graph.add_object("observation", {
+            "text": (f"submit_pr rejected for {repo}: no pull request opened, "
+                     "no write token exercised."
+                     + (f" Operator rationale: {rationale}" if rationale else "")),
+            "confidence": 1.0,
+            "category": "fact",
+            "metadata": {"lab": "pr_rejected", "artifact_id": artifact_id,
+                         "lab_branch_id": branch_id, "decision_id": decision_id,
+                         "repo": repo},
+        })
+        if branch_id:
+            graph.add_relation(branch_id, obs.id, "supported_by")
+        return
+
+    # Approved: the ONE place a write token is exercised. Push a branch and
+    # open a PR through github_write (token read there, header-only).
+    from .github_write import open_pull_request
+    try:
+        graph.patch_object(artifact_id, {"status": "approved"})
+    except Exception:
+        pass
+    result = open_pull_request(
+        repo, head_branch=spec.get("head_branch") or "lab-proposed-change",
+        base=spec.get("base") or "main", title=spec.get("title") or "Lab change",
+        body=spec.get("body") or "", files=a_meta.get("files") or {})
+    if result.get("error"):
+        obs = graph.add_object("observation", {
+            "text": (f"submit_pr approved for {repo} but the PR could not be "
+                     f"opened: {result['error']}. No PR exists; the operator "
+                     "can open it manually from the diff."),
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "pr_failed", "artifact_id": artifact_id,
+                         "lab_branch_id": branch_id, "decision_id": decision_id,
+                         "repo": repo},
+        })
+    else:
+        meta = dict(a_meta)
+        meta["pr_url"] = result.get("url")
+        meta["pr_number"] = result.get("number")
+        try:
+            graph.patch_object(artifact_id, {"metadata": meta})
+        except Exception:
+            pass
+        obs = graph.add_object("observation", {
+            "text": (f"Pull request opened against {repo} on operator "
+                     f"approval: {result.get('url')} (#{result.get('number')}, "
+                     f"branch '{result.get('head')}' → '{result.get('base')}'). "
+                     "The operator reviews and merges on GitHub — the second "
+                     "gate. No auto-merge."),
+            "confidence": 1.0,
+            "category": "fact",
+            "metadata": {"lab": "pr_opened", "artifact_id": artifact_id,
+                         "lab_branch_id": branch_id, "decision_id": decision_id,
+                         "repo": repo, "pr_url": result.get("url"),
+                         "pr_number": result.get("number")},
+        })
+    if branch_id:
+        graph.add_relation(branch_id, obs.id, "supported_by")
+
+
 def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) -> None:
     if decision_id in _APPLIED_DECISIONS:
         return
@@ -1588,6 +1697,16 @@ def _apply_decision(graph, decision_id: str, data: dict, settings: LabSettings) 
                 graph.patch_object(subject, {"status": "rejected"})
             except Exception:
                 pass
+    elif kind == "submit_pr" and subject:
+        # ADR-035 (rung 2 of ADR-022): the doubly-gated PR path. ONLY on
+        # operator approval (the first gate) is a write-scoped token
+        # exercised to push a branch and open a PR — the operator then
+        # reviews and merges on GitHub (the second gate). No auto-merge. The
+        # write token (GITHUB_WRITE_TOKEN) is read ONLY inside github_write,
+        # rides only in a request header, and never reaches the graph, a log,
+        # or any payload here (sentinel-audited). Rejection records the
+        # rationale and touches no token.
+        _apply_submit_pr(graph, subject, decision_id, status, data)
     # schema_change / dependency_pin / other: the record itself is the outcome;
     # humans act on it outside the runtime (e.g. bump the pin in pyproject).
 
@@ -1680,8 +1799,8 @@ _FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
 # "model X" footer rounded that routing up to one name. These are the LLM
 # behaviors whose output can become an artifact's evidence.
 _LLM_BEHAVIOR_NAMES = frozenset((
-    "draft_writer", "interpret", "plan", "research_worker", "answer",
-    "seam_writer"))
+    "draft_writer", "interpret", "plan", "research_worker", "code_worker",
+    "answer", "seam_writer"))
 
 
 _ENTITY_ID_RE = re.compile(
@@ -2373,8 +2492,8 @@ def _steering_event(graph, verb: str, branch_id: str, msg_id: str,
 _SEAM_NAME_RE = re.compile(
     r"\b(prompt\.[a-z_]+|setting\.[a-z_.]+|charter\.mission|"
     r"template\.feed\.[a-z_]+)\b")
-_SEAM_PROMPT_BEHAVIORS = ("draft_writer", "research_worker", "interpret",
-                          "plan", "answer")
+_SEAM_PROMPT_BEHAVIORS = ("draft_writer", "research_worker", "code_worker",
+                          "interpret", "plan", "answer")
 
 
 def _seam_name_from_message(low: str) -> Optional[str]:
@@ -2922,6 +3041,11 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
 # plumbing; this import is the only registration point. It must come last:
 # research_worker.py imports nothing from this module at import time.
 from .research_worker import research_intake, research_worker  # noqa: E402
+# The code worker stages (ADR-035) likewise live in lab_pack/code_worker.py —
+# droppable plumbing, registered only here; it imports nothing from this module
+# at import time.
+from .code_worker import code_intake, code_worker  # noqa: E402
 
 BEHAVIORS = [ingest, plan, work, research_intake, interpret, digest, gate,
-             draft_writer, research_worker, seam_writer, answer]
+             draft_writer, research_worker, code_intake, code_worker,
+             seam_writer, answer]

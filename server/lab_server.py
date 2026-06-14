@@ -58,7 +58,7 @@ _ERRORS: _deque = _deque(maxlen=_ERRORS_MAX)
 
 _SECRET_ENV_KEYS = ("LAB_MCP_TOKEN", "LAB_OPERATOR_TOKEN", "LAB_DATABASE_URL",
                     "DATABASE_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-                    "GITHUB_TOKEN")
+                    "GITHUB_TOKEN", "GITHUB_WRITE_TOKEN")
 
 
 def _sanitize_error_text(text: str) -> str:
@@ -307,16 +307,28 @@ def _rebuild_lab_registries(rt) -> None:
     # their observations and evaluations; in-flight fetches do not survive a
     # restart — the stall watchdog releases those tasks.
     from lab_pack import research_worker as rw
+    from lab_pack import code_worker as cw
     for o in g.objects(type="observation"):
         meta = o.data.get("metadata") or {}
         if meta.get("lab") == "research_progress" and meta.get("task_id"):
             rw._CLAIMED.add(str(meta["task_id"]))
         elif meta.get("lab") == "research_synthesis_request" and meta.get("task_id"):
             rw._SYNTH_REQUESTED.add(str(meta["task_id"]))
+        # ADR-035: the code worker's claimed task ids rebuild from its
+        # code_progress observations (in-flight sandbox runs do not survive a
+        # restart — the stall watchdog releases the task, like research).
+        elif meta.get("lab") == "code_progress" and meta.get("task_id"):
+            cw._CLAIMED.add(str(meta["task_id"]))
+    for s in g.objects(type="source"):
+        meta = s.data.get("metadata") or {}
+        if meta.get("lab") == "code_repo_source" and meta.get("repo"):
+            cw._REPO_SOURCES.setdefault(str(meta["repo"]), str(s.id))
     for e in g.objects(type="evaluation"):
         meta = e.data.get("metadata") or {}
         if meta.get("lab") == "research_synthesis" and meta.get("task_id"):
             rw._SYNTHESIZED.add(str(meta["task_id"]))
+        elif meta.get("lab") == "code_synthesis" and meta.get("task_id"):
+            cw._SYNTHESIZED.add(str(meta["task_id"]))
     for a in g.objects(type="artifact"):
         meta = a.data.get("metadata") or {}
         if meta.get("lab") == "seam":
@@ -402,7 +414,7 @@ def _build_runtime():
         _arm_store_reconnect(rt, db)
         # ADR-020: the worker defaults dark in the pack; the server boot is
         # the one place that turns it on — the live lab always runs it.
-        load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True),
+        load_lab_packs(rt, lab_settings=LabSettings(research_worker_enabled=True, code_worker_enabled=True),
                        memory_backend_url=_memory_db_path())
         from lab_pack.tools import register_web_fetch
         register_web_fetch()
@@ -444,7 +456,7 @@ def _build_runtime():
         mode = "fresh"
         rt = build_lab(
             llm_provider=provider,
-            lab_settings=LabSettings(research_worker_enabled=True),  # ADR-020
+            lab_settings=LabSettings(research_worker_enabled=True, code_worker_enabled=True),  # ADR-020
             memory_backend_url=_memory_db_path(),
             persist_to=db,
         )
@@ -645,6 +657,13 @@ DEFAULT_TEMPLATES = {
     "research_progress": "{short_text}",
     "research_synthesis_request": "{short_text}",
     "research_finding": "Research finding: “{short_text}”",
+    "code_progress": "{short_text}",
+    "code_run": "Sandbox run: {short_text}",
+    "code_synthesis_request": "{short_text}",
+    "code_finding": "Code finding: “{short_text}”",
+    "pr_opened": "{short_text}",
+    "pr_rejected": "{short_text}",
+    "pr_failed": "{short_text}",
     "seam_proposal_request": "{short_text}",
     "seam_proposal_failed": "{short_text}",
     "decision_annotation": "Operator note (via MCP): “{short_text}”",

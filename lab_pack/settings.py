@@ -71,6 +71,48 @@ class LabSettings(BaseModel):
         default="claude-opus-4-8",
         description="Model for the research_worker behavior (ADR-019/020).",
     )
+    # ── code worker + repo sandbox (ADR-035, rung 2) ────────────────────────
+    code_worker_enabled: bool = Field(
+        default=False,
+        description=(
+            "If True, the lab-local code worker (ADR-035) claims tasks routed "
+            "codebase.code_task, clones an allowlisted repo into the repo "
+            "sandbox, runs a specified command (and, for a fix-task, applies a "
+            "proposed diff and re-runs to prove it), and writes the captured "
+            "output as attributed evidence. Defaults False so no fixture or "
+            "embedding clones/runs by surprise; the server boot enables it — "
+            "the live lab runs the worker. Droppable like the research worker: "
+            "disabled, codebase.code_task is a dead lane again (capability gap)."
+        ),
+    )
+    code_run_cap: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Per-task cap on sandbox command runs by the code worker "
+            "(ADR-035): a plain command is 1 run, a fix-task (command, apply "
+            "diff, re-run) is 2. Bounds runaway re-runs. Seam-eligible."
+        ),
+    )
+    sandbox_timeout_seconds: int = Field(
+        default=300,
+        ge=5,
+        le=1800,
+        description=(
+            "Wall-clock timeout for ONE repo-sandbox command run (ADR-035). "
+            "The run is killed on expiry and the outcome recorded as evidence. "
+            "Seam-eligible — tuning the sandbox budget is self-modification."
+        ),
+    )
+    model_code_worker: str = Field(
+        default="claude-opus-4-8",
+        description=(
+            "Model for the code_worker behavior (ADR-019/035). Defaults to the "
+            "deliberate plane (claude-opus-4-8) — reasoning over a code change "
+            "and its test output is top-tier work per the operator's tiering."
+        ),
+    )
     dispatch_gap_check: bool = Field(
         default=True,
         description=(

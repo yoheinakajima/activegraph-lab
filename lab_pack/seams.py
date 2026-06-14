@@ -110,7 +110,7 @@ def composed_description(behavior_name: str, prompt_body: str,
 # runtime's native per-model reporting (cost_usd on llm.responded).
 
 MODEL_ROUTED_BEHAVIORS = ("plan", "interpret", "draft_writer", "answer",
-                          "research_worker")
+                          "research_worker", "code_worker")
 
 
 def resolve_behavior_model(graph, behavior_name: str) -> str:

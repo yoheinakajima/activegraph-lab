@@ -74,9 +74,16 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     "model.draft_writer",
     "model.answer",
     "model.research_worker",
+    "model.code_worker",
     "model.default",
     # Research worker (ADR-020): per-task source-fetch cap.
     "research_fetch_cap",
+    # Code worker + repo sandbox (ADR-035): per-task run cap and per-run
+    # wall-clock budget — tuning sandbox thoroughness/spend is
+    # self-modification through the gate, while the secret-isolation and
+    # allowlist invariants stay in code (repo_sandbox is plumbing, not a seam).
+    "code_run_cap",
+    "sandbox_timeout_seconds",
     # MCP surface (ADR-016): send_chat's bounded reply wait — client-facing
     # latency policy, not auth, gating, or budget.
     "mcp_reply_wait_seconds",

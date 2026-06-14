@@ -296,6 +296,71 @@ def annotate_branch_fn(graph, branch_id: str, note: str,
     return obs
 
 
+def propose_submit_pr_fn(
+    graph,
+    repo: str,
+    *,
+    head_branch: str,
+    title: str,
+    diff: str,
+    files: Optional[dict] = None,
+    base: str = "main",
+    body: str = "",
+    branch_id: Optional[str] = None,
+    proof_refs: Optional[list] = None,
+    rationale: str = "",
+):
+    """Open a doubly-gated submit_pr decision (ADR-035, rung 2 of ADR-022).
+
+    A code change the lab wants to LAND becomes an artifact (kind=code_change:
+    the unified diff for the human reviewer + the concrete changed-file
+    contents to commit) plus the sandbox PROOF (the code_worker's
+    sandbox_proven evaluation, cited in evidence_refs). The lab opens a PENDING
+    decision kind=submit_pr — and NOTHING touches a write token until the
+    operator approves it (the gate's submit_pr path). Rejection records the
+    rationale and exercises no token. Returns (artifact, decision).
+
+    The write token (GITHUB_WRITE_TOKEN) appears NOWHERE in what this creates —
+    the artifact, the decision, the diff, the files. It is read only inside
+    github_write on an approved decision, and rides only in a request header.
+    """
+    proof_refs = list(proof_refs or [])
+    artifact = graph.add_object("artifact", {
+        "kind": "code_change",
+        "title": title,
+        "content": diff,                 # the diff is for the human reviewer
+        "format": "diff",
+        "status": "proposed",            # gated — never written without approval
+        "metadata": {
+            "lab": "submit_pr",
+            "lab_branch_id": branch_id,
+            "submit_pr": {"repo": repo, "base": base,
+                          "head_branch": head_branch, "title": title,
+                          "body": body},
+            # The concrete file states the write path commits (the diff alone
+            # cannot be applied server-side); never a credential.
+            "files": dict(files or {}),
+            "proof_refs": proof_refs,
+        },
+    })
+    decision = graph.add_object("decision", {
+        "subject_ref": artifact.id,
+        "kind": "submit_pr",
+        "status": "pending",
+        "rationale": rationale or (
+            f"Open a pull request against {repo} from branch "
+            f"'{head_branch}': '{title}'. The change is proven in the sandbox "
+            f"(see evidence). On approval the lab pushes the branch and opens "
+            f"the PR; the operator then reviews and merges on GitHub — two "
+            f"human gates, no auto-merge. Rejection touches no write token."),
+        "evidence_refs": [artifact.id] + proof_refs,
+        "metadata": {"requested_by": "lab.code_worker", "kind": "submit_pr",
+                     "lab_branch_id": branch_id, "repo": repo,
+                     "head_branch": head_branch},
+    })
+    return artifact, decision
+
+
 def complete_task_fn(graph, task_id: str, result_summary: str, success: bool = True):
     """Mark a dispatched task done/failed (a worker pack — or a fixture — calls
     this). work turns the patch into a task_outcome evaluation for interpret."""

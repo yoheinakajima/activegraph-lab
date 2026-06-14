@@ -6,6 +6,16 @@
 # and branch#64 ("implements" describing the subject) — to research.
 cases:
   - intent: >
+      Fetch the actual implementation files from the activegraph repository and
+      run get_file on the event-log projection, replay, fork, and diff code
+      paths to confirm the claims hold at the level of code.
+    domain: research
+    note: >
+      branch#847 EXACT intent (the third re-dispatch, task#973). The ACTION is
+      fetch/read/verify (research lane); the OBJECTS being code paths does NOT
+      make it a code-WRITE task. Regression-lock: if a rebase reverts the
+      verb classifier to the keyword router, THIS case fails loudly.
+  - intent: >
       Fetch the actual implementation files from the activegraph repo and
       verify the replay claim against the source.
     domain: research

@@ -32,6 +32,9 @@ SENTINELS = {
     "LAB_DATABASE_URL": "postgres://lab_sentinel_user:pw-SENTINEL-mK6tE9@db.lab-sentinel.internal:5432/lab",
     # ADR-022: the GitHub rate-limit token is a credential like any other.
     "GITHUB_TOKEN": "ghp_SENTINEL_xT4rW8nQ2j",
+    # ADR-035: the write-scoped PR token is the highest-stakes credential —
+    # exercised only on an approved submit_pr, header-only, never in the graph.
+    "GITHUB_WRITE_TOKEN": "ghp_SENTINEL_WRITE_zP6kM2nB8w",
 }
 
 FAILURES: list[str] = []
@@ -123,6 +126,25 @@ def _run() -> int:
         if pend:
             approve_decision_fn(g, pend[0].id, True, "audit pass")
             rt.run_until_idle()
+
+        # ADR-035: exercise an APPROVED submit_pr through the gate with a mock
+        # PR opener, so the write token's one exercise point joins the audit.
+        # GITHUB_WRITE_TOKEN is planted in the env (a sentinel); the gate must
+        # let none of it reach the graph, the PR observation, or any payload.
+        from lab_pack import github_write
+        from lab_pack.tools import propose_submit_pr_fn
+        github_write.set_pr_opener(lambda repo, **kw: {
+            "url": "https://github.com/yoheinakajima/activegraph-lab/pull/1",
+            "number": 1, "head": kw.get("head_branch"), "base": kw.get("base")})
+        _art, _dec = propose_submit_pr_fn(
+            g, "yoheinakajima/activegraph-lab",
+            head_branch="lab/audit-change", title="audit submit_pr",
+            diff="--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            files={"x": "b\n"}, branch_id=branch.id)
+        rt.run_until_idle()
+        approve_decision_fn(g, _dec.id, True, "audit: open the PR")
+        rt.run_until_idle()
+        github_write.set_pr_opener(None)
 
     # ── MCP surface (ADR-016): tool outputs join the audited corpus too ─────
     import threading
@@ -400,6 +422,11 @@ def _run() -> int:
     budget = [o for o in g.objects(type="observation")
               if (o.data.get("metadata") or {}).get("lab") == "llm_budget"]
     check(len(budget) >= 1, f"budget-exhaustion path exercised ({len(budget)})")
+    pr_opened = [o for o in g.objects(type="observation")
+                 if (o.data.get("metadata") or {}).get("lab") == "pr_opened"]
+    check(len(pr_opened) >= 1,
+          f"submit_pr approval path exercised — the write token's one exercise "
+          f"point is in the audited corpus ({len(pr_opened)})")
 
     print(f"\ntest_public_safety: {'PASS' if not FAILURES else 'FAIL'} "
           f"({len(FAILURES)} failure(s))")

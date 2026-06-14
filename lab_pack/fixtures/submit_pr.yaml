@@ -1,0 +1,37 @@
+# ADR-035 (rung 2 of ADR-022), Phase 3: the submit_pr decision kind — the
+# gate, the whole point. A code change the lab wants to land becomes an
+# artifact (diff + sandbox proof); the lab opens a PENDING submit_pr decision;
+# ONLY on operator approval is a (MOCKED) write token exercised to push a
+# branch and open a PR; rejection touches no token. submit_pr is EXCLUDED from
+# MCP exactly like approve/reject. The write token is sentinel-audited: it must
+# appear in NOTHING the flow writes to the graph.
+settings:
+  crawl_enabled: false
+
+mission:
+  title: Submit-PR gate mission
+
+branch:
+  title: Land the proven fix
+  intent: Open a PR for the fix the sandbox proved.
+
+# The proposed change: a unified diff (for the human reviewer) plus the
+# concrete new file contents the write path commits.
+change:
+  repo: yoheinakajima/activegraph-lab
+  head_branch: lab/fix-the-thing
+  base: main
+  title: "Fix the thing the sandbox proved"
+  diff: |
+    --- a/check.py
+    +++ b/check.py
+    @@ -1 +1 @@
+    -import sys; sys.exit(1)
+    +import sys; sys.exit(0)
+  files:
+    check.py: "import sys; sys.exit(0)\n"
+
+# A canned PR the mock opener returns on approval.
+mock_pr:
+  url: https://github.com/yoheinakajima/activegraph-lab/pull/123
+  number: 123

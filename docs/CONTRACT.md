@@ -23,6 +23,7 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 - One bit per capability: `auto` or `gated`.
 - Publishing and self-modification are always gated. Self-modification additionally requires its enabling flag (`LAB_ALLOW_GRAPH_CODE=1` for graph code) — an approved decision alone is not enough (ADR-012).
+- Opening a pull request is always gated and doubly so (ADR-035): a `submit_pr` decision must be approved by the operator (gate one) AND the resulting PR reviewed and merged by the operator on GitHub (gate two) — no auto-merge, ever. The write-scoped `GITHUB_WRITE_TOKEN` (separate from the read `GITHUB_TOKEN`, fine-grained, lab-repo-only, absent until configured) is exercised ONLY on an approved submit_pr, rides only in a request header, and is NEVER in any event payload, observation, artifact, log line, or error — sentinel-audited like every secret. `submit_pr` is EXCLUDED from MCP exactly like approve/reject — the inbox is human-only.
 - Decision resolutions record the operator's reasons on the resolution event (`resolution_rationale`, `resolved_by` — ADR-026). MCP may annotate a pending decision (public, attributed commentary) but never resolve it: approve/reject remain EXCLUDED from MCP (ADR-016/021/026).
 
 ## Code residency (ADR-012)
@@ -40,7 +41,7 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 ## Workers
 
-- The lab never calls domain packs directly. Work is dispatched as core task objects with routing tags; packs react or a capability-gap observation is recorded (ADR-006). Tasks route by their ACTION verb (ADR-025/ADR-006): reading source to verify/check/examine a claim is `research.deep_research`; only WRITE/MODIFY/GENERATE-code intent is `codebase.code_task`. A mention of code, files, or a repo is not a request to write code.
+- The lab never calls domain packs directly. Work is dispatched as core task objects with routing tags; packs react or a capability-gap observation is recorded (ADR-006). Tasks route by their ACTION verb (ADR-025/ADR-006): reading source to verify/check/examine a claim is `research.deep_research`; only WRITE/MODIFY/GENERATE-code intent is `codebase.code_task`. A mention of code, files, or a repo is not a request to write code. The lab-local research worker (ADR-020) and code worker (ADR-035) are droppable plumbing that REACT to these routed tasks from inside the lab, implementing the same routing contract an upstream pack would — they call no domain pack; disable or delete either and the capability-gap path takes over unchanged.
 - Workers emit a progress event at least every 60 seconds, or declare the current step uninterruptible.
 - All external fetches go through tool_gateway.
 - Honesty about capability (ADR-031): no behavior asserts a capability is absent ("lacks the means" / "cannot" / "has no capability") without consulting the actual available-capability set. "No pack reacted" is a routing fact; a task whose capability EXISTS but was misrouted records "misrouted, capability available", never an absence. A genuine gap is still recorded honestly.

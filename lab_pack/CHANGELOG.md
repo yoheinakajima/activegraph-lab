@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- GitHub rung 2 — the code worker, the repo sandbox, and the submit_pr
+  decision (ADR-035, the self-repair rails). Three phases, two hard sentinel
+  gates:
+  - **Repo sandbox** (`lab_pack/repo_sandbox.py`): a bounded execution sandbox
+    for cloning and running allowlisted repos — clean env (NO inherited
+    secrets, built from a curated allowlist), wall-clock + POSIX resource
+    limits, allowlisted repos only (GITHUB_REPO_ALLOWLIST), captured output as
+    evidence. Subprocess-hardened; E2B documented as the future upgrade for
+    untrusted code. HARD GATE: `scripts/test_sandbox_isolation.py` plants
+    sentinel secrets in the parent env and proves none reaches the sandbox or
+    its output.
+  - **Code worker** (`lab_pack/code_worker.py`, plumbing, droppable — mirrors
+    the research worker): reacts to `codebase.code_task` (the dead lane gets a
+    reactor). `code_intake` clones an allowlisted repo, runs a command, and
+    for a fix-task applies a proposed diff and re-runs to PROVE it, writing the
+    captured output as attributed evidence; `code_worker` (llm, model
+    `setting.model.code_worker`, default claude-opus-4-8) summarizes and
+    completes the task (done if the deciding run exited 0 — the run's verdict,
+    not the model's). Run cap `setting.code_run_cap`; per-run wall-clock
+    `setting.sandbox_timeout_seconds`. Dark by default (`code_worker_enabled`);
+    the server boot enables it. Safety net for the branch#847 family: a
+    read-to-verify task in the codebase lane records a `routing_miss` naming
+    research.deep_research and an actionable verdict, not a dead lane.
+  - **submit_pr decision** (kind=`submit_pr`, ADR-035): a code change becomes a
+    `code_change` artifact (diff + concrete file contents) plus the sandbox
+    proof; the lab opens a PENDING decision; ONLY operator approval exercises
+    the separate `GITHUB_WRITE_TOKEN` (`lab_pack/github_write.py`, header-only,
+    never in the graph — sentinel-audited) to open a PR the operator then
+    merges on GitHub. No auto-merge; MCP-excluded like approve/reject.
+  - Fixtures: `code_worker` (pass/fix-proven/fail + the branch#847 safety net),
+    `submit_pr` (pending → approve → mocked PR → reject → no token, write-token
+    sentinel-clean, MCP-excluded), plus the branch#847 exact-intent
+    regression-lock in `routing`. Fixture count 32 → 34. The public-safety
+    audit gains the GITHUB_WRITE_TOKEN sentinel and exercises an approved
+    submit_pr; `test_mcp` asserts submit_pr is MCP-excluded while annotate is
+    fine.
+
 - Phantom-work alias-map maintenance guard (ADR-032, Phase 6): the
   `alias_map_guard` fixture asserts every tool in RESEARCH_WORKER_TOOLS is
   either aliased in `_EXISTING_CAPABILITY_ALIASES` or named in a new

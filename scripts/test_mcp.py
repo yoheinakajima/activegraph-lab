@@ -463,6 +463,28 @@ def main() -> int:
         check(isinstance(err, str) and "no such branch" in err,
               "annotating a bogus branch id is a tool error, not a 500")
 
+        print("== submit_pr is EXCLUDED from MCP (ADR-035), annotate is fine ==")
+        from lab_pack.tools import propose_submit_pr_fn
+        _art, _spd = propose_submit_pr_fn(
+            rt.graph, "yoheinakajima/activegraph-lab",
+            head_branch="lab/mcp-excluded", title="a change",
+            diff="--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", files={"x": "b\n"},
+            branch_id=str(seed_branch.id))
+        rt.run_until_idle()
+        _, _tl = rpc(base, "tools/list")
+        tool_names = {t["name"] for t in (_tl.get("result") or {}).get("tools", [])}
+        check(not (tool_names & {"approve_decision", "reject_decision",
+                                 "resolve_decision", "submit_pr", "open_pr"}),
+              "no MCP tool resolves a decision or opens a PR — opening the PR "
+              "is the operator's tap, the inbox is human-only")
+        s, _, out = call_tool(base, "annotate_decision",
+                              {"decision_id": str(_spd.id),
+                               "note": "LGTM — recommend opening this PR"})
+        check(isinstance(out, dict) and out.get("annotation_id")
+              and rt.graph.get_object(_spd.id).data.get("status") == "pending",
+              "a pending submit_pr CAN be annotated over MCP — and STAYS "
+              "pending (commentary, not authority)")
+
         print("== send_chat round-trip (operator authority via MCP) ==")
         s, _, out = call_tool(base, "send_chat",
                               {"branch_id": seed_branch.id,

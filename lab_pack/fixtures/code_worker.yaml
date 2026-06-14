@@ -1,0 +1,52 @@
+# ADR-035 (rung 2), Phase 2: the lab-local code worker. A routed
+# codebase.code_task is claimed, cloned (CANNED — no network), run in the repo
+# sandbox, its captured output recorded as attributed evidence, and completed.
+# A fix-task applies a proposed diff and re-runs to PROVE it. A failure path
+# (the deciding run does not pass) records the error and fails the task.
+settings:
+  crawl_enabled: false
+  code_worker_enabled: true     # the code lane is live for this fixture
+
+mission:
+  title: Code-worker mission
+
+# Branch A: a plain command task that passes (exit 0) → proven, task done.
+pass_branch:
+  title: Run the smoke command against the repo
+  intent: >
+    Run the project's smoke command against the lab repo to confirm it builds.
+  repo: yoheinakajima/activegraph-lab
+  command: "true"          # canned-clone, then the sandbox runs `true` → exit 0
+
+# Branch B: a fix-task — the baseline command fails, the proposed diff is
+# applied, the re-run passes (proven). The canned clone seeds a failing script
+# the diff repairs.
+fix_branch:
+  title: Prove the proposed fix
+  intent: >
+    Apply the proposed fix and re-run the test command to prove it.
+  repo: yoheinakajima/activegraph-lab
+  command: "python check.py"
+
+# Branch C: failure path — the command never passes; no diff repairs it.
+fail_branch:
+  title: A command that cannot pass
+  intent: >
+    Run the failing command against the repo.
+  repo: yoheinakajima/activegraph-lab
+  command: "false"         # always exit 1 → not proven → task failed
+
+# branch#847 safety net (addendum): a read-to-verify task FORCED into the
+# codebase lane (the production regression shape) is answerable either way —
+# the code worker recognizes it has no command to run, records a routing_miss
+# naming research.deep_research (get_file), and fails with an actionable
+# verdict instead of dying in a dead lane.
+misroute_intent: >
+  Fetch the actual implementation files from the activegraph repository and run
+  get_file on the event-log projection, replay, fork, and diff code paths to
+  confirm the claims hold at the level of code.
+
+expected_outputs:
+  pass:  { task_status: done,     proven: true }
+  fix:   { task_status: done,     proven: true }
+  fail:  { task_status: rejected, proven: false }
