@@ -187,11 +187,11 @@ def main() -> int:
                     "get_post", "list_posts", "list_seams", "list_branches",
                     "get_errors", "get_log", "get_entity", "github_read",
                     "send_chat", "set_budget", "pause_lab", "resume_lab",
-                    "annotate_decision"}
+                    "annotate_decision", "annotate_branch"}
         check(tools == expected,
               f"exactly the ADR-016 tools + get_errors (ADR-023) + the "
-              f"ADR-021 expansion + annotate_decision (ADR-026) "
-              f"({sorted(tools)})")
+              f"ADR-021 expansion + annotate_decision (ADR-026) + "
+              f"annotate_branch (ADR-028) ({sorted(tools)})")
         check("get_errors" in tools, "get_errors present in the READ tier (ADR-023)")
         gate_tools = {"approve_decision", "reject_decision", "promote_seam",
                       "approve", "reject"}
@@ -431,6 +431,37 @@ def main() -> int:
         check(str(ann.id) in (d.data.get("evidence_refs") or []),
               "the pending annotation is linked into the resolution's evidence")
         rt.run_until_idle()  # let the gate apply the rejection outcome
+
+        print("== annotate_branch (ADR-028, Phase 4): bare branch commentary ==")
+        b_before = rt.graph.get_object(seed_branch.id).data.get("status")
+        bnote = ("Erratum: the earlier figure was a typo; the real number is "
+                 "lower. Recording for the record, not asking for anything.")
+        s, _, out = call_tool(base, "annotate_branch",
+                              {"branch_id": str(seed_branch.id), "note": bnote})
+        check(s == 200 and isinstance(out, dict) and out.get("annotation_id")
+              and out.get("status_unchanged") is True,
+              f"annotate_branch records a note and changes no status ({out})")
+        check(rt.graph.get_object(seed_branch.id).data.get("status") == b_before,
+              "annotate_branch leaves the branch status exactly as it was")
+        bobs = rt.graph.get_object(out["annotation_id"])
+        bmeta = (bobs.data.get("metadata") or {}) if bobs is not None else {}
+        check(bobs is not None and bmeta.get("lab") == "operator_note"
+              and bmeta.get("kind") == "operator_note"
+              and bmeta.get("source") == "operator_via_mcp"
+              and bmeta.get("lab_branch_id") == str(seed_branch.id)
+              and (bobs.data.get("text") or "") == bnote,
+              "the note is a public operator_note observation, attributed, "
+              "carrying the FULL commentary")
+        # No pending decision is needed — it lands straight on the branch and
+        # is visible in the branch timeline (the advertised read path).
+        s, _, br = call_tool(base, "get_branch", {"branch_id": str(seed_branch.id)})
+        check(any("typo" in e["sentence"] or "Erratum" in e["sentence"]
+                  for e in br.get("entries", [])),
+              "the operator note is reachable in the branch timeline")
+        s, _, err = call_tool(base, "annotate_branch",
+                              {"branch_id": "branch#9999", "note": "x"})
+        check(isinstance(err, str) and "no such branch" in err,
+              "annotating a bogus branch id is a tool error, not a 500")
 
         print("== send_chat round-trip (operator authority via MCP) ==")
         s, _, out = call_tool(base, "send_chat",

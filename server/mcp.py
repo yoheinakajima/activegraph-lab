@@ -21,7 +21,10 @@ Tool tiers (ADR-016; get_errors added by ADR-023; ADR-021 expansion):
             event. annotate_decision (ADR-026) attaches a public,
             operator_via_mcp-attributed note to a PENDING decision — it
             does NOT and cannot resolve; annotation is commentary, not
-            authority.
+            authority. annotate_branch (ADR-028) attaches the same kind of
+            public commentary to a BRANCH (an operator_note observation),
+            changing no status — a bare annotation needing no pending
+            decision.
   EXCLUDED BY DESIGN: approve/reject of decisions and seam promotion
             remain EXCLUDED from MCP — the inbox stays human-only.
 """
@@ -42,8 +45,11 @@ INSTRUCTIONS = (
     "kernel ceiling). annotate_decision attaches a public pre-review note to "
     "a pending decision — commentary, not authority: the operator's UI "
     "prefills its rationale field from the latest note when they resolve. "
-    "Approving/rejecting decisions and seam promotion are deliberately not "
-    "available here — the inbox stays human-only (ADR-016/021/026)."
+    "annotate_branch attaches free-text commentary to a branch (an "
+    "operator_note that changes no status) when there is no decision to "
+    "annotate. Approving/rejecting decisions and seam promotion are "
+    "deliberately not available here — the inbox stays human-only "
+    "(ADR-016/021/026/028)."
 )
 
 _DEFAULT_LIMIT = 30
@@ -254,6 +260,29 @@ TOOLS: list[dict] = [
                          "description": "The annotation text (public, lands in the log)."},
             },
             "required": ["decision_id", "note"],
+        },
+    },
+    {
+        "name": "annotate_branch",
+        "description": "OPERATOR (ADR-028): attach free-text commentary to a "
+                       "BRANCH — a bare annotation that needs no pending "
+                       "decision and no command wording. Records a public, "
+                       "operator_via_mcp-attributed operator_note observation "
+                       "linked to the branch and changes NO status (an erratum "
+                       "or aside that is not a command has somewhere to land). "
+                       "Commentary, not control: it is safe on a branch in any "
+                       "state, archived included. For commentary ON a pending "
+                       "decision use annotate_decision; to STEER a branch use "
+                       "send_chat.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "branch_id": {"type": "string",
+                              "description": "A branch id, e.g. branch#7."},
+                "note": {"type": "string",
+                         "description": "The commentary (public, lands in the log)."},
+            },
+            "required": ["branch_id", "note"],
         },
     },
     {
@@ -668,6 +697,42 @@ def _annotate_decision(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dic
         return _tool_failure(msg_id, str(exc))
 
 
+def _annotate_branch(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dict:
+    """ADR-028 (Phase 4): a bare branch annotation — free-text operator
+    commentary recorded as an operator_note observation on the branch. The
+    handler can only create the observation and link it; no code path here
+    touches branch status, by construction."""
+    branch_id = (args.get("branch_id") or "").strip()
+    note = (args.get("note") or "").strip()
+    if not branch_id or not note:
+        return _tool_failure(msg_id, "branch_id and note are required")
+    get_rt()
+
+    def job(rt):
+        from lab_pack.tools import annotate_branch_fn
+        from server.lab_server import _save
+        before = rt.graph.get_object(branch_id)
+        before_status = before.data.get("status") if before is not None else None
+        obs = annotate_branch_fn(rt.graph, branch_id, note,
+                                 source="operator_via_mcp")
+        _save(rt)
+        after = rt.graph.get_object(branch_id)
+        return {
+            "branch_id": branch_id,
+            "status": after.data.get("status"),  # unchanged — by construction
+            "status_unchanged": after.data.get("status") == before_status,
+            "annotation_id": str(obs.id),
+            "note": ("operator note recorded (public, operator_via_mcp) as a "
+                     "branch observation. It changes no status — commentary, "
+                     "not control (ADR-028)."),
+        }
+
+    try:
+        return _tool_result(msg_id, run_on_worker(job))
+    except ValueError as exc:
+        return _tool_failure(msg_id, str(exc))
+
+
 def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
                 rate_limited) -> tuple[int, Optional[dict]]:
     """One streamable-HTTP POST: a single JSON-RPC message in, a single JSON
@@ -707,7 +772,7 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
         name = params.get("name")
         args = params.get("arguments") or {}
         if name in ("send_chat", "set_budget", "pause_lab", "resume_lab",
-                    "annotate_decision"):
+                    "annotate_decision", "annotate_branch"):
             if rate_limited():
                 return 429, _rpc_error(msg_id, -32000,
                                        "rate limited (30 mutations/min)")
@@ -720,6 +785,9 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
             if name == "annotate_decision":
                 return 200, _annotate_decision(msg_id, args, get_rt=get_rt,
                                                run_on_worker=run_on_worker)
+            if name == "annotate_branch":
+                return 200, _annotate_branch(msg_id, args, get_rt=get_rt,
+                                             run_on_worker=run_on_worker)
             return 200, _control_pause(msg_id, name == "pause_lab",
                                        get_rt=get_rt,
                                        run_on_worker=run_on_worker)

@@ -2706,15 +2706,11 @@ def _apply_steering(graph, branch_id: str, content: str,
         # command ("pause this branch") still wins; this is the fallback for
         # commentary that is not a command (the evt_17441 erratum, refused
         # because no verb matched). Status is never touched. MCP-allowed.
-        obs = graph.add_object("observation", {
-            "text": content,
-            "confidence": 1.0,
-            "category": "fact",
-            "metadata": {"lab": "operator_note", "kind": "operator_note",
-                         "lab_branch_id": branch_id, "message_id": msg_id,
-                         "source": source or "operator"},
-        })
-        graph.add_relation(branch_id, obs.id, "supported_by")
+        # Shares one recording shape with the bare MCP annotate_branch tool
+        # (Phase 4) via annotate_branch_fn.
+        from .tools import annotate_branch_fn
+        obs = annotate_branch_fn(graph, branch_id, content,
+                                 source=source or "operator", msg_id=msg_id)
         summary = f"operator note recorded as observation {obs.id}"
         event_id = _steering_event(graph, "note", branch_id, msg_id, summary,
                                    source, refs={"note_observation": obs.id})

@@ -28,9 +28,10 @@ Setup: `uv pip install --system -e .` (plain pip can't resolve activegraph-packs
       seam_no_bypass (only gate approval activates a seam). Keyed finding
       accident_became_policy_pinned added to LIVE_FINDINGS. Fixtures 29→31.
       No ADR (no invariant moved; pins ADR-012/015/019). GREEN.
-- [ ] PHASE 4 — operator_note/annotate reachability over MCP (finish ADR-028).
-      Verify bare branch-annotate over MCP exists; add if not (operator-tier,
-      records operator_note observation, no status change).
+- [x] PHASE 4 — bare branch-annotate over MCP added: tool annotate_branch
+      (operator-tier) + tools.annotate_branch_fn (shared with the note verb).
+      Records operator_note observation, no status change. ADR-028 amended.
+      test_mcp + sentinel audit cover it. GREEN.
 - [ ] PHASE 5 — cadence metadata: one-line "evidence profile" in each draft's
       review note (own-live vs inherited findings; distinct-branch span).
       No auto-block.

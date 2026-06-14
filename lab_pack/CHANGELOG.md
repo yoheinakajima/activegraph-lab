@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Bare branch annotation over MCP (ADR-028, Phase 4): new operator-tier tool
+  `annotate_branch(branch_id, note)` records free-text operator commentary as
+  an `operator_note` observation linked to the branch and changes NO status —
+  a deterministic place for an erratum or aside to land that needs no pending
+  decision and no command wording (the evt_17441 erratum had nowhere to go).
+  Shares one recording shape with the send_chat `note` steering verb via
+  `tools.annotate_branch_fn`. Adds no new authority; the inbox stays
+  human-only. Fixtures: test_mcp annotate_branch section; sentinel audit
+  covers its output.
+
 - Pinned two "accident became policy" safety properties (Phase 3) with named
   regression fixtures — a beneficial accident is one refactor from gone
   unless a test pins it. (1) `budget_cap_restart`: the daily budget cap
