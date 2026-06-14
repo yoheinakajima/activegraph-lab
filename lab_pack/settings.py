@@ -113,6 +113,23 @@ class LabSettings(BaseModel):
             "and its test output is top-tier work per the operator's tiering."
         ),
     )
+    # ── self-dispatched code repair (ADR-036, the self-repair loop's planner) ─
+    max_self_repair_branches: int = Field(
+        default=3,
+        ge=0,
+        le=16,
+        description=(
+            "Guardrail (ADR-036): the maximum number of concurrent (non-"
+            "decided, non-archived) SELF-PROPOSED code-repair branches the "
+            "planner may have open at once. The planner self-dispatches a "
+            "code-fix branch from the lab's OWN observed defects (routing "
+            "misses, tagged code-defect findings) about its OWN allowlisted "
+            "repo; this caps how many such branches can be in flight so self-"
+            "repair cannot run wild. Deliberately NOT seam-eligible — a "
+            "guardrail on self-modification stays in git, not in a gated "
+            "decision the lab could raise on itself. 0 disables self-dispatch."
+        ),
+    )
     dispatch_gap_check: bool = Field(
         default=True,
         description=(

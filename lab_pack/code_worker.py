@@ -169,6 +169,10 @@ def _run_metadata(result: dict) -> dict:
             "baseline": _compact(result.get("baseline")),
             "after_diff": _compact(result.get("after_diff")),
             "proven": bool(result.get("proven")),
+            # The post-fix file states a proven diff produced (ADR-036): the
+            # concrete contents an approved submit_pr commits. Never a secret —
+            # the sandbox env is credential-free by construction.
+            "changed_files": result.get("changed_files") or None,
             "run_error": result.get("error")}
 
 
@@ -205,6 +209,10 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
     spec = _resolve_spec(graph, data)
     repo, command = spec.get("repo"), spec.get("command")
     ref, diff = spec.get("ref"), spec.get("diff")
+    # ADR-036: a self-repair / operator-fix task asks the loop to LAND the
+    # proven fix as a PENDING (human-gated) submit_pr — carried verbatim so
+    # the synthesis stage knows to open one when the diff proves.
+    propose_pr = bool(spec.get("propose_pr"))
     run_cap = max(1, int(effective_setting(graph, settings, "code_run_cap")))
     timeout = max(5, int(effective_setting(graph, settings,
                                            "sandbox_timeout_seconds")))
@@ -309,6 +317,11 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
         "metadata": {"lab": "code_synthesis_request", "task_id": obj_id,
                      "lab_branch_id": branch_id, "code_run_obs": obs.id,
                      "repo": repo, "proven": bool(result.get("proven")),
+                     # ADR-036: the fix to land (diff) + the intent to land it
+                     # (propose_pr) ride to the synthesis stage, which opens a
+                     # gated submit_pr ONLY when the fix proves.
+                     "diff": diff if (diff and propose_pr) else None,
+                     "propose_pr": propose_pr,
                      "run": _run_metadata(result)},
     })
 
@@ -322,7 +335,9 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
     output_schema=CodeOutcome,
     model=None,  # routes through setting.model.code_worker (ADR-019/035)
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
-    creates=["observation", "evaluation"],
+    # artifact + decision: a PROVEN self-repair/operator-fix opens a gated
+    # submit_pr (a code_change artifact + a pending submit_pr decision) — ADR-036.
+    creates=["observation", "evaluation", "artifact", "decision"],
     max_tokens=1024,
     tools=[],
 )
@@ -398,10 +413,78 @@ def code_worker(event, graph, ctx, out, *, settings: LabSettings):
         t_meta = dict((task.data.get("metadata") if task else {}) or {})
         t_meta["result_summary"] = summary
         graph.patch_object(task_id, {"status": "done", "metadata": t_meta})
+        # ADR-036, the self-repair loop's last mile: a PROVEN fix the lab was
+        # asked to LAND (propose_pr) becomes a PENDING, human-gated submit_pr —
+        # the diff + the post-fix file states the sandbox produced, citing this
+        # run's sandbox_proven evaluation as the proof. The submit_pr stays
+        # doubly-gated and MCP-excluded (ADR-035): opening the PR is still the
+        # operator's tap; the lab only proposes. A fix that did NOT prove never
+        # reaches here (the else branch records the failure and opens nothing).
+        _maybe_propose_pr(graph, meta, evaluation.id, summary, stamp)
     else:
         _fail_task(graph, task_id,
                    "code_worker: sandbox run did not pass — " +
                    (summary or "the deciding command did not exit 0"))
+
+
+def _maybe_propose_pr(graph, req_meta: dict, proof_eval_id: str,
+                      summary: str, stamp) -> None:
+    """Open a gated submit_pr for a PROVEN self-repair / operator-fix diff
+    (ADR-036). Guarded: only when propose_pr was asked, a diff proved, and the
+    target is the lab's OWN allowlisted repo — self-dispatch never opens a PR
+    against anything but the lab's own code (the Phase-3 guardrail). The write
+    token is NOT touched here; propose_submit_pr_fn only opens the PENDING
+    decision the operator must approve."""
+    from .github_read import is_own_repo
+    repo = req_meta.get("repo")
+    diff = req_meta.get("diff")
+    if not (req_meta.get("propose_pr") and diff and repo):
+        return
+    if not is_own_repo(repo):
+        # A self-proposed fix may target ONLY the lab's own repo. (Should never
+        # reach here — self_repair bounds the proposal — but the loop's PR mouth
+        # enforces it independently: defense in depth, ADR-036.)
+        graph.add_object("observation", {
+            "text": (f"Self-repair PR NOT proposed: the proven fix targets "
+                     f"'{repo}', which is not the lab's own repo. Self-"
+                     f"dispatched repair is bounded to the lab's own "
+                     f"allowlisted repo (ADR-036)."),
+            "confidence": 1.0,
+            "category": "risk",
+            "metadata": {"lab": "self_repair_blocked", "repo": repo,
+                         "lab_branch_id": req_meta.get("lab_branch_id")},
+        })
+        return
+    branch_id = req_meta.get("lab_branch_id")
+    run = req_meta.get("run") or {}
+    files = (run.get("changed_files") or {})
+    head_branch = f"lab/self-repair-{str(branch_id or 'fix').replace('#', '-')}"
+    title = (f"Self-repair: {summary}" if summary else "Self-repair fix")[:120]
+    from .tools import propose_submit_pr_fn
+    artifact, decision = propose_submit_pr_fn(
+        graph, repo, head_branch=head_branch, title=title, diff=diff,
+        files=files, branch_id=branch_id, proof_refs=[proof_eval_id],
+        rationale=(
+            f"Open a pull request against {repo} for the fix the sandbox "
+            f"proved (see the cited sandbox_proven evaluation). The lab "
+            f"self-dispatched this repair from its own observed defect; the "
+            f"diff is proven green in the sandbox. On approval the lab pushes "
+            f"the branch and opens the PR; the operator reviews and merges on "
+            f"GitHub — two human gates, no auto-merge. Rejection touches no "
+            f"write token."))
+    obs = graph.add_object("observation", {
+        "text": (f"Self-repair fix proven in the sandbox — opened a PENDING "
+                 f"submit_pr decision ({decision.id}) for {repo}. The operator "
+                 f"approves (or rejects) it from the inbox; no PR exists yet."),
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "self_repair_pr_proposed", "repo": repo,
+                     "lab_branch_id": branch_id, "decision_id": decision.id,
+                     "artifact_id": artifact.id, "proof_eval": proof_eval_id,
+                     "seam_versions": stamp},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, obs.id, "supported_by")
 
 
 CODE_BEHAVIORS = [code_intake, code_worker]

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -225,6 +226,43 @@ def _live_clone(repo: str, ref: Optional[str], dest: str) -> Optional[str]:
     return None
 
 
+# A diff's target paths come from its `+++ b/<path>` hunks (the post-image
+# side). The submit_pr write path commits CONCRETE file contents, not a diff
+# (a diff cannot be applied server-side — propose_submit_pr_fn), so after a
+# fix-task proves its diff in the sandbox the resulting file states are read
+# back from these paths and ride into the PR. /dev/null targets (a pure
+# deletion) carry no post-image content and are skipped.
+_DIFF_TARGET_RE = re.compile(r"^\+\+\+ (?:b/)?(\S+)", re.M)
+
+
+def _diff_target_paths(diff: str) -> list[str]:
+    out: list[str] = []
+    for path in _DIFF_TARGET_RE.findall(diff or ""):
+        path = path.strip()
+        if path and path != "/dev/null" and path not in out:
+            out.append(path)
+    return out
+
+
+def _read_changed_files(repo_dir: str, diff: str) -> dict[str, str]:
+    """The post-fix contents of the files a proven diff touched, read from the
+    cloned-and-patched working tree — the concrete states the PR commits.
+    Bounded by the same per-file char cap as a captured stream; unreadable
+    targets (a deletion, a binary) are simply omitted."""
+    files: dict[str, str] = {}
+    for path in _diff_target_paths(diff):
+        # Stay inside the repo dir — never follow a traversal in a path.
+        full = os.path.normpath(os.path.join(repo_dir, path))
+        if not full.startswith(os.path.normpath(repo_dir) + os.sep):
+            continue
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                files[path] = _truncate(f.read())
+        except (OSError, UnicodeDecodeError):
+            continue
+    return files
+
+
 def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     """git apply a unified diff inside the cloned repo. Returns an error
     string or None."""
@@ -267,6 +305,8 @@ def run_repo_task(
                          stdout, stderr, error},
           "after_diff": {...} | None,     # present only for a fix-task
           "proven":     bool,             # the run that decides success exited 0
+          "changed_files": {path: content} | None,  # a PROVEN fix-task only:
+                         # the post-fix file states the PR commits (ADR-036)
           "error":      str | None,       # refusal / clone / apply failure
         }
 
@@ -276,7 +316,8 @@ def run_repo_task(
     """
     base_result: dict[str, Any] = {
         "repo": repo, "ref": ref, "command": command,
-        "baseline": None, "after_diff": None, "proven": False, "error": None,
+        "baseline": None, "after_diff": None, "proven": False,
+        "changed_files": None, "error": None,
     }
     allow_err = _check_repo(repo)
     if allow_err:
@@ -310,6 +351,11 @@ def run_repo_task(
             after = _exec(command, repo_dir, timeout_seconds, mem_limit_mb)
             base_result["after_diff"] = after
             base_result["proven"] = (after.get("exit_code") == 0)
+            if base_result["proven"]:
+                # The fix is proven — read back the patched file states so the
+                # PR can commit concrete contents (ADR-036). Only on success:
+                # an unproven diff is not a fix to land.
+                base_result["changed_files"] = _read_changed_files(repo_dir, diff)
         else:
             base_result["proven"] = (baseline.get("exit_code") == 0)
         return base_result

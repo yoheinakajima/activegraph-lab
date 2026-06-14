@@ -3084,6 +3084,269 @@ def run_submit_pr() -> bool:
     return c.done("submit_pr")
 
 
+def run_self_repair() -> bool:
+    """ADR-036: the self-repair loop's PLANNER. The lab turns its OWN observed
+    code defects (a routing_miss; a finding tagged code_defect) into GATED
+    code-fix branch proposals routed codebase.code_task — no operator
+    authoring. The full loop runs to a PENDING submit_pr; guardrails hold
+    (non-own-repo NOT self-dispatched; a fix that fails its proof opens no PR;
+    the concurrency cap)."""
+    spec = _load("self_repair.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: self_repair — own defect → planner proposes code-fix "
+          "branch → code worker proves → pending submit_pr; guardrails")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write, repo_sandbox
+    from lab_pack.bundle import LIVE_FINDINGS
+
+    def fake_clone(repo, ref, dest):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "check.py"), "w") as f:
+            f.write(_CHECK_FAIL)
+        return None
+
+    def srb(g, obs_id=None):
+        out = [b for b in g.objects(type="branch")
+               if (b.data.get("metadata") or {}).get("self_repair")]
+        if obs_id is not None:
+            out = [b for b in out
+                   if (b.data.get("metadata") or {}).get("repair_source_obs")
+                   == obs_id]
+        return out
+
+    def task_for(g, branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    c = Check()
+
+    # The write-token sentinel: the loop drafts + proposes but NEVER opens a PR
+    # here (no approval), so the token must reach NOTHING — same audit as the
+    # submit_pr fixture.
+    SENTINEL = "ghp_SELFREPAIR_WRITE_SENTINEL_zz77"
+    saved = os.environ.get("GITHUB_WRITE_TOKEN")
+    os.environ["GITHUB_WRITE_TOKEN"] = SENTINEL
+    opener_calls: list = []
+    github_write.set_pr_opener(
+        lambda *a, **k: (opener_calls.append((a, k)) or {"url": "x", "number": 0,
+                                                         "head": "x", "base": "x"}))
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        rt = _new_runtime(spec, with_gateway=False, with_comm=True)
+        g = rt.graph
+        mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+        seed = create_branch_fn(g, mission.id, "Lab self-observation",
+                                "the lab's own log", status="active")
+        rt.run_until_idle()
+
+        def seed_obs(meta_extra: dict, text: str):
+            o = g.add_object("observation", {
+                "text": text, "confidence": 0.95, "category": "risk",
+                "metadata": {"lab_branch_id": seed.id, "mission_id": mission.id,
+                             **meta_extra}})
+            g.add_relation(seed.id, o.id, "supported_by")
+            rt.run_until_idle()
+            return o
+
+        # ── Leg A: a routing_miss → the planner proposes a gated code-fix branch
+        rm = spec["routing_miss"]
+        obs_a = seed_obs({"lab": "routing_miss", "task_id": "task#a",
+                          "misrouted_from": rm["misrouted_from"],
+                          "correct_routing": rm["correct_routing"]},
+                         rm["text"].strip())
+        ba = srb(g, obs_a.id)
+        c.that(len(ba) == 1, f"routing_miss → exactly one self-repair branch "
+                             f"proposed ({len(ba)})")
+        if ba:
+            bm = ba[0].data.get("metadata") or {}
+            ct = bm.get("code_task") or {}
+            c.that(ba[0].data.get("status") == "proposed"
+                   and ba[0].data.get("authority") == "gated",
+                   "the self-repair branch is proposed + gated (operator activates)")
+            c.that(ct.get("repo") == "yoheinakajima/activegraph-lab"
+                   and ct.get("propose_pr") is True,
+                   "its code_task targets the lab's OWN repo + asks to propose a PR")
+            c.that(obs_a.id in (bm.get("repair_evidence") or []),
+                   "the routing_miss observation rides as the fix task's evidence")
+        print("  A: routing_miss → proposed+gated codebase.code_task branch")
+
+        # ── Leg B: observation#1046 (the source-selection bug) → unaided proposal
+        ssf = next((f for f in LIVE_FINDINGS
+                    if f["key"] == "research_source_selection_starves_operator_urls"),
+                   None)
+        c.that(ssf is not None
+               and (ssf.get("metadata") or {}).get("code_defect") is True
+               and (ssf.get("metadata") or {}).get("repo")
+               == "yoheinakajima/activegraph-lab",
+               "the source-selection finding ships tagged code_defect for the "
+               "lab's own repo (so the boot path seeds it self-dispatchable)")
+        obs_b = seed_obs({"lab": "finding", "finding": True,
+                          **(ssf["metadata"] if ssf else {})},
+                         (ssf["text"] if ssf else "source selection bug"))
+        bb = srb(g, obs_b.id)
+        c.that(len(bb) == 1,
+               "observation#1046 → the planner proposes its fix UNAIDED "
+               "(no operator authoring) — the canonical first case")
+        print("  B: observation#1046 → planner proposes its fix unaided")
+
+        # ── Leg C: full loop — tagged defect WITH a proven fix → submit_pr ────
+        cdf = spec["code_defect_with_fix"]
+        obs_c = seed_obs({"lab": "finding", "finding": True, "code_defect": True,
+                          "repo": cdf["repo"], "fix_command": cdf["fix_command"],
+                          "fix_diff": _FIX_DIFF}, cdf["text"].strip())
+        bc = srb(g, obs_c.id)
+        c.that(len(bc) == 1 and (bc[0].data.get("metadata") or {})
+               .get("code_task", {}).get("diff") == _FIX_DIFF,
+               "tagged code defect → a self-repair branch carrying the candidate fix")
+        if bc:
+            activate_branch_fn(g, bc[0].id)
+            rt.run_until_idle()
+            tc = task_for(g, bc[0].id)
+            c.that(tc is not None
+                   and (tc.data.get("metadata") or {}).get("routing")
+                   == {"domain": "codebase", "capability": "code_task"},
+                   "activation dispatches a codebase.code_task (the routing is real)")
+            c.that(tc is not None and tc.data.get("status") == "done",
+                   f"the code worker proves the fix (task "
+                   f"{tc.data.get('status') if tc else None})")
+            pr_decs = [d for d in g.objects(type="decision")
+                       if d.data.get("kind") == "submit_pr"
+                       and (d.data.get("metadata") or {}).get("lab_branch_id")
+                       == bc[0].id]
+            c.that(len(pr_decs) == 1 and pr_decs[0].data.get("status") == "pending"
+                   and (pr_decs[0].data.get("metadata") or {})
+                   .get("approval_requested_at"),
+                   f"a PENDING submit_pr decision is opened + surfaced "
+                   f"({len(pr_decs)})")
+            if pr_decs:
+                art = g.get_object(pr_decs[0].data.get("subject_ref"))
+                proofs = [r for r in (pr_decs[0].data.get("evidence_refs") or [])
+                          if (g.get_object(r) is not None
+                              and g.get_object(r).type == "evaluation")]
+                c.that(art is not None and art.data.get("kind") == "code_change"
+                       and _FIX_DIFF.strip()[:20] in (art.data.get("content") or ""),
+                       "the change is a gated code_change artifact carrying the diff")
+                c.that((art.data.get("metadata") or {}).get("files", {})
+                       .get("check.py", "").strip() == "import sys; sys.exit(0)",
+                       "the PR commits the PROVEN post-fix file contents (from the "
+                       "sandbox), not just a diff")
+                c.that(any((g.get_object(r).data.get("judgment")
+                            == "sandbox_proven") for r in proofs),
+                       "the sandbox_proven evaluation is cited as the PR's proof")
+            c.that(len(_lab_obs(g, "self_repair_pr_proposed")) == 1,
+                   "a self_repair_pr_proposed observation records the gated PR")
+            c.that(not opener_calls,
+                   "NO write token is exercised — the submit_pr stays pending "
+                   "(opening the PR is the operator's tap)")
+        print("  C: proven fix → PENDING submit_pr (no PR opened, gated)")
+
+        # ── Leg D: Phase 2 — the operator 'fix' verb hands a bug in ───────────
+        _thread, msg = send_branch_message_fn(
+            g, seed.id, "fix the smoke check on main\ncommand: true")
+        rt.run_until_idle()
+        fix_branches = [b for b in g.objects(type="branch")
+                        if (b.data.get("metadata") or {}).get("repair_kind")
+                        == "operator_fix"]
+        c.that(len(fix_branches) == 1
+               and fix_branches[0].data.get("status") != "proposed",
+               f"the operator 'fix' verb creates + activates a code-fix branch "
+               f"(activated, not left proposed) ({len(fix_branches)}, "
+               f"status={fix_branches[0].data.get('status') if fix_branches else None})")
+        if fix_branches:
+            ft = task_for(g, fix_branches[0].id)
+            c.that(ft is not None
+                   and (ft.data.get("metadata") or {}).get("routing")
+                   == {"domain": "codebase", "capability": "code_task"},
+                   "it dispatches a codebase.code_task — same downstream path")
+        cand = next((x for x in g.objects(type="comm_response_candidate")
+                     if x.data.get("message_id") == msg.id), None)
+        reply = (cand.data.get("content") or "") if cand else ""
+        c.that("Applied" in reply and "submit_pr" in reply,
+               "the reply confirms the fix dispatched + that the PR stays gated")
+        print("  D: operator 'fix' verb → active codebase.code_task branch")
+
+        # ── Leg E1: a tagged defect about a NON-own repo → NOT self-dispatched ─
+        before = len(srb(g))
+        obs_e1 = seed_obs({"lab": "finding", "finding": True, "code_defect": True,
+                           "repo": "yoheinakajima/activegraph-packs",
+                           "fix_command": "python check.py"},
+                          "Finding: a parser bug in the packs repo.")
+        c.that(len(srb(g)) == before and len(srb(g, obs_e1.id)) == 0,
+               "a code defect about a NON-own (allowlisted) repo is NOT "
+               "self-dispatched — only the lab's OWN repo (ADR-005 guardrail)")
+        print("  E1: non-own-repo defect NOT self-dispatched")
+
+        # ── Leg E2: a fix that FAILS its proof → no submit_pr ──────────────────
+        und = spec["unprovable_defect"]
+        obs_e2 = seed_obs({"lab": "finding", "finding": True, "code_defect": True,
+                           "repo": und["repo"], "fix_command": und["fix_command"],
+                           "fix_diff": _FIX_DIFF}, und["text"].strip())
+        be2 = srb(g, obs_e2.id)
+        if be2:
+            activate_branch_fn(g, be2[0].id)
+            rt.run_until_idle()
+            te2 = task_for(g, be2[0].id)
+            pr_e2 = [d for d in g.objects(type="decision")
+                     if d.data.get("kind") == "submit_pr"
+                     and (d.data.get("metadata") or {}).get("lab_branch_id")
+                     == be2[0].id]
+            c.that(te2 is not None and te2.data.get("status") == "rejected",
+                   "an unprovable fix fails its sandbox proof (task rejected)")
+            c.that(not pr_e2,
+                   "a fix that fails its proof opens NO submit_pr (it must earn "
+                   "the PR — the Phase-3 guardrail)")
+        print("  E2: failed proof → no submit_pr")
+
+        # ── write-token sentinel: NOTHING the loop wrote carries the token ────
+        import json as _json
+        corpus = _json.dumps({
+            "events": [{"type": str(e.type), "payload": e.payload} for e in g.events],
+            "objects": [{"id": str(o.id), "data": o.data} for o in g.all_objects()],
+        }, default=str)
+        c.that(SENTINEL not in corpus,
+               "GITHUB_WRITE_TOKEN appears in NO event payload or object "
+               "(sentinel-clean — self-repair drafts + proposes, never writes)")
+
+        # ── Leg E3: the concurrency cap (own runtime, cap=1) ──────────────────
+        cap_spec = dict(spec)
+        cap_spec["settings"] = {**spec["settings"], "max_self_repair_branches": 1}
+        rt2 = _new_runtime(cap_spec, with_gateway=False, with_comm=False)
+        g2 = rt2.graph
+        m2 = create_mission_fn(g2, "cap mission", target_url="")
+        s2 = create_branch_fn(g2, m2.id, "obs", "log", status="active")
+        rt2.run_until_idle()
+        for i in range(2):
+            o = g2.add_object("observation", {
+                "text": f"Misrouted, capability available: routing miss {i}.",
+                "confidence": 0.95, "category": "risk",
+                "metadata": {"lab": "routing_miss", "task_id": f"task#{i}",
+                             "misrouted_from": "codebase.code_task",
+                             "correct_routing": "research.deep_research",
+                             "lab_branch_id": s2.id, "mission_id": m2.id}})
+            g2.add_relation(s2.id, o.id, "supported_by")
+            rt2.run_until_idle()
+        capped = [b for b in g2.objects(type="branch")
+                  if (b.data.get("metadata") or {}).get("self_repair")]
+        c.that(len(capped) == 1,
+               f"the cap holds: only 1 self-repair branch in flight with cap=1 "
+               f"({len(capped)})")
+        c.that(len(_lab_obs(g2, "self_repair_capped")) >= 1,
+               "the over-cap defect records a self_repair_capped idle observation")
+        print("  E3: concurrency cap holds (cap=1 → 1 branch)")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        github_write.set_pr_opener(None)
+        if saved is None:
+            os.environ.pop("GITHUB_WRITE_TOKEN", None)
+        else:
+            os.environ["GITHUB_WRITE_TOKEN"] = saved
+
+    return c.done("self_repair")
+
+
 def run_rejection_lifecycle() -> bool:
     spec = _load("rejection_lifecycle.yaml")
     print("\n" + "=" * 64)
@@ -4042,6 +4305,7 @@ def run_all() -> None:
         run_research_worker(),
         run_code_worker(),
         run_submit_pr(),
+        run_self_repair(),
         run_seam_proposal(),
         run_seam_verbatim(),
         run_github_read(),

@@ -158,6 +158,12 @@ _IDLE_LOGGED: dict[str, bool] = {"capped": False}  # one idle obs per cap episod
 _BRANCH_EVIDENCE: dict[str, list[str]] = {}  # branch id → supported_by targets
 # (BehaviorGraph has no relation iteration, so evidence counting inside
 # behaviors goes through this registry, fed by relation.created events.)
+# Self-dispatched code repair (ADR-036): the planner turns the lab's OWN
+# observed defects into gated code-fix branch proposals. These caches keep it
+# bounded and idempotent (rebuilt from the graph on resume, never the truth):
+_SELF_REPAIR_PROPOSED: set[str] = set()   # defect obs ids already self-dispatched
+_SELF_REPAIR_OPEN: set[str] = set()       # self-repair branch ids still in flight
+_SELF_REPAIR_CAPPED: dict[str, bool] = {"logged": False}  # one idle obs per cap
 
 
 def clear_lab_registry() -> None:
@@ -190,6 +196,9 @@ def clear_lab_registry() -> None:
     _DECIDED_THIN.clear()
     _PENDING_PUBLISH.clear()
     _IDLE_LOGGED["capped"] = False
+    _SELF_REPAIR_PROPOSED.clear()
+    _SELF_REPAIR_OPEN.clear()
+    _SELF_REPAIR_CAPPED["logged"] = False
     from .research_worker import clear_research_worker_registry
     clear_research_worker_registry()
     from .code_worker import clear_code_worker_registry
@@ -1168,6 +1177,237 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
             })
             _BRANCH_COUNT["open"] += 1
             graph.add_relation(child.id, branch_id, "forked_from")
+
+
+# ---------------------------------------------------------------- self_repair
+# ADR-036: the self-repair loop's PLANNER. The lab already records its own
+# code defects — a `routing_miss` (the capability self-check's OWN verdict that
+# a task was a routing/code bug, not a capability absence — ADR-031), and
+# findings the build tags as open code defects about the lab's own code. This
+# behavior turns such a defect into a GATED code-fix branch proposal routed
+# codebase.code_task, carrying the defect's evidence so the code worker can act
+# on it — lab-repairs-lab, not operator-hands-lab-each-bug.
+#
+# Bounds (the Phase-3 guardrails live HERE and in the code worker's PR mouth):
+#   * OWN repo only — a self-proposed fix targets ONLY yoheinakajima/
+#     activegraph-lab (the lab's own allowlisted repo). An upstream-tagged
+#     finding or a non-own repo is never self-dispatched (CONTRACT.md / ADR-005:
+#     the lab never edits the packs repo or activegraph core).
+#   * CONCRETE evidence only — a routing_miss is concrete by construction (it
+#     names the misrouted lane + the task); a finding qualifies only when the
+#     build EXPLICITLY tagged it metadata.code_defect (an open defect with a
+#     proving harness). Free-text cue-matching would misfire on the many
+#     findings that DESCRIBE already-fixed bugs ("Fixed by …") — re-proposing
+#     phantom repairs.
+#   * GATED like any branch — the proposal is status=proposed/authority=gated;
+#     the operator activates it (the existing dispatch path), and the resulting
+#     submit_pr is doubly-gated and MCP-excluded (ADR-035). The lab proposes;
+#     the operator taps.
+#   * CAPPED — at most setting.max_self_repair_branches in flight at once, so
+#     self-dispatch cannot run wild. 0 disables it.
+#   * LIVE LANE only — proposed only when the code worker is enabled; proposing
+#     a code fix into a dead lane would be the very dishonesty ADR-031 forbids.
+
+# The default proof harness for a self-repair branch: the lab's own fixture
+# suite. A routing/parser fix is proven by the suite staying green; a finding
+# may name a tighter command in metadata.fix_command.
+_SELF_REPAIR_DEFAULT_COMMAND = "python -m lab_pack.fixtures.run_fixtures"
+
+
+def _self_repair_target(graph, obs_id: str, data: dict) -> Optional[dict]:
+    """If `data` is a self-repairable defect about the lab's OWN repo, return a
+    fix spec {repo, command, diff?, evidence, reason, kind}; else None
+    (ADR-036). Conservative by design — see the guardrails above."""
+    from .github_read import LAB_OWN_REPO, is_own_repo
+    meta = data.get("metadata") or {}
+    lab = meta.get("lab")
+    text = data.get("text") or ""
+    # Upstream bugs are NEVER self-dispatched (CONTRACT.md / ADR-005). The
+    # findings tag upstream ones in their text ("(upstream, activegraph core)").
+    if "(upstream" in text.lower():
+        return None
+
+    if lab == "routing_miss":
+        # The capability self-check classified this as a routing/code bug in
+        # the lab's OWN router (ADR-031). Concrete by construction.
+        evidence = [obs_id]
+        if meta.get("task_id"):
+            evidence.append(str(meta["task_id"]))
+        return {
+            "repo": LAB_OWN_REPO,
+            "command": _SELF_REPAIR_DEFAULT_COMMAND,
+            "diff": None,
+            "evidence": evidence,
+            "reason": (f"routing miss ({meta.get('misrouted_from')} → "
+                       f"{meta.get('correct_routing')}): {text[:240]}"),
+            "kind": "routing_miss",
+        }
+
+    if lab == "finding" and meta.get("code_defect"):
+        repo = meta.get("repo") or LAB_OWN_REPO
+        if not is_own_repo(repo):
+            return None  # a tagged defect about a non-own repo is out of bounds
+        evidence = [obs_id] + [r for r in (meta.get("evidence_refs") or [])]
+        return {
+            "repo": repo,
+            "command": meta.get("fix_command") or _SELF_REPAIR_DEFAULT_COMMAND,
+            "diff": meta.get("fix_diff"),
+            "evidence": evidence,
+            "reason": text[:300],
+            "kind": "code_defect",
+        }
+    return None
+
+
+def _open_self_repair_count(graph) -> int:
+    """Self-repair branches still in flight (proposed/active/interpreting) —
+    pruning resolved (decided/archived) ones lazily from the cache (the cache
+    is never the truth; the graph is)."""
+    n = 0
+    for bid in list(_SELF_REPAIR_OPEN):
+        b = graph.get_object(bid)
+        if b is None or b.data.get("status") in ("decided", "archived"):
+            _SELF_REPAIR_OPEN.discard(bid)
+        else:
+            n += 1
+    return n
+
+
+def _propose_code_fix_branch(graph, *, repo: str, command: str,
+                             diff: Optional[str], evidence: list[str],
+                             reason: str, kind: str, mission_id: Optional[str],
+                             title: str, source_obs: Optional[str],
+                             proposed_by: str, status: str = "proposed",
+                             extra_meta: Optional[dict] = None):
+    """Create a code-fix branch routed codebase.code_task (ADR-036). The
+    code_task spec on the branch is itself the routing signal — _dispatch_branch
+    sends it to the codebase lane regardless of the intent's verb, and
+    propose_pr asks the code worker to open a gated submit_pr once the fix
+    proves. Shared by self_repair (status=proposed, the planner) and the
+    operator 'fix' verb (Phase 2, activated by the operator)."""
+    code_task: dict[str, Any] = {"repo": repo, "command": command,
+                                 "propose_pr": True}
+    if diff:
+        code_task["diff"] = diff
+    ev = ", ".join(evidence) if evidence else "the linked defect observation"
+    intent = (
+        f"Fix the lab's own observed defect ({kind}) in {repo}: {reason} "
+        f"Author a minimal fix, prove it in the sandbox by running "
+        f"`{command}`, and open a gated pull request. "
+        f"Evidence: {ev}.")
+    meta: dict[str, Any] = {
+        "reasoning": (f"The lab logged a fixable {kind} about its own code "
+                      f"({source_obs or 'operator request'}). Self-dispatching "
+                      f"a gated code-fix branch routes it to the code worker, "
+                      f"which clones the allowlisted repo, proves a fix in the "
+                      f"sandbox, and opens a human-gated submit_pr — the lab "
+                      f"repairs the lab, the operator approves the PR."),
+        "self_repair": True,
+        "repair_kind": kind,
+        "repair_source_obs": source_obs,
+        "repair_evidence": evidence,
+        "code_task": code_task,
+        "proposed_by": proposed_by,
+        "seam_versions": seam_versions_stamp(graph, "charter.mission"),
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    branch = graph.add_object("branch", {
+        "title": title[:120],
+        "intent": intent,
+        "status": status,
+        "authority": "gated",
+        "mission_id": mission_id,
+        "metadata": meta,
+    })
+    if mission_id:
+        graph.add_relation(mission_id, branch.id, "has_branch")
+    for ref in evidence:
+        o = graph.get_object(ref)
+        # supported_by links a branch to its EVIDENCE objects (observation /
+        # evaluation) — the schema restricts the target type. The operator-fix
+        # path's evidence is a comm_message (the message stays the record via
+        # metadata.operator_request); it is not linked here. Non-resolvable
+        # refs (a placeholder task id) are skipped too.
+        if o is not None and str(o.type) in ("observation", "evaluation"):
+            graph.add_relation(branch.id, ref, "supported_by")
+    return branch
+
+
+@behavior(
+    name="self_repair",
+    on=["object.created"],
+    creates=["branch", "observation"],
+)
+def self_repair(event, graph, ctx, *, settings: LabSettings):
+    """Propose a gated code-fix branch for the lab's OWN observed defects.
+
+    On: object.created (observation) that is a self-repairable defect about the
+        lab's own repo — a routing_miss (ADR-031's code-bug verdict) or a
+        finding the build tagged metadata.code_defect.
+    Creates: branch (proposed, gated, routed codebase.code_task via its
+        code_task spec) carrying the defect's evidence — the operator activates
+        it and the code worker clones/proves/opens a gated submit_pr.
+
+    Dark unless the code worker is live (no proposing into a dead lane —
+    ADR-031) and the self-repair cap allows it (ADR-036 guardrail).
+    """
+    if not settings.code_worker_enabled:
+        return  # no reactor for the code lane → proposing a fix would be a lie
+    cap = settings.max_self_repair_branches
+    if cap <= 0:
+        return  # self-dispatch disabled
+    obj = event.payload.get("object", {})
+    if obj.get("type") != "observation":
+        return
+    obs_id = obj.get("id")
+    data = obj.get("data", {})
+    if not obs_id or obs_id in _SELF_REPAIR_PROPOSED:
+        return
+
+    target = _self_repair_target(graph, obs_id, data)
+    if target is None:
+        return
+
+    # Cap on concurrent self-repair branches (the guardrail). Over it, idle and
+    # record ONE observation per cap episode — the operator's attention is a
+    # budget here too, and the defect stays in the log to revisit.
+    if _open_self_repair_count(graph) >= cap:
+        if not _SELF_REPAIR_CAPPED["logged"]:
+            _SELF_REPAIR_CAPPED["logged"] = True
+            graph.add_object("observation", {
+                "text": (f"Self-repair idle: {cap} self-proposed code-fix "
+                         f"branch(es) already in flight (the cap). The newly "
+                         f"observed defect ({target['kind']}) stays in the log; "
+                         f"the planner will propose a fix once a slot frees."),
+                "confidence": 1.0,
+                "category": "fact",
+                "metadata": {"lab": "self_repair_capped",
+                             "defect_obs": obs_id, "cap": cap},
+            })
+        return
+    if _BRANCH_COUNT["open"] >= effective_setting(graph, settings,
+                                                  "max_open_branches"):
+        return
+    _SELF_REPAIR_CAPPED["logged"] = False
+
+    meta = data.get("metadata") or {}
+    mission_id = meta.get("mission_id")
+    if not mission_id and meta.get("lab_branch_id"):
+        src_branch = graph.get_object(meta["lab_branch_id"])
+        if src_branch is not None:
+            mission_id = src_branch.data.get("mission_id")
+
+    short = target["reason"].strip().rstrip(".")[:80]
+    branch = _propose_code_fix_branch(
+        graph, repo=target["repo"], command=target["command"],
+        diff=target.get("diff"), evidence=target["evidence"],
+        reason=target["reason"], kind=target["kind"], mission_id=mission_id,
+        title=f"Self-repair: {short}", source_obs=obs_id,
+        proposed_by="lab.self_repair", status="proposed")
+    _SELF_REPAIR_PROPOSED.add(obs_id)
+    _SELF_REPAIR_OPEN.add(branch.id)
+    _BRANCH_COUNT["open"] += 1
 
 
 # ---------------------------------------------------------------- digest
@@ -2437,6 +2677,15 @@ _STEER_PROPOSE = ("propose",)
 _STEER_ACTIVATE = ("activate",)
 _STEER_DEACTIVATE = ("deactivate",)
 _STEER_RECRAWL = ("recrawl", "re-crawl")
+# ADR-036, Phase 2: the operator front door to the self-repair loop. "fix"
+# hands a bug in directly — it proposes a code-fix branch (routed
+# codebase.code_task) from the operator's message and activates it, the same
+# downstream path the planner's self-dispatch takes. Secondary to Phase 1.
+# "code" is deliberately NOT an alias: it is overwhelmingly the NOUN ("verify
+# the code"), the same collision ADR-025's routing carefully avoids — using it
+# as a verb would fire on ordinary prose. Word-boundary matched, so "prefix"/
+# "fixed"/"fixes" never trip it.
+_STEER_FIX = ("fix",)
 # ADR-028: commentary, not control — records the operator's message as a
 # branch observation. The one steering verb that claims nothing and changes
 # nothing; MCP-allowed (it is not authority over the branch).
@@ -2445,7 +2694,7 @@ _STEER_NOTE = ("note", "comment")
 # The verb set a refusal names (ADR-025). Order = documentation order.
 SUPPORTED_STEERING_VERBS = (
     "pause", "resume", "activate", "deactivate", "draft", "approve",
-    "reject", "recrawl", "note", "propose <seam>")
+    "reject", "recrawl", "fix", "note", "propose <seam>")
 
 # Action-shaped requests no steering verb supports. When one of these appears
 # and no supported verb matched, the reply is an explicit refusal naming the
@@ -2700,7 +2949,8 @@ def _resolve_decision_verb(graph, branch_id: str, msg_id: str, verb: str,
 
 def _apply_steering(graph, branch_id: str, content: str,
                     msg_id: Optional[str] = None,
-                    source: Optional[str] = None) -> Optional[dict]:
+                    source: Optional[str] = None,
+                    settings: Optional[LabSettings] = None) -> Optional[dict]:
     """Deterministic steering: the effect lands at this event boundary and
     the reply is composed AFTER it, from post-mutation graph state
     (ADR-025). Returns None when no steering verb matched, else a result
@@ -2722,7 +2972,7 @@ def _apply_steering(graph, branch_id: str, content: str,
             and not _has_verb(low, _STEER_NOTE):
         other_verbs = (_STEER_PAUSE + _STEER_RESUME + _STEER_DEACTIVATE
                        + _STEER_RECRAWL + _STEER_DRAFT + _STEER_APPROVE
-                       + _STEER_REJECT + _STEER_PROPOSE)
+                       + _STEER_REJECT + _STEER_PROPOSE + _STEER_FIX)
         if _has_verb(low, other_verbs) or _unsupported_action(low):
             return {"kind": "refused", "verb": "archived", "event_id": None,
                     "summary": (
@@ -2860,6 +3110,45 @@ def _apply_steering(graph, branch_id: str, content: str,
                                    refs={"crawl_request": req.id,
                                          "mission_id": mission.id})
         return _applied("recrawl", summary, event_id)
+    if _has_verb(low, _STEER_FIX):
+        # ADR-036, Phase 2: the operator front door to the self-repair loop.
+        # Hand a bug in directly — propose a code-fix branch (routed
+        # codebase.code_task) from the message and ACTIVATE it so the code
+        # worker clones/proves and opens a GATED submit_pr. Same downstream
+        # path as the planner's self-dispatch (Phase 1); the difference is the
+        # operator supplied the bug instead of the lab's own log. Bounded to
+        # the lab's own repo (the code worker's PR mouth enforces it too), and
+        # the resulting submit_pr stays human-gated + MCP-excluded — the
+        # operator's tap remains the only way a PR opens.
+        from .github_read import LAB_OWN_REPO
+        if settings is None or not settings.code_worker_enabled:
+            return _noop("fix", "The code worker is disabled, so a code-fix "
+                                "branch would dispatch into a dead lane. "
+                                "Enable the code worker, then ask again.")
+        m = re.search(r"(?:^|\n)\s*command:\s*(.+)", content, re.I)
+        command = (m.group(1).strip() if m else _SELF_REPAIR_DEFAULT_COMMAND)
+        mission = graph.get_object(branch.data.get("mission_id")) \
+            if branch.data.get("mission_id") else None
+        new_branch = _propose_code_fix_branch(
+            graph, repo=LAB_OWN_REPO, command=command, diff=None,
+            evidence=[msg_id] if msg_id else [],
+            reason=f"operator-reported defect: {content[:240]}",
+            kind="operator_fix",
+            mission_id=(mission.id if mission is not None
+                        else branch.data.get("mission_id")),
+            title=f"Operator fix: {content[:70].strip()}",
+            source_obs=None, proposed_by="lab.answer.fix", status="active",
+            extra_meta={"operator_request": content[:400],
+                        "activation_message": content})
+        _DISPATCHED.discard(new_branch.id)
+        summary = (f"operator fix dispatched as code-fix branch {new_branch.id} "
+                   f"(active, routed codebase.code_task; proving command "
+                   f"`{command}`). The code worker clones, proves, and opens a "
+                   f"GATED submit_pr — opening the PR stays your tap.")
+        event_id = _steering_event(graph, "fix", branch_id, msg_id, summary,
+                                   source, refs={"fix_branch": new_branch.id,
+                                                 "command": command})
+        return _applied("fix", summary, event_id)
     if _has_verb(low, _STEER_DRAFT):
         # 4b escape hatch: the operator can request a draft on anything.
         # Explicit attention — bypasses the pending-publish cap (ADR-014).
@@ -2929,7 +3218,7 @@ def _apply_steering(graph, branch_id: str, content: str,
         "depth": 1,
         "recent_events": 0,
     },
-    creates=["comm_response_candidate", "observation", "source"],
+    creates=["comm_response_candidate", "observation", "source", "branch"],
     max_tokens=1024,
     tools=[],
 )
@@ -2971,7 +3260,7 @@ def answer(event, graph, ctx, out, *, settings: LabSettings):
     consume_llm_anomalies(graph)
     content = data.get("content") or ""
     result = _apply_steering(graph, branch_id, content, msg_id,
-                             source=meta.get("source"))
+                             source=meta.get("source"), settings=settings)
 
     # Post-mutation state: read AFTER steering applied (ADR-025).
     branch = graph.get_object(branch_id)
@@ -3046,6 +3335,6 @@ from .research_worker import research_intake, research_worker  # noqa: E402
 # at import time.
 from .code_worker import code_intake, code_worker  # noqa: E402
 
-BEHAVIORS = [ingest, plan, work, research_intake, interpret, digest, gate,
-             draft_writer, research_worker, code_intake, code_worker,
-             seam_writer, answer]
+BEHAVIORS = [ingest, plan, work, research_intake, interpret, self_repair,
+             digest, gate, draft_writer, research_worker, code_intake,
+             code_worker, seam_writer, answer]
