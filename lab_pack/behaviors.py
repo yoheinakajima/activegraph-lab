@@ -1809,6 +1809,177 @@ def _coverage_review(body: str) -> Optional[str]:
     return "\n\n" + "\n\n".join(notes)
 
 
+# Phase 1 (ADR-033): overclaim lint — a sibling to the coverage check. The
+# project's founding sin is the narrative layer claiming more than the graph
+# supports: published posts said "five independent sources" over five
+# same-author artifacts and "fully autonomous" inside an operator-steered
+# pipeline. This check flags overclaiming language whose claim the graph
+# evidence CONTRADICTS — for operator attention in the review note, NEVER
+# auto-blocked (the operator judges; the ADR-014 escape-hatch spirit). The
+# grounding is the discriminator: each flag fires only when the graph actually
+# undercuts the phrasing, so a hedged-correctly draft passes clean.
+_INDEPENDENT_RE = re.compile(
+    r"\b(?:independent(?:ly)?|separate sources|corroborat\w+|"
+    r"multiple (?:independent )?sources|cross-?checked|triangulat\w+)\b", re.I)
+_AUTONOMOUS_RE = re.compile(
+    r"\b(?:fully autonomous|autonomous(?:ly)?|unprompted|unsupervised|"
+    r"of its own accord|without (?:any )?(?:human|operator) "
+    r"(?:input|prompting|involvement|intervention|steering))\b", re.I)
+_DEMONSTRATED_RE = re.compile(
+    r"\b(?:verified|proven|proves?|proved|demonstrat\w+|"
+    r"conclusively (?:shows?|showed)|established that)\b", re.I)
+_SUPERLATIVE_RE = re.compile(
+    r"\b(?:first[- ]ever|the (?:only|first|best|fastest)|only one|"
+    r"never before|unprecedented|world'?s (?:first|best|fastest)|"
+    r"the most \w+)\b", re.I)
+
+
+def _source_origin(o) -> Optional[str]:
+    """A source's origin signature: an explicit author, else its URL site.
+    Two sources with the same signature are NOT independent."""
+    if o is None:
+        return None
+    d = o.data
+    m = d.get("metadata") or {}
+    author = m.get("author") or d.get("author")
+    if author:
+        return "author:" + str(author).strip().lower()
+    url = d.get("url") or m.get("url") or ""
+    if url:
+        net = urlparse(url).netloc.lower()
+        if net:
+            return "site:" + net
+    return None
+
+
+def _evidence_origin(graph, ref: str, ctx: Optional[dict]) -> Optional[str]:
+    """Origin signature for one cited evidence id: a source's own origin, the
+    joined origins of an observation's source_ids, else the actor/behavior that
+    created it. None when it cannot be resolved (then independence stays
+    unjudged — the lint never flags on missing data)."""
+    o = graph.get_object(ref)
+    if o is not None:
+        if o.type == "source":
+            return _source_origin(o)
+        sids = o.data.get("source_ids") or []
+        sites = sorted({s for s in (_source_origin(graph.get_object(x))
+                                    for x in sids) if s})
+        if sites:
+            return "+".join(sites)
+    if ctx and ctx.get("created_by"):
+        return "actor:" + str(ctx["created_by"])
+    if o is not None:
+        cb = (o.data.get("metadata") or {}).get("created_by")
+        if cb:
+            return "actor:" + str(cb)
+    return None
+
+
+def _has_demonstration(graph, evidence_ids: list[str]) -> bool:
+    """True if any cited evidence is a DEMONSTRATION (an evaluation, or an
+    observation that measured/tested), not mere DESCRIPTION. 'verified'/'proven'
+    needs a demonstration; a pile of descriptive observations does not earn it."""
+    for ref in evidence_ids:
+        o = graph.get_object(ref)
+        if o is None:
+            continue
+        if o.type == "evaluation":
+            return True
+        if o.type == "observation":
+            cat = (o.data.get("category") or "").lower()
+            if cat in ("measurement", "benchmark", "test", "experiment", "result"):
+                return True
+    return False
+
+
+def _operator_in_chain(graph, branch_id: Optional[str],
+                       findings_context: list) -> bool:
+    """True if an operator message or activation is in the branch's causal
+    chain — which makes 'autonomous'/'unprompted' an overclaim. Read without
+    iteration: the branch's activation_message (set by the activate verb), the
+    operator-direction registry, and the cited findings' creators."""
+    if branch_id:
+        b = graph.get_object(branch_id)
+        if b is not None and (b.data.get("metadata") or {}).get("activation_message"):
+            return True
+        if _OPERATOR_DIRECTIONS.get(branch_id):
+            return True
+    for ctx in findings_context or []:
+        if "operator" in str(ctx.get("created_by") or "").lower():
+            return True
+    return False
+
+
+def _overclaim_review(body: str, graph, evidence_ids: list[str], *,
+                      branch_id: Optional[str] = None,
+                      findings_context: Optional[list] = None) -> Optional[str]:
+    """Flag overclaiming language the graph evidence does not support. Advisory
+    only — flagged phrases go in the review note for operator attention, never
+    auto-blocked. Each check is graph-grounded so a correctly hedged draft
+    passes: 'independent' over single-origin evidence, 'autonomous' where an
+    operator is in the chain, 'verified'/'proven' over description-only
+    evidence, and superlatives with no supporting footnote."""
+    findings_context = findings_context or []
+    ctx_by_id = {c.get("finding_id"): c for c in findings_context
+                 if c.get("finding_id")}
+    flags: list[tuple[str, str]] = []
+
+    if _INDEPENDENT_RE.search(body or "") and len(evidence_ids) >= 2:
+        origins = [_evidence_origin(graph, r, ctx_by_id.get(r))
+                   for r in evidence_ids]
+        resolved = [o for o in origins if o]
+        # Only flag when EVERY cited item resolved and they collapse to one
+        # origin — independence claimed over evidence that shares an author.
+        if resolved and len(resolved) == len(evidence_ids) \
+                and len(set(resolved)) == 1:
+            flags.append((
+                "independent sources",
+                f"the draft calls its evidence independent, but the "
+                f"{len(evidence_ids)} cited items share one origin "
+                f"({resolved[0]}) — same-origin artifacts are not independent "
+                "corroboration."))
+
+    if _AUTONOMOUS_RE.search(body or "") \
+            and _operator_in_chain(graph, branch_id, findings_context):
+        flags.append((
+            "autonomy",
+            "the draft claims autonomous/unprompted operation, but an operator "
+            "message or activation is in this branch's causal chain — the work "
+            "was operator-steered, not unprompted."))
+
+    if _DEMONSTRATED_RE.search(body or "") and evidence_ids \
+            and not _has_demonstration(graph, evidence_ids):
+        flags.append((
+            "evidence strength",
+            "the draft uses verified/proven/demonstrated language, but the "
+            "cited evidence is descriptive (observations), not a demonstration "
+            "(an evaluation, measurement, or test) — soften to what the "
+            "evidence shows."))
+
+    superlatives = []
+    for i, para in enumerate(p.strip() for p in re.split(r"\n\s*\n", body or "")):
+        if not para or para.startswith("#") or para.startswith("[^"):
+            continue
+        m = _SUPERLATIVE_RE.search(para)
+        if m and not _FOOTNOTE_RE.search(para):
+            superlatives.append((i + 1, m.group(0)))
+    if superlatives:
+        phrases = ", ".join(f'"{w}" (¶{n})' for n, w in superlatives)
+        flags.append((
+            "superlatives",
+            f"superlative claim(s) {phrases} carry no evidence footnote — a "
+            "first/only/best claim needs supporting evidence or a hedge."))
+
+    if not flags:
+        return None
+    lines = ["> **Review note (overclaim lint):** the following phrasings claim "
+             "more than the graph evidence supports — for operator review, not "
+             "auto-blocked:"]
+    for label, detail in flags:
+        lines.append(f"> - _{label}_: {detail}")
+    return "\n\n" + "\n".join(lines)
+
+
 @llm_behavior(
     name="draft_writer",
     on=["object.created"],
@@ -1880,9 +2051,17 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     title = (out.title or "Untitled lab note").strip()
     slug = _slugify(out.slug or title)
 
+    # Review notes append to the body (operator attention, never auto-blocking):
+    # coverage/process/orphan (5b), then the overclaim lint (Phase 1, ADR-033).
+    # Both scan the ORIGINAL body so neither lints the other's note text.
     review = _coverage_review(body)
+    overclaim = _overclaim_review(
+        body, graph, evidence, branch_id=branch_id,
+        findings_context=meta.get("findings_context"))
     if review:
         body += review
+    if overclaim:
+        body += overclaim
 
     mission_meta = {}
     mission = None

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Overclaim lint in drafts (ADR-033): `draft_writer` gains a graph-grounded
+  sibling to the coverage check (`behaviors._overclaim_review`). It flags
+  overclaiming language the cited evidence contradicts — "independent" over
+  same-origin artifacts, "autonomous"/"unprompted" where an operator message
+  or activation is in the branch's causal chain, "verified"/"proven" over
+  descriptive-only evidence (no evaluation/measurement), and superlatives
+  with no supporting footnote — in the review note for operator attention,
+  NEVER auto-blocked. External review caught "five independent sources" (five
+  same-author artifacts) and "fully autonomous" (one trigger inside an
+  operator-steered pipeline) in published posts; the lint catches both at the
+  inbox. Fixture: draft_writer Phase 1.
+
 - Routing, capability self-check, and the phantom-work guard — the
   branch#847 chain, closed at every link. (1) Routing is verb/intent
   classification, not keywords (ADR-006/025, extends ADR-025's contract):

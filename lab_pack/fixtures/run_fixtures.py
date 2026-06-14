@@ -1089,6 +1089,77 @@ def run_draft_writer() -> bool:
     c.that(bool(named) and "claims coverage" in named,
            "a named-component opener (camelCase) is substantive, not framing")
     print("  Phase 4: framing exempt; numeric + named openers flag")
+
+    # ── Phase 1 (ADR-033): overclaim lint — graph-grounded, advisory ────────
+    from lab_pack.behaviors import _overclaim_review
+    import lab_pack.behaviors as _lb
+
+    # "independent" over same-author sources flags.
+    s1 = g.add_object("source", {"kind": "url", "url": "https://activegraph.ai/post-a",
+                                 "metadata": {"author": "the-lab"}})
+    s2 = g.add_object("source", {"kind": "url", "url": "https://activegraph.ai/post-b",
+                                 "metadata": {"author": "the-lab"}})
+    indep = _overclaim_review(
+        "Five independent sources back the replay claim.[^1][^2]\n\n"
+        f"[^1]: {s1.id}\n[^2]: {s2.id}\n", g, [s1.id, s2.id]) or ""
+    c.that("overclaim lint" in indep and "independent sources" in indep,
+           f"'independent' over same-origin sources flags ({indep!r})")
+
+    # Distinct-origin sources do NOT flag the independence claim.
+    s3 = g.add_object("source", {"kind": "url", "url": "https://example.org/x",
+                                 "metadata": {"author": "someone-else"}})
+    indep_ok = _overclaim_review(
+        "Two independent sources agree.[^1][^2]\n\n"
+        f"[^1]: {s1.id}\n[^2]: {s3.id}\n", g, [s1.id, s3.id]) or ""
+    c.that("independent sources" not in indep_ok,
+           f"'independent' over distinct-origin sources passes ({indep_ok!r})")
+
+    # "autonomous" over an operator-triggered (activation_message) branch flags.
+    ab = g.add_object("branch", {
+        "title": "Operator-activated branch", "intent": "verify replay",
+        "status": "active",
+        "metadata": {"activation_message": "Activate this and check replay."}})
+    auto = _overclaim_review(
+        "The lab fully autonomously confirmed the result.[^1]\n\n"
+        "[^1]: observation#1\n", g, ["observation#1"], branch_id=ab.id) or ""
+    c.that("autonomy" in auto,
+           f"'autonomous' over an operator-triggered branch flags ({auto!r})")
+
+    # "proven" over a descriptive observation flags; over an evaluation passes.
+    descr = g.add_object("observation", {"text": "A described behavior.",
+                                         "category": "fact", "metadata": {}})
+    proven = _overclaim_review(
+        f"The determinism claim is proven.[^1]\n\n[^1]: {descr.id}\n",
+        g, [descr.id]) or ""
+    c.that("evidence strength" in proven,
+           f"'proven' over a descriptive observation flags ({proven!r})")
+    demo = g.add_object("evaluation", {"subject_id": "task#1",
+                                       "subject_type": "task",
+                                       "judgment": "measured",
+                                       "evaluator": "lab.research_worker"})
+    proven_ok = _overclaim_review(
+        f"The determinism claim is proven by the run.[^1]\n\n[^1]: {demo.id}\n",
+        g, [demo.id]) or ""
+    c.that("evidence strength" not in proven_ok,
+           f"'proven' over a demonstration (evaluation) passes ({proven_ok!r})")
+
+    # A superlative with no supporting footnote flags.
+    sup = _overclaim_review(
+        "This is the first-ever self-hosted research lab of its kind, full "
+        "stop, and the framing deserves emphasis up front here in the lede.\n",
+        g, [], branch_id=None) or ""
+    c.that("superlatives" in sup,
+           f"an unfootnoted superlative flags ({sup!r})")
+
+    # A hedged-correctly draft passes clean (no trigger phrasing).
+    hedged = _overclaim_review(
+        "The runtime recorded the outcome and the operator can inspect the "
+        "linked evidence below to judge it for themselves.[^1]\n\n"
+        "[^1]: observation#1\n", g, ["observation#1"], branch_id=None)
+    c.that(not hedged, f"a hedged-correctly draft draws no overclaim note "
+                       f"({hedged!r})")
+    print("  Phase 1: overclaim lint — independent/autonomous/proven/superlative"
+          " flag, hedged passes")
     return c.done("draft_writer")
 
 
