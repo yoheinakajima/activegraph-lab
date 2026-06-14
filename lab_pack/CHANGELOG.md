@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Self-dispatched code repair — the self-repair loop's FIRST mile, closed
+  (ADR-036). The lab repairs the lab; the operator approves the PR.
+  - **`self_repair` planner** (`lab_pack/behaviors.py`): a deterministic
+    behavior that turns the lab's OWN observed defects — a `routing_miss`
+    (ADR-031's verdict that a task was a routing/code bug, not a capability
+    absence) or a finding the build tagged `metadata.code_defect` — into a
+    GATED code-fix branch routed `codebase.code_task`, carrying the defect's
+    evidence as the task intent. No operator authoring. Bounded: the lab's OWN
+    allowlisted repo only (`yoheinakajima/activegraph-lab`), concrete evidence
+    only, gated like any branch, capped at `setting.max_self_repair_branches`
+    (default 3, NOT seam-eligible — a guardrail stays in git), and dark unless
+    the code worker is live.
+  - **The PR last mile** (`lab_pack/code_worker.py`): a PROVEN fix the lab was
+    asked to LAND (`code_task.propose_pr`) now opens a PENDING `submit_pr` —
+    the diff + the post-fix file states the sandbox read back
+    (`repo_sandbox.run_repo_task` captures a proven diff's target files),
+    citing the run's `sandbox_proven` evaluation. A fix that fails its proof
+    opens none. Own-repo enforced at the PR mouth too (defense in depth).
+  - **Operator `fix` verb** (Phase 2, the secondary front door): an `answer`
+    steering verb that proposes a code-fix branch from the operator's message
+    and activates it — the same downstream path. "code" is deliberately not an
+    alias (the noun collision ADR-025's routing avoids).
+  - **observation#1046** (the source-selection bug the lab logged itself —
+    the research worker's `_source_urls` starves operator-named URLs under a
+    tight cap) ships as a `code_defect`-tagged LIVE_FINDING: after deploy the
+    planner proposes its fix unaided.
+  - Guardrails: submit_pr stays human-gated + MCP-excluded; a non-own-repo
+    defect is NOT self-dispatched; a failed proof opens no PR; the concurrency
+    cap holds. Fixture `self_repair` covers every leg; the code_worker /
+    submit_pr / sandbox-isolation sentinel gates stay green.
+
 - GitHub rung 2 — the code worker, the repo sandbox, and the submit_pr
   decision (ADR-035, the self-repair rails). Three phases, two hard sentinel
   gates:

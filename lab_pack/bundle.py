@@ -375,6 +375,44 @@ LIVE_FINDINGS: list[dict] = [
         ),
     },
     {
+        # observation#1046 — the canonical first case for the self-repair loop
+        # (ADR-036). A code defect about the lab's OWN code, tagged so the
+        # planner can self-dispatch a gated code-fix branch for it, no operator
+        # authoring. The fix harness is the lab's own fixture suite (a
+        # research-worker source-ordering fix must keep every fixture green).
+        "key": "research_source_selection_starves_operator_urls",
+        "text": (
+            "Finding (lab code defect): the research worker's source selection "
+            "starves operator-named sources under a tight fetch cap. "
+            "_source_urls (lab_pack/research_worker.py) seeds its candidate "
+            "list with operator_direction URLs FIRST (deliberately, so the cap "
+            "cannot starve them), then appends the derived defaults — the "
+            "branch claim URL and the mission target_url — and ONLY THEN the "
+            "URLs the operator wrote into the task description / activation "
+            "message (the `for t in texts` tail). So a URL the operator names "
+            "inline ('verify this against https://… ') sorts BEHIND the "
+            "mission homepage and the claim URL, and when research_fetch_cap is "
+            "small it is dropped before it is ever fetched — the inverse of the "
+            "documented intent that 'the operator can steer sources by "
+            "mentioning links'. The bug is an ordering one: only the "
+            "operator_direction channel is prioritized; the description / "
+            "activation-message channel the docstring also promises is not. "
+            "Fix shape: gather ALL operator-supplied URLs (direction + "
+            "description + activation message) ahead of the derived defaults, "
+            "so explicitly named sources always survive the cap; lock it with "
+            "a research_worker fixture asserting an inline-named URL is fetched "
+            "even when the cap would otherwise fill on defaults."
+        ),
+        "metadata": {
+            # ADR-036 self-repair tags: an OPEN code defect about the lab's own
+            # repo, with a proving harness. The planner self-dispatches a gated
+            # code-fix branch from this — no operator hands it the bug.
+            "code_defect": True,
+            "repo": "yoheinakajima/activegraph-lab",
+            "fix_command": "python -m lab_pack.fixtures.run_fixtures",
+        },
+    },
+    {
         "key": "accident_became_policy_pinned",
         "text": (
             "Finding: two of the lab's safety properties began life as "
@@ -411,14 +449,19 @@ def queue_findings_once(graph, *, branch_id: str, mission_id: str) -> int:
     for finding in LIVE_FINDINGS:
         if finding["key"] in present:
             continue
+        meta = {"lab": "finding", "finding": True,
+                "finding_key": finding["key"],
+                "lab_branch_id": branch_id, "mission_id": mission_id,
+                "evidence_refs": []}
+        # A finding may carry extra metadata — notably the ADR-036 self-repair
+        # tags (code_defect / repo / fix_command / fix_diff) that let the
+        # planner self-dispatch a gated code-fix branch for it.
+        meta.update(finding.get("metadata") or {})
         f = graph.add_object("observation", {
             "text": finding["text"],
             "confidence": 0.9,
             "category": "fact",
-            "metadata": {"lab": "finding", "finding": True,
-                         "finding_key": finding["key"],
-                         "lab_branch_id": branch_id, "mission_id": mission_id,
-                         "evidence_refs": []},
+            "metadata": meta,
         })
         graph.add_relation(branch_id, f.id, "supported_by")
         appended += 1

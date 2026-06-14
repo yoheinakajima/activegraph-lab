@@ -210,6 +210,16 @@ def _rebuild_lab_registries(rt) -> None:
     for b in g.objects(type="branch"):
         if b.data.get("status") != "archived":
             open_count += 1
+        # ADR-036: self-dispatched code-repair branches — the dedup set (so a
+        # finding is not re-proposed) and the in-flight set (so the concurrency
+        # cap survives a restart). Replay rebuilds the branches, not the caches.
+        b_meta = b.data.get("metadata") or {}
+        if b_meta.get("self_repair"):
+            src = b_meta.get("repair_source_obs")
+            if src:
+                lb._SELF_REPAIR_PROPOSED.add(str(src))
+            if b.data.get("status") not in ("decided", "archived"):
+                lb._SELF_REPAIR_OPEN.add(str(b.id))
     lb._BRANCH_COUNT["open"] = open_count
     # ADR-027: rejected promotes carry continuation direction. Legacy
     # rejections (pre-ADR-027, e.g. decision#266) recorded the rationale on

@@ -34,6 +34,26 @@ DEFAULT_ALLOWLIST = ("yoheinakajima/activegraph-lab,activegraph,"
                      "activegraph-packs,ag-coder")
 DEFAULT_OWNER = "yoheinakajima"
 
+# The lab's OWN repo — the single repo self-dispatched code repair (ADR-036)
+# is bounded to. The allowlist also carries activegraph / activegraph-packs /
+# ag-coder, but those are NOT the lab's own code (CONTRACT.md: never edit the
+# packs repo directly — ADR-005), so self-repair targets ONLY this one.
+LAB_OWN_REPO = "yoheinakajima/activegraph-lab"
+
+
+def _normalize_repo(repo: str) -> str:
+    """owner/name, lower-cased, owner defaulted (the allowlist's convention)."""
+    repo = (repo or "").strip().strip("/")
+    if repo and "/" not in repo:
+        repo = f"{DEFAULT_OWNER}/{repo}"
+    return repo.lower()
+
+
+def is_own_repo(repo: str) -> bool:
+    """Is `repo` the lab's own repo (ADR-036 self-repair bound)? Bare names
+    default to the lab owner, like the allowlist."""
+    return _normalize_repo(repo) == LAB_OWN_REPO.lower()
+
 _API = "https://api.github.com"
 _MAX_FILE_CHARS = 200_000
 _MAX_LIST = 100

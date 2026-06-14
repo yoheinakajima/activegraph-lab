@@ -1,0 +1,61 @@
+# ADR-036: the self-repair loop's PLANNER — the lab turns its OWN observed code
+# defects into GATED code-fix branch proposals routed codebase.code_task, no
+# operator authoring. Bounded to the lab's own allowlisted repo; capped; the
+# downstream submit_pr stays doubly-gated + MCP-excluded.
+#
+# Legs:
+#   A  a logged routing_miss about the lab's repo → planner proposes a gated
+#      code-fix branch (the routing_miss IS the ADR-031 code-bug verdict).
+#   B  observation#1046 (the source-selection bug the lab logged itself) → the
+#      planner proposes its fix UNAIDED — the canonical first case.
+#   C  full loop: a tagged code defect WITH a proven fix → planner proposes →
+#      code worker clones (canned) + proves → a PENDING submit_pr.
+#   D  Phase 2: the operator "fix" verb hands a bug in → a code-fix branch.
+#   E  guardrails: an upstream (non-own-repo) defect is NOT self-dispatched; a
+#      fix that fails its sandbox proof does NOT submit_pr; the concurrency cap.
+settings:
+  crawl_enabled: false
+  research_worker_enabled: true   # the source-selection bug lives in this lane
+  code_worker_enabled: true       # self-repair is dark unless the lane is live
+  max_self_repair_branches: 8     # generous for the multi-leg run; leg E caps to 1
+  digest_min_findings: 50         # keep the editorial machinery out of this run
+
+mission:
+  title: Self-repair mission
+
+# Leg A — a routing_miss the lab logged about its OWN router (ADR-031's verdict
+# that a task was a routing/code bug, not a capability absence).
+routing_miss:
+  text: >
+    Misrouted, capability available: task 'Verify replay at code level' was
+    routed codebase.code_task but its action is read-to-verify, not code-write
+    — that work belongs to research.deep_research. A routing miss, not a
+    capability absence.
+  misrouted_from: codebase.code_task
+  correct_routing: research.deep_research
+
+# Leg C — a code defect the lab diagnosed AND knows the fix for: the full loop
+# to a pending submit_pr. The fix_diff/failing-file are the canned clone's
+# (_FIX_DIFF / _CHECK_FAIL in run_fixtures); the command decides success.
+code_defect_with_fix:
+  text: >
+    Finding (lab code defect): the smoke check exits nonzero on main; a
+    one-line fix makes it pass. Proven candidate fix attached.
+  repo: yoheinakajima/activegraph-lab
+  fix_command: "python check.py"
+
+# Leg E — a defect about a NON-own repo (upstream): NEVER self-dispatched
+# (CONTRACT.md / ADR-005 — the lab does not edit the packs repo or core).
+upstream_defect:
+  text: >
+    Finding (upstream, activegraph core): PostgresEventStore assumes an
+    immortal connection and never reconnects after a serverless suspend.
+
+# Leg E — a tagged defect whose proposed fix does NOT prove: records the
+# failure, opens NO submit_pr (a self-proposed fix must earn its PR).
+unprovable_defect:
+  text: >
+    Finding (lab code defect): a deciding command that cannot pass; no diff
+    repairs it.
+  repo: yoheinakajima/activegraph-lab
+  fix_command: "false"
