@@ -1103,6 +1103,60 @@ def _pending_decisions(g) -> list[dict]:
     return inbox
 
 
+# Canonical branch statuses the status filter documents. A branch also passes
+# through transient states (interpreting, scoped); status=all and an explicit
+# status= for those still work — the filter matches exactly.
+_BRANCH_STATUSES = ("proposed", "active", "decided", "archived")
+
+
+def _branches_projection(g, status: Optional[str] = None) -> dict:
+    """Read-only projection of branch state: one row per branch, newest first,
+    optionally filtered by status. Pure parity with the graph — proposed
+    branches can be enumerated and activated without hand-fetching ids from the
+    UI. Shared by GET /lab/branches and the MCP list_branches tool, so the two
+    cannot drift.
+
+    `status` is one of proposed|active|decided|archived (or any transient
+    status a branch actually holds); None or 'all' returns every branch."""
+    want = (status or "all").strip().lower() or "all"
+    pending_by_branch: dict[str, int] = {}
+    for d in _pending_decisions(g):
+        bid = d.get("branch_id") or d.get("subject_ref")
+        if bid:
+            pending_by_branch[bid] = pending_by_branch.get(bid, 0) + 1
+    rows: list[dict] = []
+    counts: dict[str, int] = {}
+    for b in g.objects(type="branch"):
+        bstatus = b.data.get("status")
+        counts[bstatus] = counts.get(bstatus, 0) + 1
+        if want != "all" and bstatus != want:
+            continue
+        rows.append({
+            "id": str(b.id),
+            "title": b.data.get("title"),
+            "status": bstatus,
+            "authority": b.data.get("authority"),
+            "intent": b.data.get("intent"),
+            "mission_id": b.data.get("mission_id"),
+            "parent_branch_id": b.data.get("parent_branch_id"),
+            "pending_decisions": pending_by_branch.get(str(b.id), 0),
+        })
+    # Newest first by id ordinal (branch#N is 1-based monotonic).
+    def _ordinal(bid: str) -> int:
+        try:
+            return int(str(bid).rsplit("#", 1)[-1])
+        except ValueError:
+            return -1
+    rows.sort(key=lambda r: _ordinal(r["id"]), reverse=True)
+    return {
+        "status": want,
+        "branches": rows,
+        "count": len(rows),
+        "counts_by_status": counts,
+        "total": sum(counts.values()),
+    }
+
+
 def _feed(rt, limit: int = 100) -> dict:
     """The notebook feed: lab events joined with their objects, one sentence
     each, grouped by branch, pending decisions pinned on top (the inbox).
@@ -1553,6 +1607,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_draft(qs)
             elif path == "/lab/seams":
                 self._handle_seams()
+            elif path == "/lab/branches":
+                self._handle_branches(qs)
             elif path == "/graph":
                 self._handle_graph()
             elif path == "/trace":
@@ -1800,6 +1856,16 @@ class Handler(BaseHTTPRequestHandler):
             status = seams.seam_status(rt.graph)
             status.update(graph_code.status(rt.graph))
         self._send_json(status)
+
+    # ── GET /lab/branches?status= (branch listing projection) ───────────────
+
+    def _handle_branches(self, qs: dict):
+        """Read-only branch listing, optionally filtered by status (operator/
+        MCP quality-of-life): enumerate proposed branches and activate them
+        without hand-fetching ids from the UI. Pure projection, public."""
+        rt = _get_rt()
+        with _lock:
+            self._send_json(_branches_projection(rt.graph, qs.get("status")))
 
     # ── GET /lab/errors (ADR-023 diagnostics projection) ────────────────────
 

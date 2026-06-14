@@ -1,0 +1,30 @@
+# Phase 2 (ADR-031): a behavior must not assert a capability is ABSENT without
+# checking tool availability. "No pack reacted" is a routing fact, not proof the
+# lab cannot do the work. A task misrouted to a lane whose capability EXISTS
+# records "misrouted, capability available" (routing_miss) — never a gap; a task
+# needing a genuinely absent capability still records an honest capability gap.
+# (Production: decision#910 asserted the lab "lacks the means to retrieve file
+# contents", false since get_file shipped in ADR-028 — the worker's lane simply
+# was not the one routed.)
+settings:
+  crawl_enabled: false
+  research_worker_enabled: true   # the research lane (get_file et al.) is live
+  dispatch_gap_check: true
+
+mission:
+  title: Capability self-check mission
+
+# A reading/verification intent — its real lane is research.deep_research, which
+# IS available. Forced into the codebase lane here to reproduce the misroute.
+misroute_intent: >
+  Fetch the implementation files from the activegraph repo and verify the replay
+  claim against the source.
+
+# A genuine code-write task — its lane is codebase.code_task, for which no pack
+# reacts: an honest, present gap even with the research worker enabled.
+genuine_gap_intent: >
+  Write and refactor a new code pack to add a parser module to the codebase.
+
+expected_outputs:
+  routing_miss_observations: 1
+  capability_gap_observations: 1

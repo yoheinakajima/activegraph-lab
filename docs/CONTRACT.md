@@ -40,9 +40,11 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 ## Workers
 
-- The lab never calls domain packs directly. Work is dispatched as core task objects with routing tags; packs react or a capability-gap observation is recorded (ADR-006).
+- The lab never calls domain packs directly. Work is dispatched as core task objects with routing tags; packs react or a capability-gap observation is recorded (ADR-006). Tasks route by their ACTION verb (ADR-025/ADR-006): reading source to verify/check/examine a claim is `research.deep_research`; only WRITE/MODIFY/GENERATE-code intent is `codebase.code_task`. A mention of code, files, or a repo is not a request to write code.
 - Workers emit a progress event at least every 60 seconds, or declare the current step uninterruptible.
 - All external fetches go through tool_gateway.
+- Honesty about capability (ADR-031): no behavior asserts a capability is absent ("lacks the means" / "cannot" / "has no capability") without consulting the actual available-capability set. "No pack reacted" is a routing fact; a task whose capability EXISTS but was misrouted records "misrouted, capability available", never an absence. A genuine gap is still recorded honestly.
+- No phantom work (ADR-032): a branch proposing to build/extend a capability that already exists is not proposed — an observation that the capability is present (and the prior gap spurious) is recorded instead.
 
 ## Forks
 

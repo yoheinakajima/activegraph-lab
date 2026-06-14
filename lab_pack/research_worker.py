@@ -164,6 +164,28 @@ def _ensure_github_provider(graph) -> str:
     return provider.id
 
 
+# The concrete tools the research lane provides when it is live: source
+# retrieval through tool_gateway (web fetch) and the read-only GitHub tools
+# (ADR-022) — get_file among them, shipped in ADR-028. The capability
+# self-check (ADR-031) and the phantom-work guard (ADR-032) consult this so no
+# behavior claims the lab "lacks the means" to retrieve file contents while
+# this worker is live. Mirrors the github capability_provider registered in
+# _ensure_github_provider plus web.fetch_url.
+RESEARCH_WORKER_TOOLS = frozenset({
+    "web.fetch_url",
+    "github.get_tree", "github.get_file", "github.list_commits",
+    "github.list_issues", "github.list_pulls",
+})
+
+
+def research_lane_available(settings) -> bool:
+    """Is the research lane live? It is the lab's reactor for
+    research.deep_research and carries get_file et al. (ADR-022/028). A
+    capability is only 'available' when its reactor is enabled — disabled, the
+    capability-gap path is the honest answer (ADR-031)."""
+    return bool(getattr(settings, "research_worker_enabled", False))
+
+
 def task_claimed(task_id: str) -> bool:
     """The dispatch gap check consults this: a claim IS a reaction."""
     return task_id in _CLAIMED

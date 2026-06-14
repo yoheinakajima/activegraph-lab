@@ -688,6 +688,218 @@ def run_capability_gap() -> bool:
     return c.done("capability_gap")
 
 
+def run_routing() -> bool:
+    """Phase 1 (ADR-006/025): verb/intent routing classification."""
+    spec = _load("routing.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: routing — read/verify intent → research; write-code → codebase")
+    print("=" * 64)
+    from lab_pack.behaviors import _routing_for_intent
+    c = Check()
+    for case in spec["cases"]:
+        got = _routing_for_intent(case["intent"].strip())["domain"]
+        c.that(got == case["domain"],
+               f"{case['note']}: expected {case['domain']}, got {got} "
+               f"— {case['intent'].strip()[:70]}")
+        print(f"  {got:8s} ← {case['intent'].strip()[:64]}")
+    return c.done("routing")
+
+
+def run_capability_self_check() -> bool:
+    """Phase 2 (ADR-031): misroute to a lane whose capability EXISTS records
+    'misrouted, capability available', not a capability gap; a genuinely
+    absent capability still records an honest gap."""
+    spec = _load("capability_self_check.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: capability_self_check — absence is checked, not assumed")
+    print("=" * 64)
+
+    def canned(url: str, **_kw) -> dict:
+        return {"url": url, "status": 200, "content": "<p>canned</p>"}
+
+    rt = _new_runtime(spec, with_gateway=True, with_comm=True)
+    register_web_fetch(canned, overwrite=True)
+    g = rt.graph
+    c = Check()
+    exp = spec["expected_outputs"]
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    # ── misroute: a research intent FORCED into the codebase lane ────────────
+    b_mis = create_branch_fn(g, mission.id, "Verify replay from source",
+                             spec["misroute_intent"].strip(), status="proposed")
+    rt.run_until_idle()
+    # Hand-dispatch with the WRONG routing (a legacy/forced misroute), then fire
+    # the probe patch the gap check keys on — exactly the shape _dispatch_branch
+    # produces, minus the corrected router.
+    meta = {"routing": {"domain": "codebase", "capability": "code_task"},
+            "tags": ["lab", "codebase"], "lab_branch_id": b_mis.id,
+            "progress_contract": {"interval_seconds": 60, "uninterruptible": False}}
+    mis_task = g.add_object("task", {
+        "title": "Forced-codebase verification task",
+        "description": spec["misroute_intent"].strip(),
+        "status": "active", "priority": "medium", "metadata": meta})
+    g.add_relation(b_mis.id, mis_task.id, "dispatched")
+    rt.run_until_idle()  # the worker ignores codebase routing — no reaction
+    pm = dict(mis_task.data.get("metadata") or {})
+    pm["dispatch_probe"] = True
+    g.patch_object(mis_task.id, {"metadata": pm})
+    rt.run_until_idle()
+
+    miss = [o for o in _lab_obs(g, "routing_miss")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == b_mis.id]
+    c.that(len(miss) == exp["routing_miss_observations"],
+           f"misroute records a routing_miss, not a gap ({len(miss)})")
+    c.that(not [o for o in _lab_obs(g, "capability_gap")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_mis.id],
+           "no capability_gap for a misrouted-but-available task")
+    mm = (miss[0].data.get("metadata") or {}) if miss else {}
+    c.that(mm.get("misrouted_from") == "codebase.code_task"
+           and mm.get("correct_routing") == "research.deep_research",
+           f"the routing_miss names where it went and where it belongs ({mm})")
+    miss_text = (miss[0].data.get("text") or "") if miss else ""
+    c.that("not reached" in miss_text.lower()
+           and "capability gap" not in miss_text.lower(),
+           "the recorded outcome is 'not reached', never a capability gap")
+    t_mis = g.get_object(mis_task.id)
+    c.that(t_mis.data.get("status") == "blocked",
+           "the misrouted task is still blocked (it was not executed)")
+    print(f"  misroute: routing_miss recorded "
+          f"({mm.get('misrouted_from')} → {mm.get('correct_routing')}), no gap")
+
+    # ── genuine gap: a write-code task in the codebase lane, no pack reacts ──
+    b_gap = create_branch_fn(g, mission.id, "Build a parser pack",
+                             spec["genuine_gap_intent"].strip(), status="active")
+    rt.run_until_idle()
+    t_gap = task_for(b_gap.id)
+    gaps = [o for o in _lab_obs(g, "capability_gap")
+            if (o.data.get("metadata") or {}).get("lab_branch_id") == b_gap.id]
+    c.that(len(gaps) == exp["capability_gap_observations"]
+           and t_gap is not None and t_gap.data.get("status") == "blocked",
+           f"a genuinely absent capability still records an honest gap "
+           f"({len(gaps)})")
+    c.that(gaps and "cannot execute" in (gaps[0].data.get("text") or "").lower(),
+           "the honest gap still says the lab cannot execute this yet")
+    c.that(not [o for o in _lab_obs(g, "routing_miss")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_gap.id],
+           "no routing_miss for a genuinely absent capability")
+    print(f"  genuine gap: capability_gap recorded for the codebase write task")
+    return c.done("capability_self_check")
+
+
+def run_phantom_work() -> bool:
+    """Phase 3 (ADR-032): a build-proposal for an existing capability is
+    suppressed with an explanatory observation; a build-proposal for a
+    genuinely missing capability still proposes."""
+    spec = _load("phantom_work.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: phantom_work — never propose building what already exists")
+    print("=" * 64)
+
+    import json as _json
+    from decimal import Decimal
+    from activegraph.llm import LLMResponse
+    from lab_pack.llm import InterpretSummary
+
+    class FollowUpProvider:
+        """Plays a model that always proposes a follow-up with a scripted
+        intent, so the phantom-work guard sees a capability-build proposal."""
+        default_model = LabMockProvider.default_model
+
+        def __init__(self, follow_up_intent: str):
+            self.inner = LabMockProvider()
+            self.follow_up_intent = follow_up_intent
+
+        def complete(self, **kw):
+            name = getattr(kw.get("output_schema"), "__name__", "")
+            if name == "InterpretSummary":
+                parsed = InterpretSummary(
+                    summary=("The dispatched work completed; a follow-up branch "
+                             "is warranted to extend the lab. [mock]"),
+                    outcome="follow_up",
+                    follow_up_intent=self.follow_up_intent)
+                return LLMResponse(
+                    raw_text=_json.dumps(parsed.model_dump()), parsed=parsed,
+                    input_tokens=0, output_tokens=0, cost_usd=Decimal("0"),
+                    latency_seconds=0.0,
+                    model=kw.get("model") or self.default_model,
+                    finish_reason="stop")
+            return self.inner.complete(**kw)
+
+        def estimate_cost(self, **kw):
+            return self.inner.estimate_cost(**kw)
+
+        def count_tokens(self, **kw):
+            return self.inner.count_tokens(**kw)
+
+        def recognizes_model(self, name):
+            return True
+
+    def drive(follow_up_intent: str):
+        """Set interpret loose on one task outcome and return (graph, parent)."""
+        clear_lab_registry()
+        rt = Runtime(Graph(), llm_provider=FollowUpProvider(follow_up_intent))
+        rt.load_pack(core_pack, settings=CoreSettings())
+        rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+        bind_live_behaviors(rt)
+        g = rt.graph
+        mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+        # Parent stays proposed: nothing dispatches, so the worker never runs —
+        # we feed interpret a task outcome directly and watch the follow-up.
+        parent = create_branch_fn(g, mission.id, "Parent inquiry",
+                                  "Verify the replay claim", status="proposed")
+        rt.run_until_idle()
+        g.add_object("evaluation", {
+            "subject_id": "task#fixture", "subject_type": "task",
+            "judgment": "completed_successfully",
+            "rationale": "the dispatched work completed and is linked as evidence",
+            "evaluator": "lab.work",
+            "metadata": {"lab": "task_outcome", "lab_branch_id": parent.id,
+                         "task_id": "task#fixture"}})
+        rt.run_until_idle()
+        return g, parent
+
+    c = Check()
+
+    # ── phantom: build get_file (present since ADR-028) → suppressed ─────────
+    g, parent = drive(spec["phantom_intent"].strip())
+    branches = g.objects(type="branch")
+    sup = _lab_obs(g, "phantom_work_suppressed")
+    c.that(len(branches) == 1,
+           f"no child branch proposed for an existing capability ({len(branches)})")
+    c.that(len(sup) == 1
+           and (sup[0].data.get("metadata") or {}).get("existing_tool")
+           == "github.get_file",
+           f"a phantom_work_suppressed observation names the live tool "
+           f"({[(o.data.get('metadata') or {}).get('existing_tool') for o in sup]})")
+    c.that(sup and any(str(r.type) == "supported_by"
+                       and str(r.source) == parent.id
+                       and str(r.target) == sup[0].id for r in g.relations()),
+           "the suppression observation is linked to the parent branch")
+    c.that(sup and "spurious" in (sup[0].data.get("text") or "").lower(),
+           "the observation flags the prior gap as spurious")
+    print(f"  phantom: get_file build suppressed, observation recorded, no branch")
+
+    # ── genuine: a missing capability → still proposes ──────────────────────
+    g2, parent2 = drive(spec["genuine_intent"].strip())
+    branches2 = g2.objects(type="branch")
+    child = next((b for b in branches2 if b.id != parent2.id), None)
+    c.that(len(branches2) == 2 and child is not None,
+           f"a genuinely missing capability still proposes a child branch "
+           f"({len(branches2)})")
+    c.that(child is not None
+           and spec["genuine_intent"].strip()[:40] in (child.data.get("intent") or ""),
+           "the child branch carries the follow-up build intent")
+    c.that(not _lab_obs(g2, "phantom_work_suppressed"),
+           "no suppression for a capability the lab does not have")
+    print(f"  genuine: sandbox build proposes child branch {child.id if child else '?'}")
+    return c.done("phantom_work")
+
+
 def run_draft_writer() -> bool:
     spec = _load("draft_writer.yaml")
     print("\n" + "=" * 64)
@@ -3175,6 +3387,9 @@ def run_all() -> None:
         run_thread_equals_branch(),
         run_truthful_steering(),
         run_capability_gap(),
+        run_routing(),
+        run_capability_self_check(),
+        run_phantom_work(),
         run_rejection_lifecycle(),
         run_draft_writer(),
         run_editorial(),

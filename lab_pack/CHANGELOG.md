@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Routing, capability self-check, and the phantom-work guard — the
+  branch#847 chain, closed at every link. (1) Routing is verb/intent
+  classification, not keywords (ADR-006/025, extends ADR-025's contract):
+  a task routes by its ACTION — reading source to verify/check/examine a
+  claim is `research.deep_research` (the research worker has `get_file`,
+  ADR-022/028); only imperative WRITE/MODIFY/GENERATE-code intent acting
+  on a code object is `codebase.code_task`. branch#847 ("fetch the
+  implementation files from the repo and verify the replay claim") and
+  branch#64 ("…actually implements…") now route research; "write/refactor/
+  implement a new pack" still routes codebase. (2) Capability self-check
+  (ADR-031): the dispatch gap check consults the live tool set
+  (`RESEARCH_WORKER_TOOLS`) before asserting absence — a task misrouted to
+  a lane whose capability EXISTS records a `routing_miss` ("misrouted,
+  capability available — not reached"), never a `capability_gap`; a
+  genuinely absent capability still records an honest gap. (Production:
+  decision#910 asserted the lab "lacks the means to retrieve file
+  contents" — false since ADR-028.) (3) Phantom-work guard (ADR-032): a
+  branch proposing to build a capability that already exists is suppressed
+  with a `phantom_work_suppressed` observation naming the live tool and
+  flagging the prior gap as spurious (the false gap spawned branch#911, a
+  proposal to build `get_file`); a genuinely missing capability still
+  proposes. New fixtures: routing, capability_self_check, phantom_work.
+
+- `list_branches` read tool: a read-only projection `GET /lab/branches?
+  status=<proposed|active|decided|archived|all>` and the MCP READ tool
+  `list_branches` (byte-identical to the HTTP projection), so proposed
+  branches can be enumerated and activated without hand-fetching ids from
+  the UI. Pure projection, public, sentinel-audited; status filter binds.
+
 - Rejection is teaching, not burial (ADR-027): a rejected promote lands
   the branch on `decided` — never archived — and the operator's
   `resolution_rationale` becomes an `operator_direction` observation in

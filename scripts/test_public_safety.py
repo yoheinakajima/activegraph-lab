@@ -150,7 +150,8 @@ def _run() -> int:
     for name, args in (("get_status", {}), ("get_feed", {}),
                        ("get_branch", {"branch_id": str(branch.id)}),
                        ("get_pending_decisions", {}), ("list_posts", {}),
-                       ("list_seams", {}), ("get_errors", {}),
+                       ("list_seams", {}), ("list_branches", {"status": "all"}),
+                       ("get_errors", {}),
                        # ADR-021 expansion: the new READ + control tools join
                        # the audited corpus like every public surface.
                        ("get_log", {"limit": 50}),

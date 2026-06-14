@@ -12,8 +12,8 @@ only sees already-authorized messages.
 
 Tool tiers (ADR-016; get_errors added by ADR-023; ADR-021 expansion):
   READ:     get_status, get_feed, get_branch, get_pending_decisions,
-            get_post, list_posts, list_seams, get_errors, get_log,
-            get_entity — pure projections of public data, fast path.
+            get_post, list_posts, list_seams, list_branches, get_errors,
+            get_log, get_entity — pure projections of public data, fast path.
   OPERATOR: send_chat (tagged source=operator_via_mcp in the public log)
   OPERATOR CONTROL (ADR-021; same authority as send_chat): set_budget,
             pause_lab, resume_lab — REVERSIBLE operational controls,
@@ -111,6 +111,23 @@ TOOLS: list[dict] = [
         "description": "Every self-modification surface: active seam versions, "
                        "their source (file|graph), and graph-code draft states.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_branches",
+        "description": "Enumerate branches of inquiry, newest first, optionally "
+                       "filtered by status — so proposed branches can be found "
+                       "and activated (via send_chat 'activate this branch') "
+                       "without hand-fetching ids from the UI. Mirror of "
+                       "GET /lab/branches.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string",
+                           "description": "proposed | active | decided | "
+                                          "archived | all (default all)."},
+            },
+            "required": [],
+        },
     },
     {
         "name": "get_errors",
@@ -402,6 +419,13 @@ def _tool_list_seams(rt, args: dict) -> dict:
     return out
 
 
+def _tool_list_branches(rt, args: dict) -> dict:
+    """Mirror of GET /lab/branches — same projection function, so the HTTP and
+    MCP views cannot drift."""
+    from server.lab_server import _branches_projection
+    return _branches_projection(rt.graph, args.get("status"))
+
+
 def _tool_get_errors(rt, args: dict) -> dict:
     from server.lab_server import _ERRORS, _ERRORS_MAX
     entries = list(reversed(_ERRORS))
@@ -447,6 +471,7 @@ _READ_TOOLS = {
     "get_post": _tool_get_post,
     "list_posts": _tool_list_posts,
     "list_seams": _tool_list_seams,
+    "list_branches": _tool_list_branches,
     "get_errors": _tool_get_errors,
     "get_log": _tool_get_log,
     "get_entity": _tool_get_entity,

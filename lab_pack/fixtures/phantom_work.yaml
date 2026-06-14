@@ -1,0 +1,22 @@
+# Phase 3 (ADR-032): a capability-BUILD proposal (a branch proposing to build/
+# extend a pack for capability X) must check whether X already exists before
+# being proposed. A follow-up proposing to build get_file — present since
+# ADR-028 — is suppressed with an explanatory observation (the production
+# branch#911 that the false gap decision#910 spawned). A follow-up proposing a
+# genuinely absent capability still proposes a branch.
+settings:
+  crawl_enabled: false
+  research_worker_enabled: true   # get_file et al. are live → its build is phantom
+
+mission:
+  title: Phantom-work guard mission
+
+# A build proposal for a capability the lab ALREADY has (github.get_file).
+phantom_intent: >
+  Build the capability to retrieve file contents from the repository so the lab
+  can read source files directly.
+
+# A build proposal for a capability the lab does NOT have — still proposes.
+genuine_intent: >
+  Build a code-execution sandbox capability to run fetched test suites against
+  the source.

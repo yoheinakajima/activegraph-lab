@@ -622,6 +622,13 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
     if _BRANCH_COUNT["open"] >= effective_setting(graph, settings, "max_open_branches"):
         return
 
+    # Phantom-work guard (ADR-032): never propose a branch to build a
+    # capability the lab already has.
+    phantom = _phantom_capability(out.intent, settings)
+    if phantom:
+        _record_phantom_suppression(graph, out.intent, phantom, None, mission_id)
+        return
+
     branch = graph.add_object("branch", {
         "title": (out.title or "Untitled branch")[:120],
         "intent": out.intent,
@@ -645,25 +652,179 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
 # ---------------------------------------------------------------- work
 
 
+# ── routing: verb/intent classification (ADR-006; extends ADR-025's contract) ─
+# A task ROUTES BY ITS ACTION, not by the nouns it mentions. Reading source to
+# verify/check/examine a claim is RESEARCH — the research_worker has get_file
+# and owns it (ADR-022/028). Only tasks that WRITE, MODIFY, or GENERATE code
+# route to codebase.code_task. The earlier keyword router (`code|repo|test|
+# implement`) sent ANYTHING naming code/a repo to codebase: branch#847, a
+# verification task that merely said "fetch the implementation files from the
+# repo and verify the claim", was misrouted to a lane with no reactor — the
+# production defect this fixes.
+#
+# Code-write intent is the IMPERATIVE BARE verb form — the lab is COMMANDED to
+# produce or change code. The bare form is the whole trick: "implement X" is a
+# command; the third-person "X implements Y" and the noun "implementation"
+# DESCRIBE a subject and never command the lab (the branch#64 case). Word
+# boundaries on bare forms exclude both, the same verb-family discipline
+# ADR-025 brought to steering verbs.
+# "code" is deliberately NOT a write verb here: it is overwhelmingly the noun
+# ("verify THE CODE") — the very token the old keyword router misrouted on. It
+# stays in _CODE_OBJECT_RE below as a noun a write verb may act on.
+_CODE_WRITE_VERBS = (
+    "write", "implement", "build", "create", "modify", "refactor", "edit",
+    "patch", "extend", "generate", "develop", "rewrite", "scaffold", "port",
+    "migrate", "rename", "construct", "author", "add", "fix", "remove",
+    "delete",
+)
+_CODE_WRITE_RE = re.compile(
+    r"\b(?:" + "|".join(_CODE_WRITE_VERBS) + r")\b", re.I)
+# A code-write task acts ON a code object: a pack, module, behavior, function,
+# endpoint, parser, schema, migration, test to author. A write verb without a
+# code object ("create an observation", "add a finding") is not a code task —
+# requiring both keeps the verb list from capturing ordinary lab prose. Where a
+# keyword list is unavoidable, this is it, and it is documented.
+_CODE_OBJECT_RE = re.compile(
+    r"\b(?:code|codebase|pack|module|behaviou?r|function|method|class(?:es)?|"
+    r"endpoint|adapter|parser|script|schema|migration|tests?|api|cli|"
+    r"library|wrapper|handler|sandbox|runtime|compiler|linter)\b", re.I)
+
+
 def _routing_for_intent(intent: str) -> dict[str, Any]:
-    """Routing convention for emergent dispatch (ADR-006).
+    """Routing convention for emergent dispatch (ADR-006), classified by the
+    task's ACTION (ADR-025 routing contract, extended).
 
-    OPEN (docs/ARCHITECTURE.md): exact tag convention. Current shape:
-    task.metadata.routing = {"domain": ..., "capability": ...} plus
-    metadata.tags. Verified at the current pin: no upstream pack reacts to
-    core tasks, so dispatch surfaces capability gaps — which is evidence.
+    research.deep_research  — read/verify/examine source to check a claim; the
+                              research_worker fetches it (it has get_file,
+                              ADR-022/028). The DEFAULT: a mention of code,
+                              files, or a repo is not a request to write code.
+    codebase.code_task      — WRITE, MODIFY, or GENERATE code: an imperative
+                              code-write verb acting on a code object.
 
-    Word boundaries, deliberately (the branch#64 incident): the old substring
-    check matched "implement" inside "implements" in a claim DESCRIPTION
-    ("Verify that activegraph actually implements a shared graph structure…"),
-    routing verification research to a codebase pack that does not exist —
-    the same substring-match family ADR-025 fixed for steering verbs. A
-    mention of code is not a request to write code.
+    OPEN (docs/ARCHITECTURE.md): exact tag convention. No upstream pack reacts
+    to core tasks at the current pin; the lab-local research worker (ADR-020)
+    is the only reactor, so verification work MUST land in its lane.
+
+    Defaulting to research is the deliberate risk posture: over-routing a
+    code-write task to the (read-only) research lane is cheap to correct;
+    under-routing a READ task to a dead codebase lane is the production defect
+    (branch#847 → decision#910's false absence). Reading is the safe default.
     """
     low = (intent or "").lower()
-    if re.search(r"\b(code|repo|test|implement)\b", low):
+    if _CODE_WRITE_RE.search(low) and _CODE_OBJECT_RE.search(low):
         return {"domain": "codebase", "capability": "code_task"}
     return {"domain": "research", "capability": "deep_research"}
+
+
+def _available_capabilities(graph, settings) -> set[tuple[str, str]]:
+    """The lab's ACTUAL capability lanes — what it can really execute now, not
+    what routing happened to tag (ADR-031). A lane is 'available' only when its
+    reactor is live with its tools. Consulted before any behavior asserts a
+    capability is absent."""
+    caps: set[tuple[str, str]] = set()
+    try:
+        from .research_worker import research_lane_available
+        if research_lane_available(settings):
+            caps.add(("research", "deep_research"))
+    except Exception:
+        pass
+    return caps
+
+
+def _available_tools(settings) -> frozenset[str]:
+    """The concrete tool names the lab can call right now (ADR-031/032),
+    grounded in the research lane's tool list when it is live — the same set
+    the capability self-check and the phantom-work guard reason over."""
+    try:
+        from .research_worker import (RESEARCH_WORKER_TOOLS,
+                                      research_lane_available)
+        if research_lane_available(settings):
+            return RESEARCH_WORKER_TOOLS
+    except Exception:
+        pass
+    return frozenset()
+
+
+# ── phantom-work guard (ADR-032) ──────────────────────────────────────────────
+# A capability-BUILD proposal (a branch proposing to build/extend a pack for
+# capability X) must check whether X already exists before being proposed. If
+# it does, the proposal is phantom work: suppress it and record an observation
+# that the capability is present and the prior gap was spurious. (Production:
+# branch#911 proposed building get_file — which shipped in ADR-028 — born from
+# the false gap decision#910 asserted. A capability self-check that only fixes
+# the verdict still leaves the proposal it spawned.)
+#
+# The words a build-proposal uses to ASK for a capability the lab already has,
+# mapped to the live tool that already provides it. Documented and deliberately
+# narrow: the guard fires only when a build verb, a capability noun, AND one of
+# these aliases for an AVAILABLE tool all appear.
+_EXISTING_CAPABILITY_ALIASES = {
+    "github.get_file": (
+        "get_file", "get file", "file content", "file contents",
+        "files' content", "contents of files", "contents of the files",
+        "retrieve file", "retrieving file", "retrieve the file",
+        "fetch file", "fetch the file", "read file", "read the file",
+        "retrieve file contents", "retrieve the contents", "file retrieval",
+        "source file contents", "source-file contents", "retrieve source",
+    ),
+    "github.get_tree": (
+        "get_tree", "get tree", "directory tree", "repo tree",
+        "repository tree", "file tree", "directory listing", "list the files",
+        "list repository files",
+    ),
+    "web.fetch_url": (
+        "fetch_url", "fetch url", "fetch a url", "fetch web", "web fetch",
+        "fetch the page", "fetch web pages", "download the page",
+        "fetch a web page",
+    ),
+}
+_BUILD_VERB_RE = re.compile(
+    r"\b(?:build|add|create|implement|develop|introduce|provide|enable|"
+    r"gain|acquire|construct|stand up|wire up)\b", re.I)
+_CAPABILITY_NOUN_RE = re.compile(
+    r"\b(?:capab\w*|tool|tooling|pack|ability|means|support|feature|"
+    r"mechanism|worker|adapter|integration)\b", re.I)
+
+
+def _phantom_capability(intent: str, settings: LabSettings) -> Optional[str]:
+    """If `intent` is a capability-BUILD proposal for a capability the lab
+    ALREADY has, return the existing tool's name; else None (ADR-032)."""
+    low = (intent or "").lower()
+    if not (_BUILD_VERB_RE.search(low) and _CAPABILITY_NOUN_RE.search(low)):
+        return None  # not framed as building a capability
+    for tool_name in sorted(_available_tools(settings)):
+        for alias in _EXISTING_CAPABILITY_ALIASES.get(tool_name, ()):
+            if alias in low:
+                return tool_name
+    return None
+
+
+def _record_phantom_suppression(graph, intent: str, tool_name: str,
+                                branch_id: Optional[str],
+                                mission_id: Optional[str]):
+    """A capability-build proposal was suppressed because the capability is
+    already present (ADR-032). Record an observation in its place — no branch,
+    no phantom work — naming the live tool and flagging the prior gap as
+    spurious."""
+    text = (
+        f"Build-proposal suppressed (phantom work): the proposed capability is "
+        f"already present as '{tool_name}'. A branch to build it would "
+        f"duplicate a live tool, so any capability gap that prompted this "
+        f"proposal was spurious. Proposed intent: "
+        f"{(intent or '').strip()[:200]}"
+    )
+    obs = graph.add_object("observation", {
+        "text": text,
+        "confidence": 0.95,
+        "category": "fact",
+        "metadata": {"lab": "phantom_work_suppressed",
+                     "existing_tool": tool_name,
+                     "lab_branch_id": branch_id,
+                     "mission_id": mission_id},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, obs.id, "supported_by")
+    return obs
 
 
 def _dispatch_branch(graph, branch_id: str, branch_data: dict, settings: LabSettings) -> None:
@@ -728,7 +889,7 @@ def _task_reacted(graph, task_id: str) -> bool:
     return bool(task and task.data.get("status") not in ("active", None))
 
 
-def _gap_check(graph, task_id: str) -> None:
+def _gap_check(graph, task_id: str, settings: LabSettings) -> None:
     if task_id in _GAP_CHECKED:
         return
     _GAP_CHECKED.add(task_id)
@@ -740,22 +901,57 @@ def _gap_check(graph, task_id: str) -> None:
     meta = task.data.get("metadata") or {}
     branch_id = meta.get("lab_branch_id")
     routing = meta.get("routing") or {}
-    gap_text = (
-        f"Capability gap: no loaded pack reacted to task '{task.data.get('title')}' "
-        f"(routing: {routing.get('domain')}.{routing.get('capability')}). "
-        "The lab cannot execute this work yet. A gap is evidence, not an error."
-    )
+    actual = (routing.get("domain"), routing.get("capability"))
+
+    # Capability self-check (ADR-031): "no pack reacted" is a ROUTING fact, not
+    # proof the lab cannot do the work. Before recording absence, consult the
+    # actual available-capability set and re-classify the intent: if this
+    # task's work belongs to a lane whose capability IS present, this is a
+    # MISROUTE — "not reached", never "absent". (Production: decision#910
+    # asserted the lab "lacks the means to retrieve file contents", false since
+    # get_file shipped in ADR-028; the worker's lane simply was not the one
+    # routed. branch#847.)
+    available = _available_capabilities(graph, settings)
+    intent = task.data.get("description") or task.data.get("title") or ""
+    correct = _routing_for_intent(intent)
+    correct_key = (correct["domain"], correct["capability"])
+    misrouted = correct_key != actual and correct_key in available
+
+    if misrouted:
+        gap_text = (
+            f"Misrouted, capability available: task '{task.data.get('title')}' "
+            f"was routed {actual[0]}.{actual[1]} and no pack reacted, but its "
+            f"intent is {correct_key[0]}.{correct_key[1]} work whose capability "
+            f"IS present in the lab. Outcome: not reached — a routing miss, not "
+            f"a capability absence. Re-dispatch under the corrected routing."
+        )
+        lab_tag = "routing_miss"
+        obs_meta = {"lab": lab_tag, "lab_branch_id": branch_id,
+                    "task_id": task_id,
+                    "misrouted_from": f"{actual[0]}.{actual[1]}",
+                    "correct_routing": f"{correct_key[0]}.{correct_key[1]}"}
+    else:
+        gap_text = (
+            f"Capability gap: no loaded pack reacted to task "
+            f"'{task.data.get('title')}' (routing: {actual[0]}.{actual[1]}), "
+            f"and no available capability covers this work. The lab cannot "
+            f"execute this work yet. A gap is evidence, not an error."
+        )
+        lab_tag = "capability_gap"
+        obs_meta = {"lab": lab_tag, "lab_branch_id": branch_id,
+                    "task_id": task_id}
+
     obs = graph.add_object("observation", {
         "text": gap_text,
         "confidence": 0.95,
         "category": "risk",
-        "metadata": {"lab": "capability_gap", "lab_branch_id": branch_id, "task_id": task_id},
+        "metadata": obs_meta,
     })
     if branch_id:
         graph.add_relation(branch_id, obs.id, "supported_by")
-    # The blocked patch carries the gap as the task's result_summary; work's
-    # outcome path (which now treats `blocked` as an outcome — the branch#64
-    # silent path) turns it into the evaluation interpret fires on.
+    # The blocked patch carries the outcome as the task's result_summary;
+    # work's outcome path (which now treats `blocked` as an outcome — the
+    # branch#64 silent path) turns it into the evaluation interpret fires on.
     new_meta = dict(meta)
     new_meta["result_summary"] = gap_text
     graph.patch_object(task_id, {"status": "blocked", "metadata": new_meta})
@@ -837,7 +1033,7 @@ def work(event, graph, ctx, *, settings: LabSettings):
                                else "blocked" if new == "blocked" else "failed")
             return
         if "metadata" in diff and meta.get("dispatch_probe") and settings.dispatch_gap_check:
-            _gap_check(graph, target)
+            _gap_check(graph, target, settings)
 
 
 # ---------------------------------------------------------------- interpret
@@ -908,7 +1104,15 @@ def interpret(event, graph, ctx, out, *, settings: LabSettings):
     })
 
     if out.outcome == "follow_up" and out.follow_up_intent:
-        if _BRANCH_COUNT["open"] < settings.max_open_branches:
+        # Phantom-work guard (ADR-032): a follow-up that proposes building a
+        # capability the lab already has is suppressed with an explanatory
+        # observation — the false-gap → phantom-proposal chain (branch#911)
+        # stops here, not just at the verdict.
+        phantom = _phantom_capability(out.follow_up_intent, settings)
+        if phantom:
+            _record_phantom_suppression(graph, out.follow_up_intent, phantom,
+                                        branch_id, branch.data.get("mission_id"))
+        elif _BRANCH_COUNT["open"] < settings.max_open_branches:
             child = graph.add_object("branch", {
                 "title": f"Follow-up: {out.follow_up_intent[:100]}",
                 "intent": out.follow_up_intent,
