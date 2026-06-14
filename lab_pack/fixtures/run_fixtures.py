@@ -2922,6 +2922,87 @@ def run_code_worker() -> bool:
                "the task fails with an actionable verdict (interpret fires)")
         print(f"  branch#847 net: routing_miss → research.deep_research, "
               f"actionable verdict")
+
+        # ── branch#935 net: graceful degradation. A code task reaches the
+        # worker with the lab's OWN repo but NO command (the bare-repo shape a
+        # prose-only proposal left behind). Instead of dying with "no command
+        # could be resolved", the worker infers the lab's own proof harness and
+        # RUNS it (canned via a run stub so the suite is not re-entered). ─────
+        import lab_pack.code_worker as cw
+        from lab_pack.behaviors import _SELF_REPAIR_DEFAULT_COMMAND
+        captured: dict = {}
+
+        def fake_run(repo, command, **kw):
+            captured["repo"], captured["command"] = repo, command
+            return {"repo": repo, "ref": kw.get("ref"), "command": command,
+                    "baseline": {"command": command, "exit_code": 0,
+                                 "timed_out": False, "duration_seconds": 0.0,
+                                 "stdout": "ok", "stderr": "", "error": None},
+                    "after_diff": None, "proven": True, "changed_files": None,
+                    "error": None}
+
+        saved_run = cw.run_repo_task
+        cw.run_repo_task = fake_run
+        try:
+            b_bare = create_branch_fn(
+                g, mission.id, "Repair the lab's own parser",
+                "Implement a minimal fix for the lab's own parser bug and "
+                "prove it.", status="proposed")
+            rt.run_until_idle()
+            bare_task = g.add_object("task", {
+                "title": "Bare-repo code task",
+                "description": "Implement a minimal fix for the lab's own "
+                               "parser bug and prove it.",
+                "status": "active", "priority": "medium",
+                "metadata": {"routing": {"domain": "codebase",
+                                         "capability": "code_task"},
+                             "tags": ["lab", "codebase"],
+                             "lab_branch_id": b_bare.id,
+                             # a bare repo, NO command — the prose-only shape
+                             "code_task": {"repo": "yoheinakajima/activegraph-lab"}}})
+            g.add_relation(b_bare.id, bare_task.id, "dispatched")
+            rt.run_until_idle()
+            c.that(captured.get("command") == _SELF_REPAIR_DEFAULT_COMMAND,
+                   f"a bare-repo code task infers the default proof command "
+                   f"({captured.get('command')!r}) and RUNS it — not a hard fail")
+            bare_err = ((g.get_object(bare_task.id).data.get("metadata") or {})
+                        .get("error") or "")
+            c.that("no command could be resolved" not in bare_err,
+                   "the bare-repo task is NOT rejected with 'no command could "
+                   "be resolved' (the branch#935 production failure)")
+            claim = [o for o in _lab_obs(g, "code_progress")
+                     if (o.data.get("metadata") or {})
+                     .get("lab_branch_id") == b_bare.id]
+            c.that(bool(claim) and (claim[0].data.get("metadata") or {})
+                   .get("command_inferred") is True,
+                   "the claim observation records command_inferred=True")
+        finally:
+            cw.run_repo_task = saved_run
+        print("  branch#935 net: bare repo → default proof command inferred, runs")
+
+        # ── but a GENUINELY malformed code task (no repo, no command, a
+        # code-write intent — nothing to infer a repo from) still fails
+        # honestly: degradation never papers over an empty task. ─────────────
+        bad_intent = "Implement a minimal fix for the parser bug and prove it."
+        b_bad = create_branch_fn(g, mission.id, "Empty code task",
+                                 bad_intent, status="proposed")
+        rt.run_until_idle()
+        bad_task = g.add_object("task", {
+            "title": "Malformed code task",
+            "description": bad_intent,
+            "status": "active", "priority": "medium",
+            "metadata": {"routing": {"domain": "codebase",
+                                     "capability": "code_task"},
+                         "tags": ["lab", "codebase"], "lab_branch_id": b_bad.id}})
+        g.add_relation(b_bad.id, bad_task.id, "dispatched")
+        rt.run_until_idle()
+        bad_err = ((g.get_object(bad_task.id).data.get("metadata") or {})
+                   .get("error") or "")
+        c.that(g.get_object(bad_task.id).data.get("status") == "rejected"
+               and "no command could be resolved" in bad_err,
+               "a malformed code task (no repo, no command) still fails "
+               "honestly with 'no command could be resolved'")
+        print("  malformed task → honest 'no command could be resolved' failure")
     finally:
         repo_sandbox.set_clone_hook(None)
 
@@ -3209,6 +3290,19 @@ def run_self_repair() -> bool:
                    and (tc.data.get("metadata") or {}).get("routing")
                    == {"domain": "codebase", "capability": "code_task"},
                    "activation dispatches a codebase.code_task (the routing is real)")
+            # branch#935: the dispatched TASK itself must carry a runnable
+            # code_task spec ({repo, command}) — a prose intent alone left the
+            # worker with "no command could be resolved".
+            tct = (tc.data.get("metadata") or {}).get("code_task") or {} if tc else {}
+            c.that(tct.get("repo") == cdf["repo"]
+                   and bool((tct.get("command") or "").strip()),
+                   f"the dispatched task carries metadata.code_task="
+                   f"{{repo,command}} (repo={tct.get('repo')}, "
+                   f"command={tct.get('command')!r}) — runnable, not prose-only")
+            c.that(bool(((tc.data.get("metadata") or {}).get("brief") or "")
+                        .strip()) if tc else False,
+                   "the prose bug description rides as task.metadata.brief "
+                   "(the authoring brief)")
             c.that(tc is not None and tc.data.get("status") == "done",
                    f"the code worker proves the fix (task "
                    f"{tc.data.get('status') if tc else None})")
@@ -3261,6 +3355,16 @@ def run_self_repair() -> bool:
                    and (ft.data.get("metadata") or {}).get("routing")
                    == {"domain": "codebase", "capability": "code_task"},
                    "it dispatches a codebase.code_task — same downstream path")
+            # The fix-verb task is runnable too: {repo=own, command} populated
+            # (the operator's `command:` line, here `true`) — branch#935 fix.
+            fct = (ft.data.get("metadata") or {}).get("code_task") or {} if ft else {}
+            c.that(fct.get("repo") == "yoheinakajima/activegraph-lab"
+                   and (fct.get("command") or "").strip() == "true",
+                   f"the fix-verb task carries metadata.code_task="
+                   f"{{repo,command}} (repo={fct.get('repo')}, "
+                   f"command={fct.get('command')!r})")
+            c.that(ft is not None and ft.data.get("status") != "rejected",
+                   "the fix-verb task is not rejected for a missing command")
         cand = next((x for x in g.objects(type="comm_response_candidate")
                      if x.data.get("message_id") == msg.id), None)
         reply = (cand.data.get("content") or "") if cand else ""

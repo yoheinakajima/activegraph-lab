@@ -213,6 +213,33 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
     # proven fix as a PENDING (human-gated) submit_pr — carried verbatim so
     # the synthesis stage knows to open one when the diff proves.
     propose_pr = bool(spec.get("propose_pr"))
+    # The prose bug description the PROPOSER attached (ADR-036): the authoring
+    # brief for the diff-authoring step, falling back to the intent so a task
+    # dispatched without a structured brief still carries one.
+    brief = (spec.get("brief") or data.get("description")
+             or data.get("title") or "")
+
+    # Graceful degradation (ADR-036 hardening): a code task that reaches the
+    # worker with a repo resolved but NO command must NOT die with "no command
+    # could be resolved" (the branch#935 production failure). When the repo is
+    # the lab's OWN allowlisted repo and the intent is genuine code-write work
+    # (NOT a read-to-verify misroute — the branch#847 net below still owns
+    # that), default the command to the lab's own proof harness (the suite
+    # runner). The PROPOSER populating task.metadata.code_task is the real fix;
+    # this is defense in depth for a bare-repo task that slips through (e.g. a
+    # proposal an older deploy authored as a prose intent with no command).
+    command_inferred = False
+    if repo and not command:
+        from .github_read import is_own_repo
+        if is_own_repo(repo):
+            from .behaviors import (_routing_for_intent,
+                                    _SELF_REPAIR_DEFAULT_COMMAND)
+            intent_text = data.get("description") or data.get("title") or ""
+            correct = _routing_for_intent(intent_text)
+            if (correct["domain"], correct["capability"]) == \
+                    ("codebase", "code_task"):
+                command = _SELF_REPAIR_DEFAULT_COMMAND
+                command_inferred = True
     run_cap = max(1, int(effective_setting(graph, settings, "code_run_cap")))
     timeout = max(5, int(effective_setting(graph, settings,
                                            "sandbox_timeout_seconds")))
@@ -223,6 +250,8 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
     graph.add_object("observation", {
         "text": (f"Code worker claimed task '{data.get('title')}': "
                  + (f"sandbox-running '{command}' against {repo}"
+                    + (" (default proof command inferred)"
+                       if command_inferred else "")
                     + (" (with a proposed fix diff)" if diff else "")
                     if repo and command else
                     "no repo/command resolved — cannot run")
@@ -231,7 +260,8 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
         "category": "fact",
         "metadata": {"lab": "code_progress", "task_id": obj_id,
                      "lab_branch_id": branch_id, "repo": repo,
-                     "has_diff": bool(diff), "run_cap": run_cap},
+                     "has_diff": bool(diff), "run_cap": run_cap,
+                     "command_inferred": command_inferred},
     })
 
     if not command:
@@ -319,9 +349,10 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
                      "repo": repo, "proven": bool(result.get("proven")),
                      # ADR-036: the fix to land (diff) + the intent to land it
                      # (propose_pr) ride to the synthesis stage, which opens a
-                     # gated submit_pr ONLY when the fix proves.
+                     # gated submit_pr ONLY when the fix proves. The prose brief
+                     # rides too — the authoring context for the diff step.
                      "diff": diff if (diff and propose_pr) else None,
-                     "propose_pr": propose_pr,
+                     "propose_pr": propose_pr, "brief": brief,
                      "run": _run_metadata(result)},
     })
 
