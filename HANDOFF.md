@@ -32,9 +32,11 @@ Setup: `uv pip install --system -e .` (plain pip can't resolve activegraph-packs
       (operator-tier) + tools.annotate_branch_fn (shared with the note verb).
       Records operator_note observation, no status change. ADR-028 amended.
       test_mcp + sentinel audit cover it. GREEN.
-- [ ] PHASE 5 — cadence metadata: one-line "evidence profile" in each draft's
-      review note (own-live vs inherited findings; distinct-branch span).
-      No auto-block.
+- [x] PHASE 5 — evidence profile in each draft's review note (live vs
+      inherited; distinct-branch span). behaviors._evidence_profile, wired into
+      draft_writer's review-note region. Advisory, no auto-block. No ADR
+      (supports ADR-014 policy, doesn't move an invariant). Fixture:
+      draft_writer Phase 5. GREEN.
 - [ ] PHASE 6 — _EXISTING_CAPABILITY_ALIASES maintenance guard test: every
       tool in RESEARCH_WORKER_TOOLS has alias-map coverage or documented
       exemption. No runtime change.

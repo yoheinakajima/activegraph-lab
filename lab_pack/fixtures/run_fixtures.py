@@ -1160,6 +1160,49 @@ def run_draft_writer() -> bool:
                        f"({hedged!r})")
     print("  Phase 1: overclaim lint — independent/autonomous/proven/superlative"
           " flag, hedged passes")
+
+    # ── Phase 5: evidence profile — inherited vs live, branch span ──────────
+    from lab_pack.behaviors import _evidence_profile
+    inherited_ctx = [
+        {"finding_id": "observation#101", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+        {"finding_id": "observation#102", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+        {"finding_id": "observation#103", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+    ]
+    prof_inherited = _evidence_profile(
+        g, ["observation#101", "observation#102", "observation#103"],
+        findings_context=inherited_ctx) or ""
+    c.that("evidence profile" in prof_inherited
+           and "3 inherited from build sessions" in prof_inherited
+           and "0 from the lab's own live work" in prof_inherited
+           and "1 distinct branch" in prof_inherited
+           and "re-slice" in prof_inherited,
+           f"inherited single-branch evidence shows the re-slice profile "
+           f"({prof_inherited!r})")
+
+    fresh_ctx = [
+        {"finding_id": "observation#201",
+         "origin": "live work by the research_worker behavior",
+         "created_by": "lab.research_worker", "branch_id": "branch#21"},
+        {"finding_id": "observation#202",
+         "origin": "live work by the research_worker behavior",
+         "created_by": "lab.research_worker", "branch_id": "branch#22"},
+        {"finding_id": "observation#203",
+         "origin": "live work by the interpret behavior",
+         "created_by": "lab.interpret", "branch_id": "branch#23"},
+    ]
+    prof_fresh = _evidence_profile(
+        g, ["observation#201", "observation#202", "observation#203"],
+        findings_context=fresh_ctx) or ""
+    c.that("3 from the lab's own live work" in prof_fresh
+           and "0 inherited from build sessions" in prof_fresh
+           and "3 distinct branch" in prof_fresh
+           and "re-slice" not in prof_fresh,
+           f"fresh multi-branch evidence shows the contrast ({prof_fresh!r})")
+    print("  Phase 5: evidence profile — inherited single-branch vs fresh "
+          "multi-branch contrast")
     return c.done("draft_writer")
 
 

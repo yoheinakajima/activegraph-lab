@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Evidence profile in the draft review note (Phase 5, supports ADR-014's
+  editorial policy without enforcing it): every draft's review note now
+  carries a one-line profile — how many cited observations are the lab's own
+  LIVE work vs INHERITED from build sessions, and how many distinct branches
+  the evidence spans. Surfaces "re-slicing the same inherited findings" at
+  decision time so the operator can apply the new-evidence-only bar by eye.
+  Advisory only; no auto-block. Fixture: draft_writer Phase 5 (inherited
+  single-branch shows the re-slice profile; fresh multi-branch shows the
+  contrast).
+
 - Bare branch annotation over MCP (ADR-028, Phase 4): new operator-tier tool
   `annotate_branch(branch_id, note)` records free-text operator commentary as
   an `operator_note` observation linked to the branch and changes NO status —

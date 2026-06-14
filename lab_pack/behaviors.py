@@ -1980,6 +1980,54 @@ def _overclaim_review(body: str, graph, evidence_ids: list[str], *,
     return "\n\n" + "\n".join(lines)
 
 
+def _evidence_profile(graph, evidence_ids: list[str],
+                      findings_context: Optional[list] = None) -> Optional[str]:
+    """Phase 5 (cadence metadata): a one-line evidence profile for the review
+    note — how many cited observations are the lab's OWN LIVE WORK vs INHERITED
+    from build sessions, and how many distinct branches the evidence spans.
+    This surfaces 're-slicing the same inherited findings' at decision time so
+    the operator can apply the new-evidence-only bar by eye. Advisory: it
+    supports the operator policy, it does NOT enforce it (no auto-block)."""
+    if not evidence_ids:
+        return None
+    ctx_by_id = {c.get("finding_id"): c for c in (findings_context or [])
+                 if c.get("finding_id")}
+    live = inherited = 0
+    branches: set[str] = set()
+    for ref in evidence_ids:
+        ctx = ctx_by_id.get(ref) or _item_context(graph, ref)
+        origin = str(ctx.get("origin") or "")
+        created_by = str(ctx.get("created_by") or "")
+        is_inherited = origin.startswith("seeded") or created_by in ("system", "")
+        if not is_inherited:
+            o = graph.get_object(ref)
+            # Build-session keyed findings (LIVE_FINDINGS / _seed_findings) are
+            # inherited even where per-item provenance predates tracking.
+            if o is not None and (o.data.get("metadata") or {}).get("finding_key"):
+                is_inherited = True
+        if is_inherited:
+            inherited += 1
+        else:
+            live += 1
+        branch = ctx.get("branch_id")
+        if not branch:
+            o = graph.get_object(ref)
+            branch = ((o.data.get("metadata") or {}).get("lab_branch_id")
+                      if o is not None else None)
+        if branch:
+            branches.add(branch)
+    n = len(evidence_ids)
+    nb = len(branches)
+    tail = ("Mostly inherited and single-branch — likely a re-slice of prior "
+            "build-session findings; apply the new-evidence-only bar."
+            if inherited > live and nb <= 1 else
+            "Weigh against the new-evidence-only bar before approving.")
+    return ("\n\n> **Review note (evidence profile):** "
+            f"{n} cited observation(s) — {live} from the lab's own live work, "
+            f"{inherited} inherited from build sessions; spanning {nb} distinct "
+            f"branch(es). " + tail)
+
+
 @llm_behavior(
     name="draft_writer",
     on=["object.created"],
@@ -2052,16 +2100,21 @@ def draft_writer(event, graph, ctx, out, *, settings: LabSettings):
     slug = _slugify(out.slug or title)
 
     # Review notes append to the body (operator attention, never auto-blocking):
-    # coverage/process/orphan (5b), then the overclaim lint (Phase 1, ADR-033).
-    # Both scan the ORIGINAL body so neither lints the other's note text.
+    # coverage/process/orphan (5b), the overclaim lint (Phase 1, ADR-033), and
+    # the evidence profile (Phase 5). The text scans run on the ORIGINAL body
+    # so none lints another's note text.
     review = _coverage_review(body)
     overclaim = _overclaim_review(
         body, graph, evidence, branch_id=branch_id,
         findings_context=meta.get("findings_context"))
+    profile = _evidence_profile(graph, evidence,
+                                findings_context=meta.get("findings_context"))
     if review:
         body += review
     if overclaim:
         body += overclaim
+    if profile:
+        body += profile
 
     mission_meta = {}
     mission = None
