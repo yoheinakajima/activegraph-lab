@@ -107,6 +107,34 @@ class CodeOutcome(BaseModel):
     )
 
 
+class AuthoredDiff(BaseModel):
+    """Structured output for the code_author behavior (ADR-037, diff authoring).
+
+    The model AUTHORS a unified diff implementing the fix the brief describes,
+    over the cloned repo's relevant files. The lab then applies the diff in the
+    sandbox and runs the proof command — the RUN decides success, never the
+    model. When the brief describes a defect the diff must also add or extend a
+    regression test that fails without the fix."""
+
+    diff: str = Field(
+        description=(
+            "A valid unified diff in `git apply` format (`--- a/<path>`, "
+            "`+++ b/<path>`, `@@ … @@` hunks; `--- /dev/null` for a new file). "
+            "It must implement the fix the brief describes AND, when the brief "
+            "describes a defect, add or extend a regression test that fails "
+            "without the fix. Output ONLY the diff — no prose, no code fences."
+        ),
+    )
+    notes: str = Field(
+        default="",
+        description=(
+            "One or two sentences: what the diff changes and the regression "
+            "test it adds/extends. No claim the fix is proven — the sandbox "
+            "run decides that, not you."
+        ),
+    )
+
+
 class SeamProposal(BaseModel):
     """Structured output for the seam_writer behavior (Phase 4 rails):
     the next version of a seam body, argued from cited evidence."""
@@ -255,6 +283,46 @@ class LabMockProvider:
                        "failure. ")
                     + f"[mock {digest}]"),
             )
+        elif name == "AuthoredDiff":
+            # The diff-authoring mock (ADR-037): a deterministic "model" that
+            # reads the relevant-file context in the prompt and authors a diff
+            # the sandbox can apply. Like the CodeOutcome mock reads exit codes,
+            # this reads the file under repair: when it sees the canned failing
+            # check (`sys.exit(1)`), it authors the one-line flip that makes the
+            # proof command pass AND adds a regression test (the brief asks for
+            # one) — so fixtures can prove brief → authored diff → applied →
+            # proof passes → submit_pr without a live LLM. The lab still decides
+            # success from the RUN, never from this text.
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            test_path = f"tests/test_regression_{digest}.py"
+            regression = (
+                f"--- /dev/null\n"
+                f"+++ b/{test_path}\n"
+                f"@@ -0,0 +1,3 @@\n"
+                f"+# Regression test for the defect in the brief (mock authoring {digest}).\n"
+                f"+def test_defect_fixed():\n"
+                f"+    assert True\n")
+            if "sys.exit(1)" in blob:
+                # The fix the brief implies: flip the failing check to pass, and
+                # add the regression test the brief asks for.
+                fix = (
+                    "--- a/check.py\n"
+                    "+++ b/check.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-import sys; sys.exit(1)\n"
+                    "+import sys; sys.exit(0)\n")
+                parsed = AuthoredDiff(
+                    diff=fix + regression,
+                    notes=("Flips the failing check to exit 0 and adds a "
+                           f"regression test ({test_path}). [mock {digest}]"))
+            else:
+                # No recognizable target in context: author the regression test
+                # only (a new file always applies cleanly). The proof command
+                # decides whether that is enough.
+                parsed = AuthoredDiff(
+                    diff=regression,
+                    notes=(f"Adds a regression test ({test_path}) for the "
+                           f"defect described in the brief. [mock {digest}]"))
         elif name == "SeamProposal":
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             seam_m = re.findall(
@@ -679,6 +747,8 @@ def _inert_output(output_schema: type, note: str) -> Any:
             return output_schema(summary=note, findings=[])
         if name == "CodeOutcome":
             return output_schema(summary=note)
+        if name == "AuthoredDiff":
+            return output_schema(diff="", notes=note)
         if name == "SeamProposal":
             return output_schema(body="", rationale=note)
         if name == "BlogDraft":

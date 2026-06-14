@@ -110,7 +110,12 @@ def composed_description(behavior_name: str, prompt_body: str,
 # runtime's native per-model reporting (cost_usd on llm.responded).
 
 MODEL_ROUTED_BEHAVIORS = ("plan", "interpret", "draft_writer", "answer",
-                          "research_worker", "code_worker")
+                          "research_worker", "code_worker", "code_author")
+
+# The diff-authoring stage (ADR-037) shares the code_worker model tier — code
+# authoring is top-tier reasoning, same plane as synthesis — so it resolves
+# through setting.model.code_worker, not a separate routing entry.
+_MODEL_KEY_ALIASES = {"code_author": "code_worker"}
 
 
 def resolve_behavior_model(graph, behavior_name: str) -> str:
@@ -119,7 +124,8 @@ def resolve_behavior_model(graph, behavior_name: str) -> str:
     entry resolve through model.default."""
     from .settings import LabSettings
     defaults = LabSettings()
-    key = (f"model.{behavior_name}" if behavior_name in MODEL_ROUTED_BEHAVIORS
+    key_name = _MODEL_KEY_ALIASES.get(behavior_name, behavior_name)
+    key = (f"model.{key_name}" if key_name in MODEL_ROUTED_BEHAVIORS
            else "model.default")
     return str(effective_setting(graph, defaults, key)
                or defaults.model_default).strip()

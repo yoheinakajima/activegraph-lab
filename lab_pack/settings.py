@@ -110,7 +110,23 @@ class LabSettings(BaseModel):
         description=(
             "Model for the code_worker behavior (ADR-019/035). Defaults to the "
             "deliberate plane (claude-opus-4-8) — reasoning over a code change "
-            "and its test output is top-tier work per the operator's tiering."
+            "and its test output is top-tier work per the operator's tiering. "
+            "The diff-authoring stage (code_author, ADR-037) routes through "
+            "this same setting — authoring a fix is top-tier reasoning too."
+        ),
+    )
+    code_author_max_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description=(
+            "Bound on the code_worker's diff-authoring retry loop (ADR-037): "
+            "the LLM authors a unified diff from the brief, the lab applies it "
+            "in the sandbox and runs the proof command, and on failure the "
+            "captured output is fed back for up to this many authoring attempts "
+            "total. After the bound, the worker records an honest 'authored a "
+            "diff but could not make it pass' evaluation and opens NO submit_pr "
+            "— a fix must earn its PR by proving in the sandbox."
         ),
     )
     # ── self-dispatched code repair (ADR-036, the self-repair loop's planner) ─

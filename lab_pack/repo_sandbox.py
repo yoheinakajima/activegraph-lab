@@ -363,6 +363,107 @@ def run_repo_task(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# Files the authoring-context walk never reads (noise, binaries, or huge): the
+# diff author reasons over source, not build artifacts or VCS internals.
+_CONTEXT_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "data",
+})
+_CONTEXT_TEXT_EXT = frozenset({
+    ".py", ".md", ".txt", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".json",
+    ".js", ".mjs", ".ts", ".tsx", ".sh", ".html", ".css", ".rst",
+})
+
+
+def clone_and_read(
+    repo: str,
+    *,
+    ref: Optional[str] = None,
+    hint_paths: Optional[list[str]] = None,
+    max_files: int = 24,
+    max_total_chars: int = 40_000,
+) -> dict[str, Any]:
+    """Clone an ALLOWLISTED repo and read a bounded set of its files — the
+    relevant-file context the diff-authoring step (ADR-037) reasons over.
+
+        {"repo", "ref", "tree": [path, …], "files": {path: content},
+         "error": str | None}
+
+    No command is run: the only subprocess is the clean-env `git clone` (the
+    same isolation the rest of the sandbox uses), so this consumes no run
+    budget and exercises no command env. The allowlist is checked BEFORE any
+    I/O. `hint_paths` (e.g. files the brief names) are read first; the rest of
+    the tree fills the remaining budget, smallest text source first. Never
+    raises — refusals and clone failures come back in `error`.
+    """
+    out: dict[str, Any] = {"repo": repo, "ref": ref, "tree": [], "files": {},
+                           "error": None}
+    allow_err = _check_repo(repo)
+    if allow_err:
+        out["error"] = allow_err
+        return out
+
+    workdir = tempfile.mkdtemp(prefix="lab-sandbox-read-")
+    repo_dir = os.path.join(workdir, "repo")
+    try:
+        clone_fn = _CLONE_HOOK["fn"] or _live_clone
+        clone_err = clone_fn(repo, ref, repo_dir)
+        if clone_err:
+            out["error"] = clone_err
+            return out
+        if not os.path.isdir(repo_dir):
+            out["error"] = "clone produced no repo directory"
+            return out
+
+        root = os.path.normpath(repo_dir)
+        rel_paths: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(repo_dir):
+            dirnames[:] = [d for d in dirnames if d not in _CONTEXT_SKIP_DIRS]
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, repo_dir)
+                rel_paths.append(rel.replace(os.sep, "/"))
+        rel_paths.sort()
+        out["tree"] = rel_paths[:500]
+
+        # Read hint files first, then the rest, smallest-readable first, until
+        # the file-count or total-char budget is spent.
+        ordered: list[str] = []
+        hints = [h.replace(os.sep, "/").lstrip("./") for h in (hint_paths or [])]
+        for h in hints:
+            if h in rel_paths and h not in ordered:
+                ordered.append(h)
+        rest = [p for p in rel_paths
+                if p not in ordered
+                and os.path.splitext(p)[1].lower() in _CONTEXT_TEXT_EXT]
+
+        def _size(p: str) -> int:
+            try:
+                return os.path.getsize(os.path.normpath(os.path.join(repo_dir, p)))
+            except OSError:
+                return 1 << 30
+        rest.sort(key=_size)
+        ordered += rest
+
+        total = 0
+        for rel in ordered:
+            if len(out["files"]) >= max_files or total >= max_total_chars:
+                break
+            full = os.path.normpath(os.path.join(repo_dir, rel))
+            if not full.startswith(root + os.sep):
+                continue  # never follow a traversal out of the repo
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    content = f.read(max_total_chars)
+            except (OSError, UnicodeDecodeError):
+                continue
+            out["files"][rel] = _truncate(content)
+            total += len(content)
+        return out
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def evidence_summary(result: dict[str, Any]) -> str:
     """A one-line, secret-free summary of a run result for an observation's
     text (the full streams ride in metadata)."""

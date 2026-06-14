@@ -3027,6 +3027,155 @@ def run_code_worker() -> bool:
     return c.done("code_worker")
 
 
+def run_code_authoring() -> bool:
+    """ADR-037: the code_worker's diff-AUTHORING step — the self-repair loop's
+    last mile. A propose_pr task carrying a brief but NO candidate diff drives an
+    LLM authoring step (mocked): read the relevant files (from the clone), author
+    a unified diff, apply + run the proof command. Tests pass → a gated submit_pr
+    with the AUTHORED diff + the sandbox proof; tests fail → bounded retry, then
+    an honest 'authored a diff but could not make it pass' gap and NO PR."""
+    spec = _load("code_authoring.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: code_authoring — brief → author diff → apply → prove → "
+          "submit_pr; unprovable → bounded retry → honest gap, no PR")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write, repo_sandbox
+
+    # Canned clone: seed a FAILING check the authored diff must repair. The RUN
+    # step is the REAL subprocess (the sentinel gate covers its isolation), and
+    # the diff is AUTHORED by the mock LLM from the file context — not supplied.
+    def fake_clone(repo, ref, dest):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "check.py"), "w") as f:
+            f.write(_CHECK_FAIL)
+        return None
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    c = Check()
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def drive(bspec):
+        # A propose_pr authoring task: brief + repo + command, NO diff.
+        b = create_branch_fn(g, mission.id, bspec["title"],
+                             bspec["brief"].strip(), status="proposed")
+        rt.run_until_idle()
+        g.patch_object(b.id, {"metadata": {"code_task": {
+            "repo": bspec["repo"], "command": bspec["command"],
+            "propose_pr": True, "brief": bspec["brief"].strip()}}})
+        activate_branch_fn(g, b.id)
+        rt.run_until_idle()
+        return b
+
+    # No approval happens here, so the write token must never be exercised.
+    opener_calls: list = []
+    github_write.set_pr_opener(
+        lambda *a, **k: (opener_calls.append((a, k)) or {"url": "x", "number": 0,
+                                                         "head": "x", "base": "x"}))
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        # ── Leg 1: authoring PROVES → a PENDING submit_pr with the authored diff
+        b_pass = drive(spec["author_pass"])
+        t_pass = task_for(b_pass.id)
+
+        # The intake claim marks this an authoring task (not a plain run).
+        claim = [o for o in _lab_obs(g, "code_progress")
+                 if (o.data.get("metadata") or {}).get("lab_branch_id") == b_pass.id]
+        c.that(bool(claim) and (claim[0].data.get("metadata") or {})
+               .get("authoring") is True,
+               "the task is claimed as an AUTHORING task (brief, no candidate diff)")
+
+        # The authoring step ran once and recorded the AUTHORED diff as evidence.
+        runs = [o for o in _lab_obs(g, "code_authored_run")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_pass.id]
+        c.that(len(runs) == 1, f"one authoring attempt recorded ({len(runs)})")
+        authored = ((runs[0].data.get("metadata") or {}).get("authored_diff")
+                    or "") if runs else ""
+        c.that("check.py" in authored and "sys.exit(0)" in authored,
+               "the AUTHORED diff implements the fix (flips the failing check)")
+        c.that("tests/test_regression" in authored,
+               "the authored diff ADDS a regression test (the brief asks for one)")
+
+        c.that(t_pass is not None and t_pass.data.get("status") == "done",
+               f"the proven authored fix completes the task "
+               f"({t_pass.data.get('status') if t_pass else None})")
+
+        pr_decs = [d for d in g.objects(type="decision")
+                   if d.data.get("kind") == "submit_pr"
+                   and (d.data.get("metadata") or {}).get("lab_branch_id")
+                   == b_pass.id]
+        c.that(len(pr_decs) == 1 and pr_decs[0].data.get("status") == "pending",
+               f"a PENDING submit_pr decision is opened for the authored fix "
+               f"({len(pr_decs)})")
+        if pr_decs:
+            art = g.get_object(pr_decs[0].data.get("subject_ref"))
+            c.that(art is not None and art.data.get("kind") == "code_change"
+                   and "sys.exit(0)" in (art.data.get("content") or ""),
+                   "the submit_pr artifact carries the AUTHORED diff")
+            c.that((art.data.get("metadata") or {}).get("files", {})
+                   .get("check.py", "").strip() == "import sys; sys.exit(0)",
+                   "the PR commits the PROVEN post-fix file contents (sandbox "
+                   "read-back), not just a diff")
+            proofs = [r for r in (pr_decs[0].data.get("evidence_refs") or [])
+                      if g.get_object(r) is not None
+                      and g.get_object(r).type == "evaluation"]
+            c.that(any(g.get_object(r).data.get("judgment") == "sandbox_proven"
+                       for r in proofs),
+                   "the sandbox_proven evaluation is cited as the PR's proof")
+        c.that(not opener_calls,
+               "NO write token is exercised — the submit_pr stays pending "
+               "(opening the PR is the operator's tap)")
+        print("  pass: brief → authored diff (fix + regression test) → proven "
+              "→ PENDING submit_pr")
+
+        # ── Leg 2: authoring CANNOT pass → bounded retry → honest gap, NO PR
+        b_fail = drive(spec["author_fail"])
+        t_fail = task_for(b_fail.id)
+        attempts = [o for o in _lab_obs(g, "code_authored_run")
+                    if (o.data.get("metadata") or {}).get("lab_branch_id")
+                    == b_fail.id]
+        c.that(len(attempts) == spec["settings"]["code_author_max_attempts"],
+               f"authoring retried up to the bound "
+               f"({len(attempts)}/{spec['settings']['code_author_max_attempts']})")
+        gap = [e for e in g.objects(type="evaluation")
+               if (e.data.get("metadata") or {}).get("lab") == "code_authoring_failed"
+               and (e.data.get("metadata") or {}).get("lab_branch_id") == b_fail.id]
+        c.that(len(gap) == 1
+               and "could not make it pass" in (gap[0].data.get("rationale") or ""),
+               "an honest 'authored a diff but could not make it pass' "
+               "evaluation is recorded")
+        c.that(t_fail is not None and t_fail.data.get("status") == "rejected",
+               f"the task is rejected (the fix did not earn its PR) "
+               f"({t_fail.data.get('status') if t_fail else None})")
+        pr_fail = [d for d in g.objects(type="decision")
+                   if d.data.get("kind") == "submit_pr"
+                   and (d.data.get("metadata") or {}).get("lab_branch_id")
+                   == b_fail.id]
+        c.that(not pr_fail,
+               "a fix that never proves opens NO submit_pr (the Phase-3 "
+               "guardrail holds for authored fixes too)")
+        print("  fail: unprovable → 2 authoring attempts → honest gap, no PR")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        github_write.set_pr_opener(None)
+
+    # interpret fires on every code-task outcome (work's task_outcome path) —
+    # the authoring loop reaches a verdict either way, never a dangling task.
+    outcomes = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "task_outcome"]
+    c.that(len(outcomes) >= 2,
+           f"every authoring task yields a task_outcome evaluation "
+           f"(interpret's trigger) — got {len(outcomes)}")
+    return c.done("code_authoring")
+
+
 def run_submit_pr() -> bool:
     """ADR-035, Phase 3: the submit_pr decision kind. A proven change becomes
     an artifact + a PENDING submit_pr decision; approval exercises a (mocked)
@@ -4408,6 +4557,7 @@ def run_all() -> None:
         run_model_params(),
         run_research_worker(),
         run_code_worker(),
+        run_code_authoring(),
         run_submit_pr(),
         run_self_repair(),
         run_seam_proposal(),

@@ -2050,7 +2050,7 @@ _FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
 # behaviors whose output can become an artifact's evidence.
 _LLM_BEHAVIOR_NAMES = frozenset((
     "draft_writer", "interpret", "plan", "research_worker", "code_worker",
-    "answer", "seam_writer"))
+    "code_author", "answer", "seam_writer"))
 
 
 _ENTITY_ID_RE = re.compile(
@@ -3343,8 +3343,8 @@ from .research_worker import research_intake, research_worker  # noqa: E402
 # The code worker stages (ADR-035) likewise live in lab_pack/code_worker.py —
 # droppable plumbing, registered only here; it imports nothing from this module
 # at import time.
-from .code_worker import code_intake, code_worker  # noqa: E402
+from .code_worker import code_author, code_intake, code_worker  # noqa: E402
 
 BEHAVIORS = [ingest, plan, work, research_intake, interpret, self_repair,
              digest, gate, draft_writer, research_worker, code_intake,
-             code_worker, seam_writer, answer]
+             code_worker, code_author, seam_writer, answer]
