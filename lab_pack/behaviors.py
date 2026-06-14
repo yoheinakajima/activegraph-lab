@@ -778,6 +778,22 @@ _EXISTING_CAPABILITY_ALIASES = {
         "fetch a web page",
     ),
 }
+# Tools deliberately WITHOUT phantom-guard aliases (ADR-032, Phase 6). The
+# guard is deliberately narrow — it targets the high-confusion case that
+# actually misfired in production (get_file: the branch#911 phantom build born
+# from decision#910's false gap). These github list-* reads share the same
+# live provider, but a "build a tool to list commits/issues/PRs" proposal has
+# never been observed, so they are exempt rather than aliased: aliasing them
+# would WIDEN what the guard suppresses (a runtime behavior change), which
+# Phase 6 deliberately does not make. This set is the explicit, test-enforced
+# record of that choice — every RESEARCH_WORKER_TOOLS member must be either
+# aliased above or named here, so adding a tool without classifying it fails
+# the alias_map_guard fixture loudly (the map cannot silently rot).
+_ALIAS_EXEMPT_TOOLS = frozenset({
+    "github.list_commits",
+    "github.list_issues",
+    "github.list_pulls",
+})
 _BUILD_VERB_RE = re.compile(
     r"\b(?:build|add|create|implement|develop|introduce|provide|enable|"
     r"gain|acquire|construct|stand up|wire up)\b", re.I)

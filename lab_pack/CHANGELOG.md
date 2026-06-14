@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Phantom-work alias-map maintenance guard (ADR-032, Phase 6): the
+  `alias_map_guard` fixture asserts every tool in RESEARCH_WORKER_TOOLS is
+  either aliased in `_EXISTING_CAPABILITY_ALIASES` or named in a new
+  documented exemption set `_ALIAS_EXEMPT_TOOLS` (no tool both; no stale
+  entries), so adding a tool without classifying it fails CI loudly — the
+  alias map can no longer silently rot. The github list-* reads are exempt
+  (aliasing them would widen what the guard suppresses; no runtime change).
+  Fixture count 31 → 32.
+
 - Evidence profile in the draft review note (Phase 5, supports ADR-014's
   editorial policy without enforcing it): every draft's review note now
   carries a one-line profile — how many cited observations are the lab's own

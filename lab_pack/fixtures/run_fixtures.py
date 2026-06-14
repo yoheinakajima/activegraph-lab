@@ -1986,6 +1986,48 @@ def run_seams() -> bool:
     return c.done("seams")
 
 
+def run_alias_map_guard() -> bool:
+    _load("alias_map_guard.yaml")  # description-only; assertions are structural
+    print("\n" + "=" * 64)
+    print("Fixture: alias_map_guard — the phantom-work alias map must cover "
+          "every research-worker tool (ADR-032, Phase 6)")
+    print("=" * 64)
+
+    from lab_pack.behaviors import (_ALIAS_EXEMPT_TOOLS,
+                                    _EXISTING_CAPABILITY_ALIASES)
+    from lab_pack.research_worker import RESEARCH_WORKER_TOOLS
+
+    c = Check()
+    aliased = set(_EXISTING_CAPABILITY_ALIASES)
+    exempt = set(_ALIAS_EXEMPT_TOOLS)
+    tools = set(RESEARCH_WORKER_TOOLS)
+
+    # Every tool the lab can call is classified: aliased (the guard catches a
+    # phantom build of it) or explicitly exempt (a documented choice).
+    uncovered = sorted(t for t in tools if t not in aliased and t not in exempt)
+    c.that(not uncovered,
+           f"every RESEARCH_WORKER_TOOLS member is aliased or exempt — "
+           f"uncovered (add an alias or an exemption): {uncovered}")
+
+    # A tool cannot be BOTH aliased and exempt — that is an ambiguous record.
+    both = sorted(aliased & exempt)
+    c.that(not both,
+           f"no tool is both aliased and exempt (ambiguous): {both}")
+
+    # No stale entries: every alias-map key and every exemption names a tool
+    # that is actually in the worker's live tool set.
+    stale_aliases = sorted(aliased - tools)
+    c.that(not stale_aliases,
+           f"alias-map keys all name live tools — stale (remove): {stale_aliases}")
+    stale_exempt = sorted(exempt - tools)
+    c.that(not stale_exempt,
+           f"exemptions all name live tools — stale (remove): {stale_exempt}")
+
+    print(f"  {len(tools)} tools: {len(aliased & tools)} aliased, "
+          f"{len(exempt)} exempt, 0 uncovered, 0 stale")
+    return c.done("alias_map_guard")
+
+
 def run_budget_cap_restart() -> bool:
     spec = _load("budget_cap_restart.yaml")
     print("\n" + "=" * 64)
@@ -3688,6 +3730,7 @@ def run_all() -> None:
         run_seams(),
         run_budget_cap_restart(),
         run_seam_no_bypass(),
+        run_alias_map_guard(),
         run_charter(),
         run_model_routing(),
         run_model_params(),
