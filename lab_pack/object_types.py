@@ -87,12 +87,17 @@ class Decision(BaseModel):
         description="ID of the object this decision governs (branch, artifact, ...)."
     )
     kind: Literal[
-        "promote", "publish", "self_modify", "schema_change", "dependency_pin", "other"
+        "promote", "publish", "self_modify", "submit_pr",
+        "schema_change", "dependency_pin", "other"
     ] = Field(
         default="other",
         description=(
             "What category of gate this is. self_modify (ADR-012) gates seams "
-            "and graph code; the gate treats it exactly like publish: absolute."
+            "and graph code; the gate treats it exactly like publish: absolute. "
+            "submit_pr (ADR-035) gates opening a pull request: ONLY on operator "
+            "approval is a write token exercised, and submit_pr is EXCLUDED "
+            "from MCP exactly like approve/reject — opening the PR is the "
+            "operator's tap, the inbox is human-only."
         ),
     )
     status: Literal["pending", "approved", "rejected"] = Field(

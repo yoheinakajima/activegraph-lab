@@ -88,6 +88,25 @@ class ResearchSynthesis(BaseModel):
         description="1-5 source-attributed findings.")
 
 
+class CodeOutcome(BaseModel):
+    """Structured output for the code_worker behavior (ADR-035).
+
+    The narrative over a sandbox run: the deterministic verdict (did the
+    proving run exit 0?) is computed from the captured result, NOT from the
+    model — the model summarizes what the run shows for the operator and the
+    interpret behavior, it does not decide success."""
+
+    summary: str = Field(
+        description=(
+            "2-4 sentences over the captured sandbox output: what the command "
+            "(and, for a fix-task, the post-diff re-run) showed — whether the "
+            "build/tests passed, what failed and why if not. Ground every "
+            "statement in the captured exit codes and output; no claim the run "
+            "does not support."
+        ),
+    )
+
+
 class SeamProposal(BaseModel):
     """Structured output for the seam_writer behavior (Phase 4 rails):
     the next version of a seam body, argued from cited evidence."""
@@ -220,6 +239,21 @@ class LabMockProvider:
                           f"investigation; its excerpt is recorded as the "
                           f"linked source. [mock {digest}]"),
                     source_urls=[u]) for u in urls],
+            )
+        elif name == "CodeOutcome":
+            blob = " ".join(str(getattr(m, "content", m)) for m in messages)
+            exits = re.findall(r'"exit_code":\s*(-?\d+|null)', blob)
+            last_exit = exits[-1] if exits else "?"
+            green = last_exit == "0"
+            parsed = CodeOutcome(
+                summary=(
+                    f"The sandbox cloned the repo and ran the specified "
+                    f"command; the deciding run exited {last_exit}. "
+                    + ("The build/tests passed, so the change is proven in "
+                       "the sandbox. " if green else
+                       "The run did not pass; the captured output records the "
+                       "failure. ")
+                    + f"[mock {digest}]"),
             )
         elif name == "SeamProposal":
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
@@ -643,6 +677,8 @@ def _inert_output(output_schema: type, note: str) -> Any:
             return output_schema(reply=note)
         if name == "ResearchSynthesis":
             return output_schema(summary=note, findings=[])
+        if name == "CodeOutcome":
+            return output_schema(summary=note)
         if name == "SeamProposal":
             return output_schema(body="", rationale=note)
         if name == "BlogDraft":

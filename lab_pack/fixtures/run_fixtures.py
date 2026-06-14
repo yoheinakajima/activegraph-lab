@@ -2779,6 +2779,311 @@ def run_research_worker() -> bool:
     return c.done("research_worker")
 
 
+# A failing check script (canned-cloned) and the unified diff that repairs it
+# — the fix-task proof path: baseline `python check.py` exits 1, the diff makes
+# it exit 0, the re-run proves it.
+_CHECK_FAIL = "import sys; sys.exit(1)\n"
+_FIX_DIFF = (
+    "--- a/check.py\n"
+    "+++ b/check.py\n"
+    "@@ -1 +1 @@\n"
+    "-import sys; sys.exit(1)\n"
+    "+import sys; sys.exit(0)\n"
+)
+
+
+def run_code_worker() -> bool:
+    """ADR-035, Phase 2: a routed codebase.code_task is claimed, cloned
+    (canned — no network), run in the repo sandbox, its output captured as
+    attributed evidence, and completed; a fix-task applies a diff and re-runs
+    to prove it; the failure path records the error."""
+    spec = _load("code_worker.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: code_worker — clone (canned) → sandbox run → evidence → "
+          "complete; fix-task proven; failure recorded")
+    print("=" * 64)
+
+    import os
+    from lab_pack import repo_sandbox
+
+    # Canned clone: populate the sandbox dir without touching the network. The
+    # RUN step is the REAL subprocess (the sentinel gate covers its isolation).
+    def fake_clone(repo, ref, dest):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "check.py"), "w") as f:
+            f.write(_CHECK_FAIL)
+        return None
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    c = Check()
+    exp = spec["expected_outputs"]
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def drive(bspec, diff=None):
+        b = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"],
+                             status="proposed")
+        rt.run_until_idle()
+        code_task = {"repo": bspec["repo"], "command": bspec["command"]}
+        if diff:
+            code_task["diff"] = diff
+        g.patch_object(b.id, {"metadata": {"code_task": code_task}})
+        activate_branch_fn(g, b.id)
+        rt.run_until_idle()
+        return b
+
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        # ── Branch A: a plain passing command → proven, task done ───────────
+        b_pass = drive(spec["pass_branch"])
+        t_pass = task_for(b_pass.id)
+        runs_pass = [o for o in _lab_obs(g, "code_run")
+                     if (o.data.get("metadata") or {}).get("lab_branch_id") == b_pass.id]
+        c.that(t_pass is not None
+               and t_pass.data.get("status") == exp["pass"]["task_status"],
+               f"pass: task {t_pass.data.get('status') if t_pass else None} "
+               f"(want {exp['pass']['task_status']})")
+        c.that(len(runs_pass) == 1
+               and bool(runs_pass[0].data.get("source_ids")),
+               "pass: a code_run observation records the run, attributed to a "
+               "repo source")
+        c.that(runs_pass and (runs_pass[0].data.get("metadata") or {})
+               .get("run", {}).get("baseline", {}).get("exit_code") == 0,
+               "pass: the captured baseline exit code is 0")
+        synth = [e for e in g.objects(type="evaluation")
+                 if (e.data.get("metadata") or {}).get("lab") == "code_synthesis"
+                 and (e.data.get("metadata") or {}).get("lab_branch_id") == b_pass.id]
+        c.that(len(synth) == 1 and synth[0].data.get("judgment") == "sandbox_proven",
+               "pass: a sandbox_proven evaluation is linked to the branch")
+        print(f"  pass: {t_pass.data.get('status')}, code_run captured exit 0")
+
+        # ── Branch B: a fix-task — diff repairs a failing command → proven ──
+        b_fix = drive(spec["fix_branch"], diff=_FIX_DIFF)
+        t_fix = task_for(b_fix.id)
+        runs_fix = [o for o in _lab_obs(g, "code_run")
+                    if (o.data.get("metadata") or {}).get("lab_branch_id") == b_fix.id]
+        run_md = (runs_fix[0].data.get("metadata") or {}).get("run", {}) if runs_fix else {}
+        c.that(t_fix is not None
+               and t_fix.data.get("status") == exp["fix"]["task_status"],
+               f"fix: task {t_fix.data.get('status') if t_fix else None} "
+               f"(want {exp['fix']['task_status']})")
+        c.that(run_md.get("baseline", {}).get("exit_code") == 1
+               and run_md.get("after_diff", {}).get("exit_code") == 0
+               and run_md.get("proven") is True,
+               f"fix: baseline failed (1), diff applied, re-run passed (0), "
+               f"proven ({run_md.get('baseline', {}).get('exit_code')}→"
+               f"{run_md.get('after_diff', {}).get('exit_code')})")
+        print(f"  fix: baseline 1 → after-diff 0 → {t_fix.data.get('status')} (proven)")
+
+        # ── Branch C: failure path — command never passes → task failed ─────
+        b_fail = drive(spec["fail_branch"])
+        t_fail = task_for(b_fail.id)
+        c.that(t_fail is not None
+               and t_fail.data.get("status") == exp["fail"]["task_status"],
+               f"fail: task {t_fail.data.get('status') if t_fail else None} "
+               f"(want {exp['fail']['task_status']})")
+        c.that("did not pass" in ((t_fail.data.get("metadata") or {})
+               .get("error") or "").lower() if t_fail else False,
+               "fail: the task error records that the run did not pass")
+        print(f"  fail: {t_fail.data.get('status')}, error recorded")
+
+        # ── branch#847 safety net: a read-to-verify task forced into the
+        # codebase lane (the regression shape) is answerable either way ──────
+        b_mis = create_branch_fn(g, mission.id, "Verify replay at code level",
+                                 spec["misroute_intent"].strip(), status="proposed")
+        rt.run_until_idle()
+        # Hand-dispatch with codebase routing + a repo but NO command (the
+        # production misroute shape), exactly as the regressed keyword router
+        # would have — code_intake claims it on creation.
+        mis_task = g.add_object("task", {
+            "title": "Forced-codebase verify task",
+            "description": spec["misroute_intent"].strip(),
+            "status": "active", "priority": "medium",
+            "metadata": {"routing": {"domain": "codebase", "capability": "code_task"},
+                         "tags": ["lab", "codebase"], "lab_branch_id": b_mis.id,
+                         "code_task": {"repo": "yoheinakajima/activegraph-lab"}}})
+        g.add_relation(b_mis.id, mis_task.id, "dispatched")
+        rt.run_until_idle()
+        miss = [o for o in _lab_obs(g, "routing_miss")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_mis.id]
+        c.that(len(miss) == 1
+               and (miss[0].data.get("metadata") or {}).get("correct_routing")
+               == "research.deep_research",
+               f"misrouted read/verify task records a routing_miss naming "
+               f"research.deep_research, not a dead lane ({len(miss)})")
+        c.that(g.get_object(mis_task.id).data.get("status") == "rejected"
+               and "read-to-verify" in ((mis_task.data.get("metadata") or {})
+               .get("error") or "").lower(),
+               "the task fails with an actionable verdict (interpret fires)")
+        print(f"  branch#847 net: routing_miss → research.deep_research, "
+              f"actionable verdict")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+
+    # The capability self-check (ADR-031): with the code lane live, a
+    # codebase.code_task is a real capability — the gap path is NOT taken.
+    from lab_pack.behaviors import _available_capabilities, _available_tools
+    settings = LabSettings(**(spec.get("settings") or {}))
+    c.that(("codebase", "code_task") in _available_capabilities(g, settings),
+           "code lane live → codebase.code_task is an available capability")
+    c.that("sandbox.clone_and_run" in _available_tools(settings),
+           "the sandbox tool is in the live tool set")
+    c.that(not _lab_obs(g, "capability_gap"),
+           "no capability gap recorded for a lane that now has a reactor")
+
+    # interpret fires on every completed/failed code task (work's task_outcome
+    # path) — the loop reaches a verdict, never a silent dangling task.
+    outcomes = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "task_outcome"]
+    c.that(len(outcomes) >= 3,
+           f"every code task yields a task_outcome evaluation (interpret's "
+           f"trigger) — got {len(outcomes)}")
+    return c.done("code_worker")
+
+
+def run_submit_pr() -> bool:
+    """ADR-035, Phase 3: the submit_pr decision kind. A proven change becomes
+    an artifact + a PENDING submit_pr decision; approval exercises a (mocked)
+    write token to open a PR; rejection touches no token; the write token
+    appears in NOTHING the flow writes to the graph."""
+    spec = _load("submit_pr.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: submit_pr — pending → approve → (mocked) PR opened; "
+          "reject → no token; write-token sentinel-clean")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write
+    from lab_pack.tools import propose_submit_pr_fn
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    c = Check()
+    change = spec["change"]
+    mock_pr = spec["mock_pr"]
+
+    # A sentinel write token in the env: the flow must NEVER let it reach the
+    # graph. The mock opener never sees it; the live opener would header-only.
+    SENTINEL = "ghp_FIXTURE_WRITE_SENTINEL_zz99"
+    saved = os.environ.get("GITHUB_WRITE_TOKEN")
+    os.environ["GITHUB_WRITE_TOKEN"] = SENTINEL
+
+    opener_calls: list[dict] = []
+
+    def mock_opener(repo, *, head_branch, base, title, body, files):
+        opener_calls.append({"repo": repo, "head_branch": head_branch,
+                             "base": base, "title": title, "files": files})
+        return {"url": mock_pr["url"], "number": mock_pr["number"],
+                "head": head_branch, "base": base}
+
+    github_write.set_pr_opener(mock_opener)
+    try:
+        mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+        bspec = spec["branch"]
+        branch = create_branch_fn(g, mission.id, bspec["title"], bspec["intent"])
+        rt.run_until_idle()
+        # The sandbox proof the PR rests on (a code_worker sandbox_proven eval).
+        proof = g.add_object("evaluation", {
+            "subject_id": "task#proof", "subject_type": "task",
+            "judgment": "sandbox_proven",
+            "rationale": "the proposed diff made the test command exit 0",
+            "evaluator": "lab.code_worker",
+            "metadata": {"lab": "code_synthesis", "lab_branch_id": branch.id,
+                         "proven": True}})
+        g.add_relation(branch.id, proof.id, "supported_by")
+
+        # ── propose: artifact + PENDING submit_pr decision; NO token yet ─────
+        artifact, decision = propose_submit_pr_fn(
+            g, change["repo"], head_branch=change["head_branch"],
+            base=change["base"], title=change["title"], diff=change["diff"],
+            files=change["files"], branch_id=branch.id, proof_refs=[proof.id])
+        rt.run_until_idle()
+
+        c.that(artifact.data.get("kind") == "code_change"
+               and artifact.data.get("status") == "proposed"
+               and change["diff"].strip()[:20] in (artifact.data.get("content") or ""),
+               "the change is a gated code_change artifact carrying the diff")
+        d = g.get_object(decision.id)
+        c.that(d.data.get("kind") == "submit_pr" and d.data.get("status") == "pending"
+               and (d.data.get("metadata") or {}).get("approval_requested_at"),
+               "a PENDING submit_pr decision is raised and surfaced by the gate")
+        c.that(proof.id in (d.data.get("evidence_refs") or []),
+               "the sandbox proof is cited in the decision's evidence")
+        c.that(not opener_calls,
+               "NO write token is exercised while the decision is pending")
+
+        # ── approve → the (mocked) PR is opened with the branch + files ──────
+        approve_decision_fn(g, decision.id, True, "looks right, ship it")
+        rt.run_until_idle()
+        c.that(len(opener_calls) == 1
+               and opener_calls[0]["head_branch"] == change["head_branch"]
+               and opener_calls[0]["files"] == change["files"],
+               f"approval opens the PR with the proposed branch + files "
+               f"({opener_calls})")
+        opened = [o for o in _lab_obs(g, "pr_opened")
+                  if (o.data.get("metadata") or {}).get("lab_branch_id") == branch.id]
+        c.that(len(opened) == 1
+               and (opened[0].data.get("metadata") or {}).get("pr_url") == mock_pr["url"]
+               and (opened[0].data.get("metadata") or {}).get("pr_number") == mock_pr["number"],
+               "a pr_opened observation records the PR url/number, linked to the branch")
+        a = g.get_object(artifact.id)
+        c.that(a.data.get("status") == "approved"
+               and (a.data.get("metadata") or {}).get("pr_url") == mock_pr["url"],
+               "the artifact lands approved, stamped with the PR url")
+        print(f"  approve: PR {mock_pr['url']} opened (mock), 1 token exercise")
+
+        # ── reject a SECOND submit_pr → no PR, no token ──────────────────────
+        artifact2, decision2 = propose_submit_pr_fn(
+            g, change["repo"], head_branch="lab/another-change",
+            base="main", title="A change to reject", diff=change["diff"],
+            files=change["files"], branch_id=branch.id, proof_refs=[proof.id])
+        rt.run_until_idle()
+        calls_before = len(opener_calls)
+        approve_decision_fn(g, decision2.id, False, "not now")
+        rt.run_until_idle()
+        c.that(len(opener_calls) == calls_before,
+               "rejection exercises NO write token (opener not called)")
+        rejected = [o for o in _lab_obs(g, "pr_rejected")
+                    if (o.data.get("metadata") or {}).get("decision_id") == decision2.id]
+        c.that(len(rejected) == 1
+               and g.get_object(artifact2.id).data.get("status") == "rejected",
+               "rejection records a pr_rejected observation; the artifact is rejected")
+        print(f"  reject: no PR, no token; pr_rejected recorded")
+
+        # ── write-token sentinel: NOTHING the flow wrote carries the token ──
+        import json as _json
+        corpus = _json.dumps({
+            "events": [{"type": str(e.type), "payload": e.payload} for e in g.events],
+            "objects": [{"id": str(o.id), "data": o.data} for o in g.all_objects()],
+        }, default=str)
+        c.that(SENTINEL not in corpus,
+               "GITHUB_WRITE_TOKEN appears in NO event payload or object "
+               "(sentinel-clean — the whole point)")
+    finally:
+        github_write.set_pr_opener(None)
+        if saved is None:
+            os.environ.pop("GITHUB_WRITE_TOKEN", None)
+        else:
+            os.environ["GITHUB_WRITE_TOKEN"] = saved
+
+    # ── submit_pr is EXCLUDED from MCP exactly like approve/reject ───────────
+    from server import mcp as mcp_mod
+    tool_names = {t["name"] for t in mcp_mod.TOOLS}
+    c.that(not (tool_names & {"approve_decision", "reject_decision",
+                              "resolve_decision", "submit_pr", "open_pr"}),
+           "no MCP tool resolves a decision or opens a PR — the inbox is "
+           "human-only (ADR-016/035)")
+    c.that("annotate_decision" in tool_names,
+           "annotate IS available over MCP — commentary on a pending submit_pr "
+           "is fine; opening it is the operator's tap")
+    return c.done("submit_pr")
+
+
 def run_rejection_lifecycle() -> bool:
     spec = _load("rejection_lifecycle.yaml")
     print("\n" + "=" * 64)
@@ -3735,6 +4040,8 @@ def run_all() -> None:
         run_model_routing(),
         run_model_params(),
         run_research_worker(),
+        run_code_worker(),
+        run_submit_pr(),
         run_seam_proposal(),
         run_seam_verbatim(),
         run_github_read(),
