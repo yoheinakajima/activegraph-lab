@@ -50,14 +50,19 @@ from pathlib import Path
 
 from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
-from .llm import CodeOutcome, consume_llm_anomalies, is_inert
-from .repo_sandbox import evidence_summary, run_repo_task
+from .llm import AuthoredDiff, CodeOutcome, consume_llm_anomalies, is_inert
+from .repo_sandbox import clone_and_read, evidence_summary, run_repo_task
 from .seams import effective_setting, seam_versions_stamp
 from .settings import LabSettings
 
-_PROMPT = next(p.body for p in
-               load_prompts_from_dir(Path(__file__).parent / "prompts")
-               if p.name == "code_worker")
+_PROMPTS = {p.name: p.body for p in
+            load_prompts_from_dir(Path(__file__).parent / "prompts")}
+_PROMPT = _PROMPTS["code_worker"]
+_AUTHOR_PROMPT = _PROMPTS["code_author"]
+
+# A path-like token in a brief (something with a file extension): the
+# diff-authoring step reads these first as the "relevant files" (ADR-037).
+_PATH_RE = re.compile(r"[\w][\w./\-]*\.[A-Za-z0-9]{1,8}")
 
 # github.com/<owner>/<repo>[...] → owner/repo (drop a trailing .git / path)
 _REPO_RE = re.compile(r"github\.com[/:]([\w.\-]+/[\w.\-]+?)(?:\.git)?(?:[/#?\s]|$)")
@@ -85,12 +90,14 @@ def code_lane_available(settings) -> bool:
 # ── registries (caches + dedup; rebuilt on resume, never the truth) ─────────
 _CLAIMED: set[str] = set()          # task ids this worker claimed
 _SYNTHESIZED: set[str] = set()      # task ids the llm stage already handled
+_AUTHORED: set[str] = set()         # authoring-request obs ids already handled
 _REPO_SOURCES: dict[str, str] = {}  # repo → source object id (evidence anchor)
 
 
 def clear_code_worker_registry() -> None:
     _CLAIMED.clear()
     _SYNTHESIZED.clear()
+    _AUTHORED.clear()
     _REPO_SOURCES.clear()
 
 
@@ -176,6 +183,141 @@ def _run_metadata(result: dict) -> dict:
             "run_error": result.get("error")}
 
 
+def _task_title(graph, task_id: str) -> str:
+    t = graph.get_object(task_id)
+    return (t.data.get("title") if t else None) or "code task"
+
+
+def _emit_synthesis_request(graph, *, title, task_id, branch_id, repo, command,
+                            result, code_run_obs_id, diff, propose_pr,
+                            brief) -> None:
+    """Emit the ONE code-synthesis request the code_worker llm stage reacts to:
+    the captured run rides whole in metadata AND the deciding exit code is in
+    the text the model's view serializes. Shared by the plain/apply path
+    (code_intake) and the authoring path (code_author) so the gated-submit_pr
+    last mile (ADR-036) is reached identically either way."""
+    graph.add_object("observation", {
+        "text": (f"Code-run synthesis request for task '{title}': summarize "
+                 f"what the sandbox run of '{command}' against {repo} shows. "
+                 + evidence_summary(result)),
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "code_synthesis_request", "task_id": task_id,
+                     "lab_branch_id": branch_id, "code_run_obs": code_run_obs_id,
+                     "repo": repo, "proven": bool(result.get("proven")),
+                     "diff": diff if (diff and propose_pr) else None,
+                     "propose_pr": bool(propose_pr), "brief": brief,
+                     "run": _run_metadata(result)},
+    })
+
+
+def _hint_paths(task_data: dict, brief: str) -> list[str]:
+    """The files the authoring step reads first: any the brief names, plus an
+    explicit code_task.files hint. Best-effort — clone_and_read fills the rest
+    of the budget from the tree."""
+    out: list[str] = []
+    meta = task_data.get("metadata") or {}
+    spec = (meta.get("code_task") or {})
+    for p in (spec.get("files") or []):
+        if isinstance(p, str) and p not in out:
+            out.append(p)
+    for m in _PATH_RE.findall(brief or ""):
+        if m not in out:
+            out.append(m)
+    return out[:12]
+
+
+def _authoring_request_text(brief, command, repo, files, tree, attempt,
+                            max_attempts, prev_diff, prev_failure) -> str:
+    """The human/model-visible authoring request: brief, the relevant files,
+    the proof command, and (on a retry) the previous attempt + its failure."""
+    parts = [
+        f"Code-authoring request (attempt {attempt}/{max_attempts}): author a "
+        f"unified diff that fixes the defect below, to be applied and proved by "
+        f"running '{command}' against {repo}.",
+        f"\nBRIEF:\n{brief}",
+    ]
+    if files:
+        parts.append("\nRELEVANT FILES:")
+        for path, content in list(files.items())[:24]:
+            parts.append(f"\n--- {path} ---\n{(content or '')[:6000]}")
+    elif tree:
+        parts.append("\nREPO FILES (no file body read):\n"
+                     + ", ".join(tree[:60]))
+    if prev_diff:
+        parts.append("\nPREVIOUS ATTEMPT (did NOT pass — revise, do not "
+                     f"repeat):\n{prev_diff[:4000]}")
+    if prev_failure:
+        parts.append(f"\nPREVIOUS FAILURE OUTPUT:\n{prev_failure[:4000]}")
+    return "\n".join(parts)
+
+
+def _emit_authoring_request(graph, settings, *, task_data, task_id, branch_id,
+                            repo, command, ref, brief, attempt: int = 1,
+                            prev_diff=None, prev_failure=None,
+                            files_context=None, tree=None) -> None:
+    """Emit a code_authoring_request the code_author llm stage reacts to
+    (ADR-037). On attempt 1 the relevant files are read from a clone (no
+    command run, so no run budget spent); a retry forwards the same file
+    context plus the previous diff + failure so the model can revise."""
+    max_attempts = max(1, int(getattr(settings, "code_author_max_attempts", 2)))
+    if files_context is None:
+        ctx = clone_and_read(repo, ref=ref,
+                             hint_paths=_hint_paths(task_data, brief))
+        if ctx.get("error"):
+            _fail_task(graph, task_id,
+                       f"code_worker: could not read {repo} to author a fix: "
+                       f"{ctx['error']}")
+            return
+        files_context = ctx.get("files") or {}
+        tree = ctx.get("tree") or []
+    tree = tree or []
+    graph.add_object("observation", {
+        "text": _authoring_request_text(brief, command, repo, files_context,
+                                        tree, attempt, max_attempts, prev_diff,
+                                        prev_failure),
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "code_authoring_request", "task_id": task_id,
+                     "lab_branch_id": branch_id, "repo": repo, "ref": ref,
+                     "command": command, "brief": brief, "attempt": attempt,
+                     "max_attempts": max_attempts,
+                     "files_context": files_context, "tree": tree[:200],
+                     "prev_diff": prev_diff, "prev_failure": prev_failure},
+    })
+
+
+def _failure_excerpt(result: dict) -> str:
+    """A short, secret-free excerpt of why an authored diff did not pass: the
+    apply/clone error, else the deciding run's stderr/stdout tail."""
+    if result.get("error"):
+        return f"sandbox error: {result['error']}"
+    run = result.get("after_diff") or result.get("baseline") or {}
+    tail = (run.get("stderr") or "").strip() or (run.get("stdout") or "").strip()
+    code = run.get("exit_code")
+    return f"command exit={code}: {tail[-1200:]}" if tail else f"command exit={code}"
+
+
+def _record_authoring_eval(graph, task_id, branch_id, repo, rationale, *,
+                           authored: bool):
+    """Honest verdict for an authoring run that did not land a PR (ADR-037):
+    an evaluation linked to the branch — 'authored a diff but could not make it
+    pass', or 'authoring could not run'. interpret fires on the task outcome."""
+    ev = graph.add_object("evaluation", {
+        "subject_id": task_id,
+        "subject_type": "task",
+        "judgment": "authoring_unproven",
+        "rationale": (rationale or "")[:600],
+        "evaluator": "lab.code_author",
+        "metadata": {"lab": "code_authoring_failed", "task_id": task_id,
+                     "lab_branch_id": branch_id, "repo": repo,
+                     "authored": authored, "proven": False},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, ev.id, "supported_by")
+    return ev
+
+
 @behavior(
     name="code_intake",
     on=["object.created"],
@@ -244,12 +386,22 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
     timeout = max(5, int(effective_setting(graph, settings,
                                            "sandbox_timeout_seconds")))
 
+    # ADR-037, the last mile: a fix the lab was asked to LAND (propose_pr) that
+    # carries a BRIEF but NO candidate diff is an AUTHORING task — the worker
+    # must WRITE the fix, not just run a command. (A task that already carries a
+    # candidate diff keeps the ADR-036 apply-and-prove path; a plain run task
+    # with no propose_pr just runs the command.) Decided once repo + command are
+    # resolved below; surfaced on the claim observation here.
+    authoring = bool(propose_pr and brief and not diff and repo and command)
+
     # The claim observation is the graph-visible reaction; the dispatch gap
     # check reads the claim REGISTRY (task_claimed) — core's `executes`
     # relation is action→task by schema, not ours to bend (research-worker note).
     graph.add_object("observation", {
         "text": (f"Code worker claimed task '{data.get('title')}': "
-                 + (f"sandbox-running '{command}' against {repo}"
+                 + (("authoring a fix diff for, then proving, "
+                     f"'{command}' against {repo}" if authoring else
+                     f"sandbox-running '{command}' against {repo}")
                     + (" (default proof command inferred)"
                        if command_inferred else "")
                     + (" (with a proposed fix diff)" if diff else "")
@@ -261,7 +413,8 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
         "metadata": {"lab": "code_progress", "task_id": obj_id,
                      "lab_branch_id": branch_id, "repo": repo,
                      "has_diff": bool(diff), "run_cap": run_cap,
-                     "command_inferred": command_inferred},
+                     "command_inferred": command_inferred,
+                     "authoring": authoring},
     })
 
     if not command:
@@ -311,6 +464,16 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
                    "in the intent)")
         return
 
+    if authoring:
+        # Hand off to the diff-authoring stage (ADR-037): read the relevant
+        # files from the clone and emit a code_authoring_request; code_author
+        # writes the diff, applies + proves it in the sandbox, retries up to the
+        # bound on failure, and on a PROVEN fix opens the gated submit_pr.
+        _emit_authoring_request(graph, settings, task_data=data, task_id=obj_id,
+                                branch_id=branch_id, repo=repo, command=command,
+                                ref=ref, brief=brief)
+        return
+
     # A fix-task is baseline + re-run = 2 runs; a plain command is 1 run. The
     # run cap bounds it — diff dropped if the cap leaves no room for the re-run.
     apply_diff = diff if (diff and run_cap >= 2) else None
@@ -336,25 +499,14 @@ def code_intake(event, graph, ctx, *, settings: LabSettings):
         _fail_task(graph, obj_id, f"code_worker: {result['error']}")
         return
 
-    # Emit the synthesis request: the captured run rides whole in metadata AND
-    # the deciding exit code is in the text the model's view serializes.
-    graph.add_object("observation", {
-        "text": (f"Code-run synthesis request for task "
-                 f"'{data.get('title')}': summarize what the sandbox run of "
-                 f"'{command}' against {repo} shows. " + evidence_summary(result)),
-        "confidence": 1.0,
-        "category": "fact",
-        "metadata": {"lab": "code_synthesis_request", "task_id": obj_id,
-                     "lab_branch_id": branch_id, "code_run_obs": obs.id,
-                     "repo": repo, "proven": bool(result.get("proven")),
-                     # ADR-036: the fix to land (diff) + the intent to land it
-                     # (propose_pr) ride to the synthesis stage, which opens a
-                     # gated submit_pr ONLY when the fix proves. The prose brief
-                     # rides too — the authoring context for the diff step.
-                     "diff": diff if (diff and propose_pr) else None,
-                     "propose_pr": propose_pr, "brief": brief,
-                     "run": _run_metadata(result)},
-    })
+    # Emit the synthesis request (ADR-036: the candidate diff + propose_pr ride
+    # to the synthesis stage, which opens a gated submit_pr ONLY when the fix
+    # proves; the prose brief rides too).
+    _emit_synthesis_request(graph, title=data.get("title"), task_id=obj_id,
+                            branch_id=branch_id, repo=repo, command=command,
+                            result=result, code_run_obs_id=obs.id,
+                            diff=diff if (diff and propose_pr) else None,
+                            propose_pr=propose_pr, brief=brief)
 
 
 @llm_behavior(
@@ -518,4 +670,143 @@ def _maybe_propose_pr(graph, req_meta: dict, proof_eval_id: str,
         graph.add_relation(branch_id, obs.id, "supported_by")
 
 
-CODE_BEHAVIORS = [code_intake, code_worker]
+@llm_behavior(
+    name="code_author",
+    on=["object.created"],
+    where={"object.type": "observation",
+           "object.data.metadata.lab": "code_authoring_request"},
+    description=_AUTHOR_PROMPT,
+    output_schema=AuthoredDiff,
+    model=None,  # routes through setting.model.code_worker (ADR-019/037 —
+                 # authoring a fix is top-tier reasoning, same plane as synthesis)
+    view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
+    creates=["observation", "evaluation"],
+    max_tokens=4096,
+    tools=[],
+)
+def code_author(event, graph, ctx, out, *, settings: LabSettings):
+    """Author a unified diff for a fix, apply + prove it in the sandbox, retry
+    up to the bound, and on a PROVEN fix hand off to the synthesis stage which
+    opens the gated submit_pr (ADR-037 — the self-repair loop's last mile).
+
+    On: object.created (observation, metadata.lab code_authoring_request).
+    The LLM authors a diff from the brief + the relevant files (read from the
+    clone by code_intake). The lab applies it and runs the proof command — the
+    RUN decides success, never the model. Tests pass → emit the synthesis
+    request (the existing propose_pr → submit_pr path). Tests fail → feed the
+    failure back and retry, up to setting.code_author_max_attempts; still
+    failing → an honest 'authored a diff but could not make it pass'
+    evaluation, the task rejected, NO submit_pr (a fix must earn its PR).
+    """
+    consume_llm_anomalies(graph)
+    obj = event.payload.get("object", {})
+    req_id = obj.get("id")
+    data = obj.get("data", {})
+    meta = data.get("metadata") or {}
+    if meta.get("lab") != "code_authoring_request" or not req_id:
+        return
+    if req_id in _AUTHORED:
+        return
+    _AUTHORED.add(req_id)
+    if not settings.code_worker_enabled:
+        return
+
+    task_id = meta.get("task_id")
+    branch_id = meta.get("lab_branch_id")
+    repo, command, ref = meta.get("repo"), meta.get("command"), meta.get("ref")
+    brief = meta.get("brief") or ""
+    attempt = int(meta.get("attempt") or 1)
+    max_attempts = int(meta.get("max_attempts") or 1)
+    if not task_id:
+        return
+
+    diff = ((getattr(out, "diff", None) or "").strip()) if out is not None else ""
+    if out is None or is_inert(getattr(out, "notes", None)) or not diff:
+        # Inert/empty authoring output (LLM budget, pause, parse) — no diff was
+        # produced. Do NOT burn a retry on a non-authoring failure; record the
+        # honest gap and fail the task (the preceding anomaly observation has
+        # the cause).
+        _record_authoring_eval(
+            graph, task_id, branch_id, repo,
+            (f"Diff authoring produced no usable output on attempt {attempt} "
+             f"(LLM budget, pause, or parse failure). No diff authored; opening "
+             f"no PR."), authored=False)
+        _fail_task(graph, task_id,
+                   "code_worker: diff authoring produced no usable output (LLM "
+                   "budget, pause, or parse failure)")
+        return
+
+    run_cap = max(1, int(effective_setting(graph, settings, "code_run_cap")))
+    timeout = max(5, int(effective_setting(graph, settings,
+                                           "sandbox_timeout_seconds")))
+    # Apply the authored diff and run the proof command (the apply + re-run is 2
+    # runs; with run_cap < 2 we cannot prove an authored diff, so fail honestly).
+    if run_cap < 2:
+        _record_authoring_eval(
+            graph, task_id, branch_id, repo,
+            "Authored a diff but code_run_cap < 2 leaves no room to apply and "
+            "re-run to prove it; opening no PR.", authored=True)
+        _fail_task(graph, task_id,
+                   "code_worker: code_run_cap < 2 — cannot prove an authored diff")
+        return
+    result = run_repo_task(repo, command, ref=ref, diff=diff,
+                           timeout_seconds=timeout)
+
+    source_id = _ensure_repo_source(graph, repo, ref)
+    stamp = seam_versions_stamp(graph, "prompt.code_author")
+    run_obs = graph.add_object("observation", {
+        "text": (f"Authored a fix diff (attempt {attempt}/{max_attempts}) and "
+                 f"applied it in the sandbox. " + evidence_summary(result)),
+        "confidence": 0.9,
+        "source_ids": [source_id],
+        "category": "measurement",
+        "metadata": {"lab": "code_authored_run", "task_id": task_id,
+                     "lab_branch_id": branch_id, "source_id": source_id,
+                     "attempt": attempt, "max_attempts": max_attempts,
+                     "authored_diff": diff,
+                     "authoring_notes": (getattr(out, "notes", "") or "")[:500],
+                     "seam_versions": stamp, "run": _run_metadata(result)},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, run_obs.id, "supported_by")
+
+    if result.get("proven"):
+        # The authored fix is proven in the sandbox. Hand the diff + the proven
+        # run (with the post-fix file states the PR commits) to the synthesis
+        # stage, which writes the honest summary, the sandbox_proven evaluation,
+        # completes the task, and opens the gated submit_pr — ADR-037 reuses
+        # ADR-035's last mile rather than duplicating it.
+        _emit_synthesis_request(
+            graph, title=_task_title(graph, task_id), task_id=task_id,
+            branch_id=branch_id, repo=repo, command=command, result=result,
+            code_run_obs_id=run_obs.id, diff=diff, propose_pr=True, brief=brief)
+        return
+
+    failure = _failure_excerpt(result)
+    if attempt < max_attempts:
+        # Feed the failure back and retry — the same file context, the previous
+        # diff, and the captured failure so the model can revise (bounded).
+        _emit_authoring_request(
+            graph, settings,
+            task_data={"title": _task_title(graph, task_id),
+                       "description": brief}, task_id=task_id,
+            branch_id=branch_id, repo=repo, command=command, ref=ref,
+            brief=brief, attempt=attempt + 1, prev_diff=diff,
+            prev_failure=failure, files_context=meta.get("files_context") or {},
+            tree=meta.get("tree") or [])
+        return
+
+    # Bounded out: honest gap. The lab DID author a fix — it just could not make
+    # it pass. No submit_pr (a fix must earn its PR by proving in the sandbox).
+    _record_authoring_eval(
+        graph, task_id, branch_id, repo,
+        (f"Authored a diff but could not make it pass after {max_attempts} "
+         f"attempt(s): running '{command}' against {repo} with the authored "
+         f"change applied did not exit 0. {failure} No PR opened."),
+        authored=True)
+    _fail_task(graph, task_id,
+               f"code_worker: authored a diff but could not make it pass after "
+               f"{max_attempts} attempt(s) — opening no PR")
+
+
+CODE_BEHAVIORS = [code_intake, code_worker, code_author]

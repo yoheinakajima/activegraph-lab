@@ -1,0 +1,39 @@
+# ADR-037: the code_worker's diff-AUTHORING step — the self-repair loop's last
+# mile. The lab could clone, run, and PROVE a fix, but could not AUTHOR one. Now
+# a propose_pr task carrying a BRIEF but NO candidate diff drives an LLM
+# authoring step: read the relevant files (from the clone), author a unified
+# diff, apply it in the sandbox, run the proof command, and —
+#   pass  -> open a gated submit_pr with the AUTHORED diff + the sandbox proof;
+#   fail  -> retry authoring up to a bound, then record an honest "authored a
+#            diff but could not make it pass" evaluation and open NO submit_pr.
+# The LLM authoring is mocked (no live LLM in fixtures): the mock reads the
+# failing check in the file context and authors the flip + a regression test.
+settings:
+  crawl_enabled: false
+  code_worker_enabled: true        # the code lane is live for this fixture
+  code_author_max_attempts: 2      # bound the authoring retry loop
+
+mission:
+  title: Diff-authoring mission
+
+# Leg 1 — an authoring task that PROVES: brief + repo + proof command, NO diff.
+# The canned clone seeds check.py exiting 1; the mock authors the flip (+ a
+# regression test); the re-run exits 0 -> proven -> a PENDING submit_pr.
+author_pass:
+  title: Author and prove the smoke-check fix
+  brief: >
+    The smoke check in check.py exits nonzero on main. Author a minimal fix so
+    it exits 0, and add a regression test so the defect cannot return.
+  repo: yoheinakajima/activegraph-lab
+  command: "python check.py"
+
+# Leg 2 — an authoring task that CANNOT pass: the proof command never exits 0,
+# so every authored diff fails. The loop retries up to the bound, then records
+# an honest gap and opens NO submit_pr (a fix must earn its PR).
+author_fail:
+  title: Author a fix that cannot be proven
+  brief: >
+    Fix the defect described here and prove it. (The proof command is rigged to
+    never pass, so no authored diff can make it green.)
+  repo: yoheinakajima/activegraph-lab
+  command: "false"
