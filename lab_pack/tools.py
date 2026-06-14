@@ -267,6 +267,35 @@ def annotate_decision_fn(graph, decision_id: str, note: str,
     return obs
 
 
+def annotate_branch_fn(graph, branch_id: str, note: str,
+                       source: str = "operator_via_mcp", msg_id: str = ""):
+    """Attach free-text operator commentary to a BRANCH (ADR-028, Phase 4).
+
+    The note becomes an operator_note observation linked `supported_by` to the
+    branch — the SAME shape the `note` steering verb records, but reachable as
+    a bare annotation that needs no pending decision and no command wording
+    (the evt_17441 erratum had nowhere to land). Records nothing but the
+    observation: the branch's STATUS is never touched, by construction.
+    Commentary is not control, so it is safe in any branch state (archived
+    included). Raises ValueError for a missing or non-branch id."""
+    note = (note or "").strip()
+    if not note:
+        raise ValueError("note is required")
+    branch = graph.get_object(branch_id)
+    if branch is None or str(branch.type) != "branch":
+        raise ValueError(f"no such branch: {branch_id}")
+    obs = graph.add_object("observation", {
+        "text": note,
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": {"lab": "operator_note", "kind": "operator_note",
+                     "lab_branch_id": branch_id, "message_id": msg_id,
+                     "source": source},
+    })
+    graph.add_relation(branch_id, obs.id, "supported_by")
+    return obs
+
+
 def complete_task_fn(graph, task_id: str, result_summary: str, success: bool = True):
     """Mark a dispatched task done/failed (a worker pack — or a fixture — calls
     this). work turns the patch into a task_outcome evaluation for interpret."""

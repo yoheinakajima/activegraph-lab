@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+- Phantom-work alias-map maintenance guard (ADR-032, Phase 6): the
+  `alias_map_guard` fixture asserts every tool in RESEARCH_WORKER_TOOLS is
+  either aliased in `_EXISTING_CAPABILITY_ALIASES` or named in a new
+  documented exemption set `_ALIAS_EXEMPT_TOOLS` (no tool both; no stale
+  entries), so adding a tool without classifying it fails CI loudly — the
+  alias map can no longer silently rot. The github list-* reads are exempt
+  (aliasing them would widen what the guard suppresses; no runtime change).
+  Fixture count 31 → 32.
+
+- Evidence profile in the draft review note (Phase 5, supports ADR-014's
+  editorial policy without enforcing it): every draft's review note now
+  carries a one-line profile — how many cited observations are the lab's own
+  LIVE work vs INHERITED from build sessions, and how many distinct branches
+  the evidence spans. Surfaces "re-slicing the same inherited findings" at
+  decision time so the operator can apply the new-evidence-only bar by eye.
+  Advisory only; no auto-block. Fixture: draft_writer Phase 5 (inherited
+  single-branch shows the re-slice profile; fresh multi-branch shows the
+  contrast).
+
+- Bare branch annotation over MCP (ADR-028, Phase 4): new operator-tier tool
+  `annotate_branch(branch_id, note)` records free-text operator commentary as
+  an `operator_note` observation linked to the branch and changes NO status —
+  a deterministic place for an erratum or aside to land that needs no pending
+  decision and no command wording (the evt_17441 erratum had nowhere to go).
+  Shares one recording shape with the send_chat `note` steering verb via
+  `tools.annotate_branch_fn`. Adds no new authority; the inbox stays
+  human-only. Fixtures: test_mcp annotate_branch section; sentinel audit
+  covers its output.
+
+- Pinned two "accident became policy" safety properties (Phase 3) with named
+  regression fixtures — a beneficial accident is one refactor from gone
+  unless a test pins it. (1) `budget_cap_restart`: the daily budget cap
+  rebuilds correctly across a restart WITH blocked attempts counted (a
+  cost-capped LLM attempt logs an llm.requested event before the provider
+  returns inert; sync_daily_budget rebuilds the count from those log events,
+  not the in-session counter — so bouncing the process cannot reset the cap).
+  (2) `seam_no_bypass`: a seam cannot activate except through a gate-approved
+  hot-load (a proposed-but-unapproved seam is inert through proposal, the
+  gate's approval-request, and a simulated boot rebuild; live ONLY on
+  approval). Both properties HELD under test. New keyed finding
+  `accident_became_policy_pinned` (LIVE_FINDINGS) records that they are now
+  pinned. No runtime change. Fixture count 29 → 31.
+
+- MCP send_chat is commit-and-return (ADR-034): a successful comm_message
+  append now returns `status=accepted` with the committed message event ids
+  IMMEDIATELY — no bounded reply wait, never a timeout error after a
+  successful append. The reply (answer behavior or a steering verb's
+  confirmation) runs fire-and-forget on the worker and is read via
+  get_branch. Supersedes the bounded-wait approach: `status=ok`-with-reply
+  and `status=reply_pending`-on-timeout are gone from the MCP path. Fixes the
+  recurring production timeouts (evt_14234, evt_16799) where the mutation
+  committed but the operator's call timed out under load. The
+  `mcp_reply_wait_seconds` setting is retired in place (a documented no-op;
+  kept to avoid a kernel-manifest edit). HTTP POST /chat is unchanged.
+
+- Overclaim lint in drafts (ADR-033): `draft_writer` gains a graph-grounded
+  sibling to the coverage check (`behaviors._overclaim_review`). It flags
+  overclaiming language the cited evidence contradicts — "independent" over
+  same-origin artifacts, "autonomous"/"unprompted" where an operator message
+  or activation is in the branch's causal chain, "verified"/"proven" over
+  descriptive-only evidence (no evaluation/measurement), and superlatives
+  with no supporting footnote — in the review note for operator attention,
+  NEVER auto-blocked. External review caught "five independent sources" (five
+  same-author artifacts) and "fully autonomous" (one trigger inside an
+  operator-steered pipeline) in published posts; the lint catches both at the
+  inbox. Fixture: draft_writer Phase 1.
+
 - Routing, capability self-check, and the phantom-work guard — the
   branch#847 chain, closed at every link. (1) Routing is verb/intent
   classification, not keywords (ADR-006/025, extends ADR-025's contract):

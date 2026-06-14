@@ -220,8 +220,9 @@ def main() -> int:
               "server paths ==")
         s, is_err, out = mcp_send_chat(base, branch_id,
                                        "post-restore baseline message", 1)
-        check(s == 200 and not is_err and out.get("status") == "ok",
-              f"resumed boot answers on the existing thread ({out.get('status') if isinstance(out, dict) else out})")
+        check(s == 200 and not is_err and out.get("status") == "accepted",
+              f"resumed boot accepts on the existing thread (ADR-034) "
+              f"({out.get('status') if isinstance(out, dict) else out})")
         check(out.get("thread_id") == thread_id if isinstance(out, dict) else False,
               "message landed in the pre-restore thread (no duplicate thread)")
 
@@ -281,8 +282,9 @@ def main() -> int:
                                            "degrade after my commit", 3)
         finally:
             store.append = flaky.real
-        check(s == 200 and not is_err and out.get("status") == "reply_pending",
-              f"degraded post-commit → reply_pending, not an error ({out.get('status') if isinstance(out, dict) else out})")
+        check(s == 200 and not is_err and out.get("status") == "accepted",
+              f"degraded post-commit → accepted, not an error (ADR-034) "
+              f"({out.get('status') if isinstance(out, dict) else out})")
         check(bool(out.get("message_id")) and bool(out.get("message_event_ids")),
               "degraded response still carries the committed message ids")
         deg = out.get("degraded") or []
@@ -404,7 +406,7 @@ def run_postgres_leaf(pg_url: str, tmp: str) -> None:
             for i in range(1, 4):
                 s, is_err, out = mcp_send_chat(base, branch_id,
                                                f"post-repair durability check {i}", 100 + i)
-                if s != 200 or is_err or out.get("status") not in ("ok", "reply_pending"):
+                if s != 200 or is_err or out.get("status") not in ("ok", "reply_pending", "accepted"):
                     check(False, f"send_chat {i} after repair → {s} {out}")
                     break
             else:
@@ -516,7 +518,7 @@ def run_postgres_reconnect(pg_url: str) -> None:
             s, is_err, out = mcp_send_chat(
                 base, branch_id, "first write after the idle suspend", 201)
             check(s == 200 and not is_err
-                  and out.get("status") in ("ok", "reply_pending"),
+                  and out.get("status") in ("ok", "reply_pending", "accepted"),
                   f"first chat after the backend kill succeeds via reconnect "
                   f"({out if is_err else out.get('status')})")
             s, errs = get_json(base, "/lab/errors")

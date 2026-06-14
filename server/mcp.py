@@ -21,7 +21,10 @@ Tool tiers (ADR-016; get_errors added by ADR-023; ADR-021 expansion):
             event. annotate_decision (ADR-026) attaches a public,
             operator_via_mcp-attributed note to a PENDING decision — it
             does NOT and cannot resolve; annotation is commentary, not
-            authority.
+            authority. annotate_branch (ADR-028) attaches the same kind of
+            public commentary to a BRANCH (an operator_note observation),
+            changing no status — a bare annotation needing no pending
+            decision.
   EXCLUDED BY DESIGN: approve/reject of decisions and seam promotion
             remain EXCLUDED from MCP — the inbox stays human-only.
 """
@@ -42,8 +45,11 @@ INSTRUCTIONS = (
     "kernel ceiling). annotate_decision attaches a public pre-review note to "
     "a pending decision — commentary, not authority: the operator's UI "
     "prefills its rationale field from the latest note when they resolve. "
-    "Approving/rejecting decisions and seam promotion are deliberately not "
-    "available here — the inbox stays human-only (ADR-016/021/026)."
+    "annotate_branch attaches free-text commentary to a branch (an "
+    "operator_note that changes no status) when there is no decision to "
+    "annotate. Approving/rejecting decisions and seam promotion are "
+    "deliberately not available here — the inbox stays human-only "
+    "(ADR-016/021/026/028)."
 )
 
 _DEFAULT_LIMIT = 30
@@ -257,6 +263,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "annotate_branch",
+        "description": "OPERATOR (ADR-028): attach free-text commentary to a "
+                       "BRANCH — a bare annotation that needs no pending "
+                       "decision and no command wording. Records a public, "
+                       "operator_via_mcp-attributed operator_note observation "
+                       "linked to the branch and changes NO status (an erratum "
+                       "or aside that is not a command has somewhere to land). "
+                       "Commentary, not control: it is safe on a branch in any "
+                       "state, archived included. For commentary ON a pending "
+                       "decision use annotate_decision; to STEER a branch use "
+                       "send_chat.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "branch_id": {"type": "string",
+                              "description": "A branch id, e.g. branch#7."},
+                "note": {"type": "string",
+                         "description": "The commentary (public, lands in the log)."},
+            },
+            "required": ["branch_id", "note"],
+        },
+    },
+    {
         "name": "send_chat",
         "description": "Post a message into a branch's thread WITH OPERATOR "
                        "AUTHORITY. The message is public and tagged "
@@ -264,12 +293,11 @@ TOOLS: list[dict] = [
                        "work from here (pause/resume, activate/deactivate, "
                        "draft, recrawl — ADR-025); approve/reject are "
                        "REFUSED for MCP-tagged messages — the inbox stays "
-                       "human-only (ADR-016/021). Returns status=ok with the "
-                       "lab's reply, its event-horizon stamp, and the event "
-                       "ids created — or status=reply_pending with the "
-                       "message event ids when the message landed but the "
-                       "reply missed the bounded wait (default 15s; poll "
-                       "get_branch).",
+                       "human-only (ADR-016/021). Returns IMMEDIATELY with "
+                       "status=accepted and the committed message event ids "
+                       "(ADR-034: commit-and-return, no blocking wait, never a "
+                       "timeout after a successful append). The lab's reply "
+                       "runs on the worker — read it via get_branch.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -505,21 +533,17 @@ def _tool_failure(msg_id: Any, message: str) -> dict:
                                 "isError": True})
 
 
-# Bounded wait for the reply phase. MCP clients enforce their own tool
-# timeouts (claude.ai errors out well under the answer behavior's 60s LLM
-# cap), so the wait must come in under theirs: past the bound the message is
-# still committed and the reply, if it lands, is visible via get_branch — so
-# the tool reports partial success instead of the client seeing a transport
-# error. The value is setting.mcp_reply_wait_seconds, seam-whitelisted
-# (lab_pack/kernel.py), default 15.
-def _reply_wait_seconds(graph) -> int:
-    from lab_pack.seams import effective_setting
-    from lab_pack.settings import LabSettings
-    return max(1, int(effective_setting(graph, LabSettings(),
-                                        "mcp_reply_wait_seconds")))
-
-
 def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
+    """Commit-and-return (ADR-034). The comm_message append is the ONLY step
+    that may fail the request (ADR-023); once it commits, the reply is
+    fire-and-forgotten onto the worker and the tool returns IMMEDIATELY with
+    status=accepted + the committed message event ids. There is NO bounded
+    wait and NEVER a timeout error after a successful append — the recurring
+    production timeouts (evt_14234, evt_16799: the mutation committed but the
+    operator's call timed out under load) were the bounded wait losing the
+    race; there is no wait to lose now. The reply (the answer behavior, or a
+    steering verb's confirmation) lands once on the worker and is read via
+    get_branch."""
     from lab_pack.llm import reset_llm_run_counters
     from server.lab_server import (_chat_collect_reply_safe,
                                    _chat_post_message, _record_error,
@@ -532,7 +556,6 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
     with lock:
         b = rt.graph.get_object(branch_id)
         status = b.data.get("status") if b is not None and str(b.type) == "branch" else None
-        reply_wait = _reply_wait_seconds(rt.graph)
     if status is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
     # ADR-027: archived branches ARE chat-able — for the activate verb
@@ -559,60 +582,30 @@ def _send_chat(msg_id: Any, args: dict, *, get_rt, lock, run_on_worker) -> dict:
                     "— nothing was committed; see get_errors / /lab/errors")
     if posted is None:
         return _tool_failure(msg_id, f"no such branch: {branch_id}")
-    # The message is committed from here on: whatever happens to the reply
-    # phase, the tool result must say so (NEVER an error — ADR-023).
-    if posted.get("degraded"):
-        # Post-commit upkeep failed — don't block the bounded wait on a
-        # store that is already degrading; the reply job still runs on the
-        # worker (client fate irrelevant) and get_branch shows it landing.
-        _submit_to_worker(
-            lambda rt: _chat_collect_reply_safe(rt, posted["message_id"]))
-        steps = ", ".join(f"{d['kind']} ({d['class']})"
-                          for d in posted["degraded"])
-        return _tool_result(msg_id, {
-            "status": "reply_pending",
-            "detail": (f"message committed but the chat path degraded after "
-                       f"the append: {steps}. The reply is queued on the "
-                       f"worker — poll get_branch for {branch_id}; see "
-                       "get_errors for sanitized details"),
-            "degraded": posted["degraded"],
-            "branch_id": posted["branch_id"],
-            "thread_id": posted["thread_id"],
-            "message_id": posted["message_id"],
-            "message_event_ids": posted["message_event_ids"],
-        })
-    try:
-        reply = run_on_worker(
-            lambda rt: _chat_collect_reply_safe(rt, posted["message_id"]),
-            reply_wait)
-    except Exception as exc:
-        # Bounded-wait timeout: the job stays queued and the worker still
-        # produces the reply (ADR-023 decoupling) — report partial success.
-        _record_error("mcp.send_chat.reply_wait", exc,
-                      posted["message_event_ids"])
-        reply = None
-    if reply is None:
-        return _tool_result(msg_id, {
-            "status": "reply_pending",
-            "detail": ("message delivered (event ids below); the reply has "
-                       "not landed within the bounded wait — poll get_branch "
-                       f"for {branch_id} to read it when it arrives"),
-            "branch_id": posted["branch_id"],
-            "thread_id": posted["thread_id"],
-            "message_id": posted["message_id"],
-            "message_event_ids": posted["message_event_ids"],
-        })
-    return _tool_result(msg_id, {
-        "status": "ok",
-        "reply": reply["content"],
-        "event_horizon": reply.get("event_horizon"),
+    # Committed. Fire the reply onto the worker and return at once — client
+    # fate is irrelevant to the reply's completion (ADR-023 decoupling).
+    _submit_to_worker(
+        lambda rt: _chat_collect_reply_safe(rt, posted["message_id"]))
+    out = {
+        "status": "accepted",
+        "detail": ("message committed (event ids below); the reply runs on "
+                   f"the worker — poll get_branch for {branch_id} to read it"),
         "branch_id": posted["branch_id"],
         "thread_id": posted["thread_id"],
         "message_id": posted["message_id"],
         "message_event_ids": posted["message_event_ids"],
-        "created_event_ids": posted["message_event_ids"]
-        + (reply.get("reply_event_ids") or []),
-    })
+    }
+    if posted.get("degraded"):
+        # Post-commit upkeep degraded — still committed, reply still queued;
+        # surface the sanitized steps so the caller can read get_errors.
+        steps = ", ".join(f"{d['kind']} ({d['class']})"
+                          for d in posted["degraded"])
+        out["degraded"] = posted["degraded"]
+        out["detail"] = (f"message committed but the chat path degraded after "
+                         f"the append: {steps}. The reply is queued on the "
+                         f"worker — poll get_branch for {branch_id}; see "
+                         "get_errors for sanitized details")
+    return _tool_result(msg_id, out)
 
 
 def _github_read(msg_id: Any, args: dict) -> dict:
@@ -704,6 +697,42 @@ def _annotate_decision(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dic
         return _tool_failure(msg_id, str(exc))
 
 
+def _annotate_branch(msg_id: Any, args: dict, *, get_rt, run_on_worker) -> dict:
+    """ADR-028 (Phase 4): a bare branch annotation — free-text operator
+    commentary recorded as an operator_note observation on the branch. The
+    handler can only create the observation and link it; no code path here
+    touches branch status, by construction."""
+    branch_id = (args.get("branch_id") or "").strip()
+    note = (args.get("note") or "").strip()
+    if not branch_id or not note:
+        return _tool_failure(msg_id, "branch_id and note are required")
+    get_rt()
+
+    def job(rt):
+        from lab_pack.tools import annotate_branch_fn
+        from server.lab_server import _save
+        before = rt.graph.get_object(branch_id)
+        before_status = before.data.get("status") if before is not None else None
+        obs = annotate_branch_fn(rt.graph, branch_id, note,
+                                 source="operator_via_mcp")
+        _save(rt)
+        after = rt.graph.get_object(branch_id)
+        return {
+            "branch_id": branch_id,
+            "status": after.data.get("status"),  # unchanged — by construction
+            "status_unchanged": after.data.get("status") == before_status,
+            "annotation_id": str(obs.id),
+            "note": ("operator note recorded (public, operator_via_mcp) as a "
+                     "branch observation. It changes no status — commentary, "
+                     "not control (ADR-028)."),
+        }
+
+    try:
+        return _tool_result(msg_id, run_on_worker(job))
+    except ValueError as exc:
+        return _tool_failure(msg_id, str(exc))
+
+
 def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
                 rate_limited) -> tuple[int, Optional[dict]]:
     """One streamable-HTTP POST: a single JSON-RPC message in, a single JSON
@@ -743,7 +772,7 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
         name = params.get("name")
         args = params.get("arguments") or {}
         if name in ("send_chat", "set_budget", "pause_lab", "resume_lab",
-                    "annotate_decision"):
+                    "annotate_decision", "annotate_branch"):
             if rate_limited():
                 return 429, _rpc_error(msg_id, -32000,
                                        "rate limited (30 mutations/min)")
@@ -756,6 +785,9 @@ def handle_post(raw: bytes, *, get_rt, lock, run_on_worker,
             if name == "annotate_decision":
                 return 200, _annotate_decision(msg_id, args, get_rt=get_rt,
                                                run_on_worker=run_on_worker)
+            if name == "annotate_branch":
+                return 200, _annotate_branch(msg_id, args, get_rt=get_rt,
+                                             run_on_worker=run_on_worker)
             return 200, _control_pause(msg_id, name == "pause_lab",
                                        get_rt=get_rt,
                                        run_on_worker=run_on_worker)

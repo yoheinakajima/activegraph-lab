@@ -1,0 +1,10 @@
+description: |
+  Phase 6 maintenance guard (ADR-032): the phantom-work alias map
+  (_EXISTING_CAPABILITY_ALIASES) must grow whenever a tool joins
+  RESEARCH_WORKER_TOOLS, or the guard silently rots — a new tool with no
+  alias and no exemption would let a phantom-build proposal for it through
+  unnoticed. This fixture asserts every RESEARCH_WORKER_TOOLS member is either
+  aliased OR named in the documented exemption set (_ALIAS_EXEMPT_TOOLS), so
+  adding a tool without classifying it fails CI loudly. It also forbids stale
+  alias/exemption entries that name tools no longer in the worker's tool set.
+  No runtime change — this is a structural test.

@@ -261,7 +261,7 @@ def main() -> int:
                                "message": "oauth round-trip check-in"},
                               token=access)
         check(s == 200 and isinstance(out, dict)
-              and out.get("status") in ("ok", "reply_pending"),
+              and out.get("status") in ("ok", "reply_pending", "accepted"),
               "send_chat with the OAuth bearer — identical authority (ADR-016)")
         msg = rt.graph.get_object(out.get("message_id"))
         check(msg is not None

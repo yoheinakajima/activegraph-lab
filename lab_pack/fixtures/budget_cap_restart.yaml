@@ -1,0 +1,22 @@
+description: |
+  Phase 3 regression (ADR-015/019): the daily budget cap is a beneficial
+  accident pinned as policy — it rebuilds CORRECTLY across a restart, and
+  blocked attempts are COUNTED. The subtlety this locks in: a cost-capped LLM
+  attempt is logged as an llm.requested event BEFORE the provider returns
+  inert, and sync_daily_budget rebuilds the used-count from those log events
+  (NOT the in-session counter, which never increments for blocked calls). So
+  bouncing the process cannot reset the cap, and the blocked attempts survive
+  the rebuild. A beneficial accident is one refactor from gone unless a test
+  pins it — this is the test.
+
+mission:
+  title: Grow activegraph.ai's evidence base
+  target_url: ""
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+cost_cap_usd: 0.50
+synthetic_spend: 0.60     # > cap, so the next LLM attempt is blocked
+claims_after_cap: 3       # each triggers plan → one blocked attempt

@@ -96,13 +96,15 @@ class LabSettings(BaseModel):
         ge=1,
         le=60,
         description=(
-            "Bounded wait (seconds) for the reply phase of the MCP send_chat "
-            "tool. MCP clients enforce their own tool timeouts (claude.ai "
-            "errors out well under a minute), so this must come in under "
-            "theirs: past the bound the committed message ids return as "
-            "status=reply_pending and the caller polls get_branch. "
-            "Seam-eligible — tuning client-facing latency policy is "
-            "self-modification through the gate."
+            "RETIRED (ADR-034), kept as a no-op. send_chat is now "
+            "commit-and-return-immediately (status=accepted + message event "
+            "ids; the reply is read via get_branch), so there is no bounded "
+            "reply wait left to tune — the recurring production timeouts the "
+            "bound caused (evt_14234/16799: the mutation committed but the "
+            "operator's call timed out) are gone with the wait. The field and "
+            "its seam-whitelist entry (lab_pack/kernel.py) are kept in place "
+            "rather than edited out, so no kernel change is required; nothing "
+            "reads this value anymore."
         ),
     )
     digest_min_findings: int = Field(

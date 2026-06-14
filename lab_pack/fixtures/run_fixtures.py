@@ -1089,6 +1089,120 @@ def run_draft_writer() -> bool:
     c.that(bool(named) and "claims coverage" in named,
            "a named-component opener (camelCase) is substantive, not framing")
     print("  Phase 4: framing exempt; numeric + named openers flag")
+
+    # ── Phase 1 (ADR-033): overclaim lint — graph-grounded, advisory ────────
+    from lab_pack.behaviors import _overclaim_review
+    import lab_pack.behaviors as _lb
+
+    # "independent" over same-author sources flags.
+    s1 = g.add_object("source", {"kind": "url", "url": "https://activegraph.ai/post-a",
+                                 "metadata": {"author": "the-lab"}})
+    s2 = g.add_object("source", {"kind": "url", "url": "https://activegraph.ai/post-b",
+                                 "metadata": {"author": "the-lab"}})
+    indep = _overclaim_review(
+        "Five independent sources back the replay claim.[^1][^2]\n\n"
+        f"[^1]: {s1.id}\n[^2]: {s2.id}\n", g, [s1.id, s2.id]) or ""
+    c.that("overclaim lint" in indep and "independent sources" in indep,
+           f"'independent' over same-origin sources flags ({indep!r})")
+
+    # Distinct-origin sources do NOT flag the independence claim.
+    s3 = g.add_object("source", {"kind": "url", "url": "https://example.org/x",
+                                 "metadata": {"author": "someone-else"}})
+    indep_ok = _overclaim_review(
+        "Two independent sources agree.[^1][^2]\n\n"
+        f"[^1]: {s1.id}\n[^2]: {s3.id}\n", g, [s1.id, s3.id]) or ""
+    c.that("independent sources" not in indep_ok,
+           f"'independent' over distinct-origin sources passes ({indep_ok!r})")
+
+    # "autonomous" over an operator-triggered (activation_message) branch flags.
+    ab = g.add_object("branch", {
+        "title": "Operator-activated branch", "intent": "verify replay",
+        "status": "active",
+        "metadata": {"activation_message": "Activate this and check replay."}})
+    auto = _overclaim_review(
+        "The lab fully autonomously confirmed the result.[^1]\n\n"
+        "[^1]: observation#1\n", g, ["observation#1"], branch_id=ab.id) or ""
+    c.that("autonomy" in auto,
+           f"'autonomous' over an operator-triggered branch flags ({auto!r})")
+
+    # "proven" over a descriptive observation flags; over an evaluation passes.
+    descr = g.add_object("observation", {"text": "A described behavior.",
+                                         "category": "fact", "metadata": {}})
+    proven = _overclaim_review(
+        f"The determinism claim is proven.[^1]\n\n[^1]: {descr.id}\n",
+        g, [descr.id]) or ""
+    c.that("evidence strength" in proven,
+           f"'proven' over a descriptive observation flags ({proven!r})")
+    demo = g.add_object("evaluation", {"subject_id": "task#1",
+                                       "subject_type": "task",
+                                       "judgment": "measured",
+                                       "evaluator": "lab.research_worker"})
+    proven_ok = _overclaim_review(
+        f"The determinism claim is proven by the run.[^1]\n\n[^1]: {demo.id}\n",
+        g, [demo.id]) or ""
+    c.that("evidence strength" not in proven_ok,
+           f"'proven' over a demonstration (evaluation) passes ({proven_ok!r})")
+
+    # A superlative with no supporting footnote flags.
+    sup = _overclaim_review(
+        "This is the first-ever self-hosted research lab of its kind, full "
+        "stop, and the framing deserves emphasis up front here in the lede.\n",
+        g, [], branch_id=None) or ""
+    c.that("superlatives" in sup,
+           f"an unfootnoted superlative flags ({sup!r})")
+
+    # A hedged-correctly draft passes clean (no trigger phrasing).
+    hedged = _overclaim_review(
+        "The runtime recorded the outcome and the operator can inspect the "
+        "linked evidence below to judge it for themselves.[^1]\n\n"
+        "[^1]: observation#1\n", g, ["observation#1"], branch_id=None)
+    c.that(not hedged, f"a hedged-correctly draft draws no overclaim note "
+                       f"({hedged!r})")
+    print("  Phase 1: overclaim lint — independent/autonomous/proven/superlative"
+          " flag, hedged passes")
+
+    # ── Phase 5: evidence profile — inherited vs live, branch span ──────────
+    from lab_pack.behaviors import _evidence_profile
+    inherited_ctx = [
+        {"finding_id": "observation#101", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+        {"finding_id": "observation#102", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+        {"finding_id": "observation#103", "origin": "seeded",
+         "created_by": "system", "branch_id": "branch#9"},
+    ]
+    prof_inherited = _evidence_profile(
+        g, ["observation#101", "observation#102", "observation#103"],
+        findings_context=inherited_ctx) or ""
+    c.that("evidence profile" in prof_inherited
+           and "3 inherited from build sessions" in prof_inherited
+           and "0 from the lab's own live work" in prof_inherited
+           and "1 distinct branch" in prof_inherited
+           and "re-slice" in prof_inherited,
+           f"inherited single-branch evidence shows the re-slice profile "
+           f"({prof_inherited!r})")
+
+    fresh_ctx = [
+        {"finding_id": "observation#201",
+         "origin": "live work by the research_worker behavior",
+         "created_by": "lab.research_worker", "branch_id": "branch#21"},
+        {"finding_id": "observation#202",
+         "origin": "live work by the research_worker behavior",
+         "created_by": "lab.research_worker", "branch_id": "branch#22"},
+        {"finding_id": "observation#203",
+         "origin": "live work by the interpret behavior",
+         "created_by": "lab.interpret", "branch_id": "branch#23"},
+    ]
+    prof_fresh = _evidence_profile(
+        g, ["observation#201", "observation#202", "observation#203"],
+        findings_context=fresh_ctx) or ""
+    c.that("3 from the lab's own live work" in prof_fresh
+           and "0 inherited from build sessions" in prof_fresh
+           and "3 distinct branch" in prof_fresh
+           and "re-slice" not in prof_fresh,
+           f"fresh multi-branch evidence shows the contrast ({prof_fresh!r})")
+    print("  Phase 5: evidence profile — inherited single-branch vs fresh "
+          "multi-branch contrast")
     return c.done("draft_writer")
 
 
@@ -1870,6 +1984,221 @@ def run_seams() -> bool:
            "recorded version matches the active version at execution")
 
     return c.done("seams")
+
+
+def run_alias_map_guard() -> bool:
+    _load("alias_map_guard.yaml")  # description-only; assertions are structural
+    print("\n" + "=" * 64)
+    print("Fixture: alias_map_guard — the phantom-work alias map must cover "
+          "every research-worker tool (ADR-032, Phase 6)")
+    print("=" * 64)
+
+    from lab_pack.behaviors import (_ALIAS_EXEMPT_TOOLS,
+                                    _EXISTING_CAPABILITY_ALIASES)
+    from lab_pack.research_worker import RESEARCH_WORKER_TOOLS
+
+    c = Check()
+    aliased = set(_EXISTING_CAPABILITY_ALIASES)
+    exempt = set(_ALIAS_EXEMPT_TOOLS)
+    tools = set(RESEARCH_WORKER_TOOLS)
+
+    # Every tool the lab can call is classified: aliased (the guard catches a
+    # phantom build of it) or explicitly exempt (a documented choice).
+    uncovered = sorted(t for t in tools if t not in aliased and t not in exempt)
+    c.that(not uncovered,
+           f"every RESEARCH_WORKER_TOOLS member is aliased or exempt — "
+           f"uncovered (add an alias or an exemption): {uncovered}")
+
+    # A tool cannot be BOTH aliased and exempt — that is an ambiguous record.
+    both = sorted(aliased & exempt)
+    c.that(not both,
+           f"no tool is both aliased and exempt (ambiguous): {both}")
+
+    # No stale entries: every alias-map key and every exemption names a tool
+    # that is actually in the worker's live tool set.
+    stale_aliases = sorted(aliased - tools)
+    c.that(not stale_aliases,
+           f"alias-map keys all name live tools — stale (remove): {stale_aliases}")
+    stale_exempt = sorted(exempt - tools)
+    c.that(not stale_exempt,
+           f"exemptions all name live tools — stale (remove): {stale_exempt}")
+
+    print(f"  {len(tools)} tools: {len(aliased & tools)} aliased, "
+          f"{len(exempt)} exempt, 0 uncovered, 0 stale")
+    return c.done("alias_map_guard")
+
+
+def run_budget_cap_restart() -> bool:
+    spec = _load("budget_cap_restart.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: budget_cap_restart — the daily cap rebuilds across a "
+          "restart, blocked attempts counted (ADR-015/019, Phase 3)")
+    print("=" * 64)
+
+    from datetime import datetime, timezone
+    from lab_pack.behaviors import emit_lab_event
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, _lab_prompt_bodies,
+                              reset_llm_session, sync_daily_budget)
+
+    clear_lab_registry()
+    reset_llm_session()
+    cap = float(spec["cost_cap_usd"])
+    spend = float(spec["synthetic_spend"])
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=10, max_daily=200,
+                                 max_daily_cost_usd=cap,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt = Runtime(Graph(), llm_provider=wrapper)
+    rt.load_pack(core_pack, settings=CoreSettings())
+    rt.load_pack(lab_pack, settings=LabSettings(**(spec.get("settings") or {})))
+    bind_live_behaviors(rt)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def requested_today():
+        return [e for e in g.events if str(e.type) == "llm.requested"
+                and str(getattr(e, "timestamp", "") or "").startswith(today)]
+
+    def proposed():
+        return [b for b in g.objects(type="branch")
+                if b.data.get("status") == "proposed"]
+
+    # Push spend over the cap (native cost accounting, ADR-015), rebuild state.
+    emit_lab_event(g, "llm.responded", {"cost_usd": spend, "model": "fixture",
+                                        "behavior": "fixture"})
+    sync_daily_budget(rt)
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           f"spend rebuilds over the cap from llm.responded "
+           f"(${float(_LLM_STATE['daily_cost']):.2f} >= ${cap:.2f})")
+
+    # Behaviors fire and are BLOCKED by the cost cap — each blocked attempt
+    # still emits an llm.requested event BEFORE the provider returns inert.
+    req_before = len(requested_today())
+    n_claims = int(spec["claims_after_cap"])
+    for i in range(n_claims):
+        g.add_object("observation", {
+            "text": f"Claim {i}: the runtime replays every event deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id}})
+        rt.run_until_idle()
+    c.that(len(proposed()) == 0,
+           f"cost cap blocks plan — no branches proposed ({len(proposed())})")
+    blocked_reqs = len(requested_today()) - req_before
+    c.that(blocked_reqs >= n_claims,
+           f"each blocked attempt still logged an llm.requested event "
+           f"({blocked_reqs} for {n_claims} blocked claims)")
+    # The in-session counter does NOT increment for blocked calls — so the
+    # only way the count survives a restart is the log rebuild. This is the
+    # accident-became-policy property: the count lives in the log.
+    c.that(_LLM_STATE["daily_used"] < len(requested_today()),
+           f"in-session daily_used ({_LLM_STATE['daily_used']}) is BEHIND the "
+           f"logged llm.requested count ({len(requested_today())}) — blocked "
+           "attempts only count via the log rebuild")
+
+    # THE PROPERTY: restart (reset session + rebuild from the log).
+    reset_llm_session()
+    c.that(_LLM_STATE["daily_used"] == 0
+           and float(_LLM_STATE["daily_cost"]) == 0.0,
+           "restart clears in-process budget state")
+    used = sync_daily_budget(rt)
+    c.that(used == len(requested_today()),
+           f"daily_used rebuilds to the llm.requested count — blocked attempts "
+           f"included ({used})")
+    c.that(used >= blocked_reqs and used > 0,
+           "the blocked attempts are part of the rebuilt count")
+    c.that(float(_LLM_STATE["daily_cost"]) >= cap,
+           "the cost cap is restart-proof: bouncing the process cannot reset it")
+
+    # …and it STAYS enforced after the restart: a fresh trigger is still blocked.
+    n_before = len(proposed())
+    g.add_object("observation", {
+        "text": "Post-restart claim: replay is deterministic for sure.",
+        "confidence": 0.7, "category": "fact",
+        "metadata": {"lab": "site_claim", "mission_id": mission.id}})
+    rt.run_until_idle()
+    c.that(len(proposed()) == n_before,
+           "post-restart: the rebuilt cap still blocks new LLM work")
+    print(f"  {blocked_reqs} blocked attempts logged; restart rebuilds "
+          f"daily_used={used}, cost=${float(_LLM_STATE['daily_cost']):.2f} >= "
+          f"${cap:.2f}; cap holds")
+    return c.done("budget_cap_restart")
+
+
+def run_seam_no_bypass() -> bool:
+    spec = _load("seam_no_bypass.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: seam_no_bypass — a seam cannot activate except through a "
+          "gate-approved hot-load (ADR-012, Phase 3)")
+    print("=" * 64)
+
+    import lab_pack.behaviors as lb
+    from lab_pack.seams import (active_version, apply_approved, clear_seam_cache,
+                                propose_seam_fn, resolve)
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    create_mission_fn(g, "No-bypass mission", target_url="")
+    rt.run_until_idle()
+
+    c = Check()
+    seam_name = spec["seam_name"]
+    marker = spec["file_default_marker"]
+    plan_b = next(b for b in lb.BEHAVIORS if b.name == "plan")
+    file_default = plan_b.description
+    c.that(marker not in file_default,
+           "precondition: the seam body marker is not in the file default")
+
+    # Propose the seam → a DRAFT artifact + a PENDING self_modify decision.
+    art = propose_seam_fn(g, seam_name, spec["body"], "no-bypass fixture")
+    rt.run_until_idle()
+    c.that(g.get_object(art.id).data.get("status") == "draft",
+           f"proposed seam artifact is a draft, not approved "
+           f"({g.get_object(art.id).data.get('status')})")
+    pending = next((d for d in g.objects(type="decision")
+                    if d.data.get("kind") == "self_modify"
+                    and d.data.get("subject_ref") == art.id
+                    and d.data.get("status") == "pending"), None)
+    c.that(pending is not None, "a PENDING self_modify decision gates it")
+
+    # Bypass attempt 1 — resolution. A full-graph scan honors only approved
+    # artifacts; a behavior (cache-only) sees the file default on a miss.
+    c.that(resolve(g, seam_name, "FILE") == (0, "FILE"),
+           "full-graph resolve ignores the draft seam (file default)")
+    c.that(active_version(g, seam_name) == 0,
+           "active_version is 0 — nothing is live")
+    c.that(marker not in plan_b.description
+           and marker not in rt.get_behavior("lab.plan").description,
+           "the live behavior description still holds the file default")
+
+    # Bypass attempt 2 — the gate ran (approval-request emitted) but did NOT
+    # approve. The seam stays inert.
+    c.that(marker not in rt.get_behavior("lab.plan").description,
+           "the gate's approval-request does not activate the seam")
+
+    # Bypass attempt 3 — a simulated boot: apply_approved clears the cache and
+    # re-applies ONLY approved seams. The pending draft is not among them.
+    clear_seam_cache()
+    apply_approved(g)
+    c.that(resolve(g, seam_name, "FILE") == (0, "FILE")
+           and marker not in rt.get_behavior("lab.plan").description,
+           "a boot rebuild (apply_approved) does not load the unapproved seam")
+
+    # The ONLY path that activates it: a gate-approved decision → hot-load.
+    approve_decision_fn(g, pending.id, True, "fixture: approve the seam")
+    rt.run_until_idle()
+    c.that(g.get_object(art.id).data.get("status") == "approved",
+           "approval patches the artifact to approved")
+    c.that(rt.get_behavior("lab.plan").description.startswith(spec["body"]),
+           "ONLY after gate approval does the hot-load make the seam live")
+    c.that(active_version(g, seam_name) == 1,
+           "the now-active seam reports its version")
+    print("  draft seam inert through proposal, approval-request, and a boot "
+          "rebuild; live ONLY after gate approval")
+    return c.done("seam_no_bypass")
 
 
 def run_github_read() -> bool:
@@ -3399,6 +3728,9 @@ def run_all() -> None:
         run_decision_rationale(),
         run_paused_boot(),
         run_seams(),
+        run_budget_cap_restart(),
+        run_seam_no_bypass(),
+        run_alias_map_guard(),
         run_charter(),
         run_model_routing(),
         run_model_params(),

@@ -17,7 +17,7 @@ Invariants. Changing any item below requires an ADR in docs/DECISIONS.md and, on
 
 ## Chat path
 
-- In any chat path, the message append is the ONLY step whose failure may fail the request (ADR-023). Post-commit failures degrade to `reply_pending` with the committed message ids — never an error after a successful append. The reply runs on the worker regardless of the client's fate.
+- In any chat path, the message append is the ONLY step whose failure may fail the request (ADR-023). Never an error after a successful append. The reply runs on the worker regardless of the client's fate. The MCP `send_chat` path is commit-and-return (ADR-034): a successful append returns `status=accepted` with the committed message ids IMMEDIATELY — no bounded wait — and the reply is read via `get_branch`; a post-commit degradation still returns `accepted`. The HTTP `POST /chat` path composes its reply inline and degrades to `reply_pending` with the committed message ids.
 
 ## Authority
 

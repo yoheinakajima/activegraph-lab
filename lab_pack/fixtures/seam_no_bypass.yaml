@@ -1,0 +1,19 @@
+description: |
+  Phase 3 regression (ADR-012): the seam loader is a beneficial accident
+  pinned as policy — a seam CANNOT activate except through a gate-approved
+  hot-load. No bypass path. A proposed-but-unapproved seam is invisible to
+  resolution (full-graph scan honors only status=approved; behaviors resolve
+  cache-only, and the cache is written ONLY by hot_load on approval and
+  apply_approved at boot, which itself loads only approved artifacts). The
+  draft seam stays inert through proposal, through the gate's approval-request,
+  and through a simulated boot — it activates ONLY when the decision is
+  approved. A beneficial accident is one refactor from gone unless a test
+  pins it — this is the test.
+
+settings:
+  crawl_enabled: false
+  dispatch_gap_check: false
+
+seam_name: prompt.plan
+body: "SEAM NO-BYPASS: propose at most one branch per page."
+file_default_marker: "SEAM NO-BYPASS"   # must NOT appear in the live behavior until approved

@@ -163,6 +163,11 @@ def _run() -> int:
                        ("annotate_decision",
                         {"decision_id": pending_id,
                          "note": "audit: pre-review note (ADR-026)"}),
+                       # ADR-028 (Phase 4): the bare branch annotation joins
+                       # the audited corpus like every public surface.
+                       ("annotate_branch",
+                        {"branch_id": str(branch.id),
+                         "note": "audit: bare branch commentary (ADR-028)"}),
                        # ADR-022: github_read outputs join the corpus — a
                        # canned hit (transport injected below) and an
                        # allowlist refusal; the sentinel GITHUB_TOKEN must
