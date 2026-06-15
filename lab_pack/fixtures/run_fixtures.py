@@ -3043,13 +3043,29 @@ def run_code_authoring() -> bool:
     import os
     from lab_pack import github_write, repo_sandbox
 
-    # Canned clone: seed a FAILING check the authored diff must repair. The RUN
-    # step is the REAL subprocess (the sentinel gate covers its isolation), and
-    # the diff is AUTHORED by the mock LLM from the file context — not supplied.
+    # A LARGE buggy widget.py (>20k chars) the ADR-039 integrity legs target:
+    # answer() returns 1 but must return 42. Seeded big so the proof that the
+    # FULL target file reaches the authoring context (Phase 2) is meaningful —
+    # the old [:6000] render slice AND the old 20k clone_and_read truncation
+    # would both have cut the END marker, which sits past both bounds.
+    widget_pad = "".join(
+        f"# padding line {i:04d} {'x' * 48}\n" for i in range(400))
+    widget_buggy = (
+        "# widget module — fixture target for ADR-039 full-file authoring.\n"
+        + widget_pad
+        + "def answer():\n    return 1  # BUG: should return 42\n"
+        + "# END_OF_WIDGET_MARKER\n")
+
+    # Canned clone: seed a FAILING check the authored diff must repair AND the
+    # large buggy widget module. The RUN step is the REAL subprocess (the
+    # sentinel gate covers its isolation), and the diff is AUTHORED by the mock
+    # LLM from the file context — not supplied.
     def fake_clone(repo, ref, dest):
         os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, "check.py"), "w") as f:
             f.write(_CHECK_FAIL)
+        with open(os.path.join(dest, "widget.py"), "w") as f:
+            f.write(widget_buggy)
         return None
 
     rt = _new_runtime(spec, with_gateway=False, with_comm=False)
@@ -3178,6 +3194,83 @@ def run_code_authoring() -> bool:
                "a fix that never proves opens NO submit_pr (the Phase-3 "
                "guardrail holds for authored fixes too)")
         print("  fail: unprovable → 2 authoring attempts → honest gap, no PR")
+
+        # ── Leg 3 (ADR-039): source fix + a REAL regression test that the
+        # proof executes directly → proven only because BOTH pass; and the FULL
+        # target file reached the authoring context (Phase 2). ───────────────
+        b_st = drive(spec["author_source_and_test"])
+        t_st = task_for(b_st.id)
+
+        # Phase 2: the authoring request carried widget.py in FULL — uncut in
+        # both the canonical files_context AND the rendered request text (the
+        # END marker sits past the old [:6000]/20k truncation bounds).
+        reqs = [o for o in _lab_obs(g, "code_authoring_request")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b_st.id]
+        ctx_full = ((reqs[0].data.get("metadata") or {}).get("files_context") or {}
+                    ).get("widget.py", "") if reqs else ""
+        c.that(len(widget_buggy) > 20_000
+               and ctx_full == widget_buggy
+               and "END_OF_WIDGET_MARKER" in ctx_full,
+               f"Phase 2: the FULL target file reaches the authoring context "
+               f"uncut ({len(ctx_full)}/{len(widget_buggy)} chars)")
+        c.that(bool(reqs) and "END_OF_WIDGET_MARKER" in (reqs[0].data.get("text") or ""),
+               "Phase 2: the rendered authoring request shows the target file "
+               "uncut (the [:6000] render slice is gone)")
+
+        # Phase 1: the authored test was actually EXECUTED (pytest exit 0) and
+        # that is part of why the fix proved.
+        st_runs = [o for o in _lab_obs(g, "code_authored_run")
+                   if (o.data.get("metadata") or {}).get("lab_branch_id") == b_st.id]
+        st_run_meta = (st_runs[-1].data.get("metadata") or {}) if st_runs else {}
+        st_reg = (st_run_meta.get("run") or {}).get("regression") or {}
+        c.that("tests/test_widget.py" in (st_run_meta.get("authored_tests") or []),
+               "the authored regression test is recorded as executed")
+        c.that(st_reg.get("exit_code") == 0,
+               f"Phase 1: the authored test ran DIRECTLY and passed "
+               f"(pytest exit={st_reg.get('exit_code')})")
+        c.that(t_st is not None and t_st.data.get("status") == "done",
+               f"source-fix + passing test proves green "
+               f"({t_st.data.get('status') if t_st else None})")
+        pr_st = [d for d in g.objects(type="decision")
+                 if d.data.get("kind") == "submit_pr"
+                 and (d.data.get("metadata") or {}).get("lab_branch_id") == b_st.id]
+        c.that(len(pr_st) == 1 and pr_st[0].data.get("status") == "pending",
+               "a PENDING submit_pr is opened (both the command AND the new "
+               "test passed)")
+        print("  prove: full target file → source fix + executed test → "
+              "PENDING submit_pr")
+
+        # ── Leg 4 (ADR-039): the branch#1704 trap — a TEST-ONLY no-op. The
+        # proof command is green regardless, but the authored test, run
+        # directly against the UNFIXED clone, FAILS → not proven → no PR. ────
+        b_to = drive(spec["author_test_only"])
+        t_to = task_for(b_to.id)
+        to_runs = [o for o in _lab_obs(g, "code_authored_run")
+                   if (o.data.get("metadata") or {}).get("lab_branch_id") == b_to.id]
+        c.that(len(to_runs) == spec["settings"]["code_author_max_attempts"],
+               f"the test-only no-op retried up to the bound "
+               f"({len(to_runs)}/{spec['settings']['code_author_max_attempts']})")
+        to_meta = (to_runs[-1].data.get("metadata") or {}) if to_runs else {}
+        to_run = to_meta.get("run") or {}
+        c.that((to_run.get("after_diff") or {}).get("exit_code") == 0
+               and (to_run.get("regression") or {}).get("exit_code") not in (0, None),
+               "the proof command passed but the authored test FAILED against "
+               "the unfixed source (the false-green is caught)")
+        to_gap = [e for e in g.objects(type="evaluation")
+                  if (e.data.get("metadata") or {}).get("lab") == "code_authoring_failed"
+                  and (e.data.get("metadata") or {}).get("lab_branch_id") == b_to.id]
+        c.that(len(to_gap) == 1,
+               "an honest authoring_unproven gap is recorded for the no-op")
+        c.that(t_to is not None and t_to.data.get("status") == "rejected",
+               f"the test-only no-op is rejected "
+               f"({t_to.data.get('status') if t_to else None})")
+        pr_to = [d for d in g.objects(type="decision")
+                 if d.data.get("kind") == "submit_pr"
+                 and (d.data.get("metadata") or {}).get("lab_branch_id") == b_to.id]
+        c.that(not pr_to,
+               "a self-repair whose regression test never proves opens NO "
+               "submit_pr (unexecuted/failing test → unproven)")
+        print("  trap: test-only no-op → authored test fails → unproven, no PR")
     finally:
         repo_sandbox.set_clone_hook(None)
         github_write.set_pr_opener(None)
@@ -3300,6 +3393,55 @@ def run_submit_pr() -> bool:
                and g.get_object(artifact2.id).data.get("status") == "rejected",
                "rejection records a pr_rejected observation; the artifact is rejected")
         print(f"  reject: no PR, no token; pr_rejected recorded")
+
+        # ── Phase 3 (ADR-039): an approved submit_pr whose PR open FAILS records
+        # a CLASSIFIED pr_failed — a credential wall (branch#1704: a bad
+        # GITHUB_WRITE_TOKEN, "Bad credentials") distinct from any other
+        # git/API error, so the operator's token replacement is unambiguous. ──
+        def err_opener(msg):
+            def _op(repo, *, head_branch, base, title, body, files):
+                return {"error": msg}
+            return _op
+
+        github_write.set_pr_opener(err_opener(
+            "could not read base ref 'main': Bad credentials"))
+        _, dec_c = propose_submit_pr_fn(
+            g, change["repo"], head_branch="lab/cred-fail", base="main",
+            title="A change whose PR open hits a credential wall",
+            diff=change["diff"], files=change["files"], branch_id=branch.id,
+            proof_refs=[proof.id])
+        rt.run_until_idle()
+        approve_decision_fn(g, dec_c.id, True, "ship it (the token is bad though)")
+        rt.run_until_idle()
+        failed_c = [o for o in _lab_obs(g, "pr_failed")
+                    if (o.data.get("metadata") or {}).get("decision_id") == dec_c.id]
+        c.that(len(failed_c) == 1
+               and (failed_c[0].data.get("metadata") or {}).get("failure_class")
+               == "credentials"
+               and "credential" in (failed_c[0].data.get("text") or "").lower(),
+               "a credential PR failure is recorded as failure_class=credentials, "
+               "self-classifying for the next attempt")
+
+        github_write.set_pr_opener(err_opener(
+            "could not commit 'check.py': a merge conflict in the tree"))
+        _, dec_o = propose_submit_pr_fn(
+            g, change["repo"], head_branch="lab/other-fail", base="main",
+            title="A change whose PR open hits a git error",
+            diff=change["diff"], files=change["files"], branch_id=branch.id,
+            proof_refs=[proof.id])
+        rt.run_until_idle()
+        approve_decision_fn(g, dec_o.id, True, "ship it")
+        rt.run_until_idle()
+        failed_o = [o for o in _lab_obs(g, "pr_failed")
+                    if (o.data.get("metadata") or {}).get("decision_id") == dec_o.id]
+        c.that(len(failed_o) == 1
+               and (failed_o[0].data.get("metadata") or {}).get("failure_class")
+               == "other",
+               "a non-credential PR failure classifies distinctly as "
+               "failure_class=other")
+        github_write.set_pr_opener(mock_opener)  # restore for any later use
+        print("  fail-class: credential wall vs other git/API error recorded "
+              "distinctly")
 
         # ── write-token sentinel: NOTHING the flow wrote carries the token ──
         import json as _json

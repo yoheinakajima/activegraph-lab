@@ -48,6 +48,7 @@ import difflib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -345,6 +346,44 @@ def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     return None
 
 
+# ── proof integrity: actually execute an authored regression test (ADR-039) ──
+# The self-repair proof command is the lab's OWN harness
+# (`python -m lab_pack.fixtures.run_fixtures`), which does NOT run pytest files
+# under lab_pack/tests/. So an authored change that ADDS a pytest regression
+# test would never have that test executed by the proof command — a test-only
+# "fix" sailed through green (branch#1704: a no-op fix that modified no source
+# yet reported 36/36). The integrity rule (ADR-039): when an authored change
+# adds or modifies a test, the proof MUST run THAT test directly with pytest,
+# in addition to the proof command, and the fix is proven only if the test is
+# actually executed AND passes — an unexecuted test can never confabulate a
+# green proof.
+
+
+def _pytest_command(test_paths: list[str]) -> str:
+    """The command that runs the authored regression test(s) directly. `python
+    -m pytest` (not bare `pytest`) so the repo root (cwd) is on sys.path — a
+    test importing a top-level module of the cloned repo resolves. The cache
+    provider is disabled so no .pytest_cache is written into the clone."""
+    joined = " ".join(shlex.quote(p) for p in test_paths)
+    return f"python -m pytest {joined} -p no:cacheprovider -q"
+
+
+def _regression_executed_and_passed(run: dict) -> bool:
+    """Was the authored regression test ACTUALLY executed and green? pytest
+    exits 0 only when ≥1 test was collected and all passed; it exits 5 when no
+    test was collected (the unexecuted-test case) and nonzero on failure. The
+    'no tests ran' string is a belt-and-suspenders guard against an all-skipped
+    or all-deselected run that still exits 0."""
+    if not run:
+        return False
+    if run.get("exit_code") != 0:
+        return False
+    out = ((run.get("stdout") or "") + "\n" + (run.get("stderr") or "")).lower()
+    if "no tests ran" in out or "no tests collected" in out:
+        return False
+    return True
+
+
 def run_repo_task(
     repo: str,
     command: str,
@@ -352,6 +391,7 @@ def run_repo_task(
     ref: Optional[str] = None,
     diff: Optional[str] = None,
     new_files: Optional[dict[str, str]] = None,
+    test_paths: Optional[list[str]] = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     mem_limit_mb: int = DEFAULT_MEM_LIMIT_MB,
 ) -> dict[str, Any]:
@@ -364,6 +404,13 @@ def run_repo_task(
                       (difflib over the cloned original) so no hand-computed
                       hunk header can be wrong. `new_files` wins if both given.
 
+    `test_paths` (ADR-039): repo-relative paths of authored regression tests
+    that the proof command does NOT itself run (the lab's harness does not run
+    pytest files). When given, after the proof command passes the lab runs
+    those tests DIRECTLY with pytest — and the fix is `proven` only if they are
+    actually executed AND pass. A test that is never executed can never produce
+    a green proof.
+
     Returns a structured result:
 
         {
@@ -371,10 +418,13 @@ def run_repo_task(
           "baseline":   {command, exit_code, timed_out, duration_seconds,
                          stdout, stderr, error},
           "after_diff": {...} | None,     # present only for a fix-task
+          "regression": {...} | None,     # the authored test run (test_paths)
+          "regression_paths": [str] | None,
           "diff":       str | None,       # the patch actually applied — the
                          # git-apply-valid one BUILT from new_files, or the
                          # supplied diff; this is what an approved PR carries
-          "proven":     bool,             # the run that decides success exited 0
+          "proven":     bool,             # the deciding run(s) passed: the proof
+                         # command exited 0 AND every authored test executed+green
           "changed_files": {path: content} | None,  # a PROVEN fix-task only:
                          # the post-fix file states the PR commits (ADR-036)
           "error":      str | None,       # refusal / clone / apply failure
@@ -386,7 +436,8 @@ def run_repo_task(
     """
     base_result: dict[str, Any] = {
         "repo": repo, "ref": ref, "command": command,
-        "baseline": None, "after_diff": None, "diff": None, "proven": False,
+        "baseline": None, "after_diff": None, "regression": None,
+        "regression_paths": None, "diff": None, "proven": False,
         "changed_files": None, "error": None,
     }
     allow_err = _check_repo(repo)
@@ -435,8 +486,19 @@ def run_repo_task(
                 return base_result
             after = _exec(command, repo_dir, timeout_seconds, mem_limit_mb)
             base_result["after_diff"] = after
-            base_result["proven"] = (after.get("exit_code") == 0)
-            if base_result["proven"]:
+            proven = (after.get("exit_code") == 0)
+            # ADR-039: when the change authored a regression test, the proof
+            # command alone is not enough — the lab's harness does not run
+            # pytest files, so a test-only no-op fix would pass falsely. Run
+            # the authored test(s) DIRECTLY and require they execute AND pass.
+            if proven and test_paths:
+                regression = _exec(_pytest_command(test_paths), repo_dir,
+                                   timeout_seconds, mem_limit_mb)
+                base_result["regression"] = regression
+                base_result["regression_paths"] = list(test_paths)
+                proven = proven and _regression_executed_and_passed(regression)
+            base_result["proven"] = proven
+            if proven:
                 # The fix is proven — read back the patched file states so the
                 # PR can commit concrete contents (ADR-036). Only on success:
                 # an unproven diff is not a fix to land.
@@ -511,15 +573,36 @@ def clone_and_read(
         rel_paths.sort()
         out["tree"] = rel_paths[:500]
 
-        # Read hint files first, then the rest, smallest-readable first, until
-        # the file-count or total-char budget is spent.
-        ordered: list[str] = []
+        # Hint (target) files first, read in FULL — PHASE 2 (ADR-039): the
+        # authoring step EDITS these, so it must see each one ENTIRE; a
+        # truncated target file is the branch#1704 failure ("the source was
+        # truncated in the request" → the worker could not author the real fix
+        # and fell back to a test-only no-op). Hint files are ALWAYS included
+        # and never truncated; the budget below bounds only the extra context.
         hints = [h.replace(os.sep, "/").lstrip("./") for h in (hint_paths or [])]
+        hint_present: list[str] = []
         for h in hints:
-            if h in rel_paths and h not in ordered:
-                ordered.append(h)
+            if h in rel_paths and h not in hint_present:
+                hint_present.append(h)
+        hint_set = set(hint_present)
+
+        total = 0
+        for rel in hint_present:
+            full = os.path.normpath(os.path.join(repo_dir, rel))
+            if not full.startswith(root + os.sep):
+                continue  # never follow a traversal out of the repo
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    content = f.read()  # FULL — no per-file cap, no truncation
+            except (OSError, UnicodeDecodeError):
+                continue
+            out["files"][rel] = content
+            total += len(content)
+
+        # Then fill the remaining budget with other text sources, smallest
+        # first. These are CONTEXT, not the targets, so they stay bounded.
         rest = [p for p in rel_paths
-                if p not in ordered
+                if p not in hint_set
                 and os.path.splitext(p)[1].lower() in _CONTEXT_TEXT_EXT]
 
         def _size(p: str) -> int:
@@ -528,10 +611,8 @@ def clone_and_read(
             except OSError:
                 return 1 << 30
         rest.sort(key=_size)
-        ordered += rest
 
-        total = 0
-        for rel in ordered:
+        for rel in rest:
             if len(out["files"]) >= max_files or total >= max_total_chars:
                 break
             full = os.path.normpath(os.path.join(repo_dir, rel))
@@ -565,6 +646,11 @@ def evidence_summary(result: dict[str, Any]) -> str:
         parts.append(f"after diff exit={after.get('exit_code')} "
                      f"({after.get('duration_seconds')}s"
                      f"{', TIMED OUT' if after.get('timed_out') else ''})")
+    reg = result.get("regression")
+    if reg is not None:
+        executed = _regression_executed_and_passed(reg)
+        parts.append(f"authored test exit={reg.get('exit_code')} "
+                     f"({'executed+passed' if executed else 'NOT executed/passed'})")
     verdict = "PROVEN (green)" if result.get("proven") else "not proven"
     return (f"sandbox: {result['repo']} — "
             + "; ".join(parts) + f" → {verdict}")

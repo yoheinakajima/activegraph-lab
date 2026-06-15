@@ -22,6 +22,11 @@ dependencies = [
     "anthropic>=0.34",
     "openai>=1.40",
     "pyyaml>=6.0",
+    # The self-repair sandbox runs an authored regression test directly with
+    # `python -m pytest` to PROVE it executes-and-passes (ADR-039); the proof
+    # harness (run_fixtures) does not collect pytest files, so pytest must be
+    # present in the runtime the sandbox clones into.
+    "pytest>=7.0",
 ]
 
 # Replit's package layer rejects direct-URL requirements in [project.dependencies]

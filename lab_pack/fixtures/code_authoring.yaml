@@ -37,3 +37,34 @@ author_fail:
     never pass, so no authored diff can make it green.)
   repo: yoheinakajima/activegraph-lab
   command: "false"
+
+# Leg 3 (ADR-039 proof integrity) — a fix that modifies SOURCE and adds a
+# passing regression test. The proof command (`python -c pass`) is green
+# REGARDLESS (it models a suite that does not exercise the bug — the
+# branch#1704 false-green shape). The mock authors the widget.py source fix AND
+# tests/test_widget.py; the lab runs THAT test directly with pytest, it passes
+# against the fixed source, and the fix proves green → a PENDING submit_pr.
+# widget.py is seeded LARGE (>20k chars) so this also proves the FULL target
+# file reaches the authoring context uncut (Phase 2).
+author_source_and_test:
+  title: Author the widget.py source fix and a regression test
+  brief: >
+    widget.py has a defect: answer() returns the wrong value and must return 42.
+    Fix the source in widget.py and add a regression test that exercises it.
+    [[FIX widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""
+
+# Leg 4 (ADR-039 proof integrity) — the branch#1704 trap: a TEST-ONLY change
+# that adds a regression test but does NOT fix the source. The proof command is
+# green regardless, but the authored test, run DIRECTLY with pytest against the
+# UNFIXED clone, FAILS — so the fix is NOT proven, the loop records an honest
+# gap, and opens NO submit_pr. A test that never proves can no longer
+# confabulate a green check.
+author_test_only:
+  title: Author a test-only no-op (must be caught)
+  brief: >
+    widget.py answer() must return 42. Add a regression test for it.
+    [[TESTONLY widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""

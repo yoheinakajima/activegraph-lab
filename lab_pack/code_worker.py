@@ -64,6 +64,23 @@ _AUTHOR_PROMPT = _PROMPTS["code_author"]
 # diff-authoring step reads these first as the "relevant files" (ADR-037).
 _PATH_RE = re.compile(r"[\w][\w./\-]*\.[A-Za-z0-9]{1,8}")
 
+
+def _is_test_path(path: str) -> bool:
+    """Is this authored file a pytest test the proof command would NOT run
+    (ADR-039)? A `.py` whose basename is `test_*`/`*_test`, or any `.py` placed
+    under a tests/ or test/ directory. conftest.py is fixture wiring, not a
+    test. The lab runs these directly with pytest so a self-repair cannot land
+    on a regression test that was never executed (branch#1704)."""
+    p = (path or "").replace("\\", "/").lower()
+    if not p.endswith(".py"):
+        return False
+    base = p.rsplit("/", 1)[-1]
+    if base == "conftest.py":
+        return False
+    if base.startswith("test_") or base.endswith("_test.py"):
+        return True
+    return any(seg in ("tests", "test") for seg in p.split("/")[:-1])
+
 # github.com/<owner>/<repo>[...] → owner/repo (drop a trailing .git / path)
 _REPO_RE = re.compile(r"github\.com[/:]([\w.\-]+/[\w.\-]+?)(?:\.git)?(?:[/#?\s]|$)")
 # A fenced or inline `command: …` the operator can put in an intent/direction.
@@ -175,6 +192,10 @@ def _run_metadata(result: dict) -> dict:
     return {"repo": result.get("repo"), "ref": result.get("ref"),
             "baseline": _compact(result.get("baseline")),
             "after_diff": _compact(result.get("after_diff")),
+            # ADR-039: the authored regression test's OWN run — the proof that
+            # the test was actually executed, not merely added.
+            "regression": _compact(result.get("regression")),
+            "regression_paths": result.get("regression_paths"),
             "proven": bool(result.get("proven")),
             # The post-fix file states a proven diff produced (ADR-036): the
             # concrete contents an approved submit_pr commits. Never a secret —
@@ -240,9 +261,14 @@ def _authoring_request_text(brief, command, repo, files, tree, attempt,
         f"\nBRIEF:\n{brief}",
     ]
     if files:
+        # PHASE 2 (ADR-039): render each relevant file in FULL — the target
+        # file the step edits must reach the model uncut. clone_and_read
+        # already reads target (hint) files whole and bounds only the extra
+        # context, so there is no truncation to re-impose here (the [:6000]
+        # slice was the branch#1704 truncation that starved the real fix).
         parts.append("\nRELEVANT FILES:")
         for path, content in list(files.items())[:24]:
-            parts.append(f"\n--- {path} ---\n{(content or '')[:6000]}")
+            parts.append(f"\n--- {path} ---\n{content or ''}")
     elif tree:
         parts.append("\nREPO FILES (no file body read):\n"
                      + ", ".join(tree[:60]))
@@ -292,9 +318,22 @@ def _emit_authoring_request(graph, settings, *, task_data, task_id, branch_id,
 
 def _failure_excerpt(result: dict) -> str:
     """A short, secret-free excerpt of why an authored diff did not pass: the
-    apply/clone error, else the deciding run's stderr/stdout tail."""
+    apply/clone error, else the authored regression test's failure when IT is
+    the part that did not prove (ADR-039 — a test that was never executed or
+    failed against the change), else the deciding command's stderr/stdout tail."""
     if result.get("error"):
         return f"sandbox error: {result['error']}"
+    reg = result.get("regression")
+    after = result.get("after_diff") or {}
+    # The proof command passed but the authored test did not execute-and-pass:
+    # name THAT failure precisely so the retry fixes the test/source, not the
+    # command (the branch#1704 unexecuted-test trap).
+    if (after.get("exit_code") == 0 and reg is not None
+            and reg.get("exit_code") != 0):
+        tail = (reg.get("stderr") or "").strip() or (reg.get("stdout") or "").strip()
+        return (f"the proof command passed but the authored regression test "
+                f"did not execute-and-pass (pytest exit={reg.get('exit_code')}): "
+                f"{tail[-1000:]}")
     run = result.get("after_diff") or result.get("baseline") or {}
     tail = (run.get("stderr") or "").strip() or (run.get("stdout") or "").strip()
     code = run.get("exit_code")
@@ -764,8 +803,14 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
         _fail_task(graph, task_id,
                    "code_worker: code_run_cap < 2 — cannot prove an authored fix")
         return
+    # ADR-039 (proof integrity): the authored test files the proof command
+    # would NOT run on its own. The sandbox runs them DIRECTLY with pytest and
+    # the fix proves only if they execute AND pass — a test-only no-op fix
+    # (modifying no source) fails its own regression test against the unfixed
+    # clone and is correctly rejected (branch#1704's false green).
+    test_paths = [p for p in new_files if _is_test_path(p)]
     result = run_repo_task(repo, command, ref=ref, new_files=new_files,
-                           timeout_seconds=timeout)
+                           test_paths=test_paths, timeout_seconds=timeout)
     # The patch the lab BUILT and applied (git-apply-valid by construction) —
     # this is what rides to submit_pr, never a model-authored diff string.
     diff = result.get("diff") or ""
@@ -786,6 +831,8 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
                      # the files the model authored, for the public record.
                      "authored_diff": diff,
                      "authored_files": sorted(new_files),
+                     # ADR-039: the authored tests the proof executed directly.
+                     "authored_tests": sorted(test_paths),
                      "authoring_notes": (getattr(out, "notes", "") or "")[:500],
                      "seam_versions": stamp, "run": _run_metadata(result)},
     })
