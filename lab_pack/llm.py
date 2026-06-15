@@ -335,7 +335,31 @@ class LabMockProvider:
                     f"(mock authoring {digest}).\n"
                     f"def test_defect_fixed():\n"
                     f"    assert True\n"))
-            if "sys.exit(1)" in blob:
+            # ADR-039 proof-integrity legs: author a regression test that
+            # GENUINELY depends on the source module `widget.py` in the clone
+            # (asserts answer() == 42), so the proof's DIRECT pytest run decides
+            # pass/fail honestly. [[FIX widget]] → author the source fix AND the
+            # test (both prove green); [[TESTONLY widget]] → author ONLY the
+            # test, which FAILS against the unfixed clone (the branch#1704
+            # test-only no-op the proof must now catch).
+            widget_test = AuthoredFile(
+                path="tests/test_widget.py",
+                content=("from widget import answer\n\n\n"
+                         "def test_answer():\n"
+                         "    assert answer() == 42\n"))
+            if "[[FIX widget" in blob:
+                parsed = AuthoredDiff(
+                    files=[AuthoredFile(path="widget.py",
+                                        content="def answer():\n    return 42\n"),
+                           widget_test],
+                    notes=(f"Fixes widget.answer() to return 42 and adds a "
+                           f"regression test (tests/test_widget.py). [mock {digest}]"))
+            elif "[[TESTONLY widget" in blob:
+                parsed = AuthoredDiff(
+                    files=[widget_test],
+                    notes=(f"Adds a regression test (tests/test_widget.py) for "
+                           f"widget.answer() WITHOUT a source fix. [mock {digest}]"))
+            elif "sys.exit(1)" in blob:
                 # The fix the brief implies: emit the repaired check.py (exits
                 # 0) as full content, and add the regression test the brief
                 # asks for. The lab diffs this against the cloned original.

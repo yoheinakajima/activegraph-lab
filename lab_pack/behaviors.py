@@ -1778,6 +1778,33 @@ def index_pending_decision(graph, decision_id: str, data: dict) -> None:
             bucket.append(decision_id)
 
 
+def _classify_pr_failure(error: str) -> tuple[str, str]:
+    """Classify a PR-open failure so the next attempt's outcome is
+    self-classifying (PHASE 3, ADR-039). Returns (class, operator_hint).
+
+    branch#1704 hit "could not read base ref 'main': Bad credentials" — a bad
+    GITHUB_WRITE_TOKEN, not a code/git problem. Distinguishing a CREDENTIAL
+    wall (Bad credentials / 401 / 403 / unauthorized) from any other git/API
+    error makes the operator's token replacement unambiguous: the next
+    submit_pr either clears (token fixed) or recurs as `credentials` (still
+    bad). A rate-limit 403 is called out separately — it is not a bad token."""
+    e = (error or "").lower()
+    if "rate limit" in e or "rate-limit" in e:
+        return ("rate_limit", "GitHub API rate limit — retry later, the token "
+                              "is fine")
+    cred_markers = ("bad credentials", " 401", "(401", "unauthorized",
+                    " 403", "(403", "forbidden", "requires authentication",
+                    "must be authenticated", "resource not accessible",
+                    "not accessible by")
+    if any(m in e for m in cred_markers):
+        return ("credentials",
+                "credential error — GITHUB_WRITE_TOKEN is missing, invalid, or "
+                "lacks pull-request write scope on this repo; replace the token "
+                "and re-approve. No code change is needed")
+    return ("other", "git/API error — see the message; the diff is in the "
+                     "artifact for a manual PR")
+
+
 def _apply_submit_pr(graph, artifact_id: str, decision_id: str,
                      status: str, decision_data: dict) -> None:
     """Apply a resolved submit_pr decision (ADR-035). Approved → exercise the
@@ -1824,15 +1851,20 @@ def _apply_submit_pr(graph, artifact_id: str, decision_id: str,
         base=spec.get("base") or "main", title=spec.get("title") or "Lab change",
         body=spec.get("body") or "", files=a_meta.get("files") or {})
     if result.get("error"):
+        # PHASE 3 (ADR-039): classify the failure so the recorded text is
+        # self-classifying — a credential wall reads differently from a
+        # git/API error, and the operator's token replacement is unambiguous
+        # on the next attempt.
+        failure_class, hint = _classify_pr_failure(result["error"])
         obs = graph.add_object("observation", {
             "text": (f"submit_pr approved for {repo} but the PR could not be "
-                     f"opened: {result['error']}. No PR exists; the operator "
-                     "can open it manually from the diff."),
+                     f"opened ({hint}): {result['error']}. No PR exists; the "
+                     "operator can open it manually from the diff."),
             "confidence": 1.0,
             "category": "risk",
             "metadata": {"lab": "pr_failed", "artifact_id": artifact_id,
                          "lab_branch_id": branch_id, "decision_id": decision_id,
-                         "repo": repo},
+                         "repo": repo, "failure_class": failure_class},
         })
     else:
         meta = dict(a_meta)
