@@ -107,28 +107,58 @@ class CodeOutcome(BaseModel):
     )
 
 
-class AuthoredDiff(BaseModel):
-    """Structured output for the code_author behavior (ADR-037, diff authoring).
+class AuthoredFile(BaseModel):
+    """One changed (or new) file the code_author behavior emits (ADR-038).
 
-    The model AUTHORS a unified diff implementing the fix the brief describes,
-    over the cloned repo's relevant files. The lab then applies the diff in the
-    sandbox and runs the proof command — the RUN decides success, never the
-    model. When the brief describes a defect the diff must also add or extend a
+    The model supplies INTENT — the complete desired contents of a file — and
+    the lab supplies patch MECHANICS: it diffs this content against the cloned
+    original deterministically (difflib) and applies the git-generated patch.
+    The model never hand-computes a unified diff or a `@@` hunk header."""
+
+    path: str = Field(
+        description=(
+            "Repo-relative path of the file to change or create (e.g. "
+            "`lab_pack/behaviors.py`, `tests/test_regression_x.py`)."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "The COMPLETE new contents of this file — the entire file as it "
+            "should read AFTER the fix, not a diff and not a fragment. The lab "
+            "computes the patch by diffing this against the cloned original, so "
+            "include every line the file must keep, exactly as-is."
+        ),
+    )
+
+
+class AuthoredDiff(BaseModel):
+    """Structured output for the code_author behavior (ADR-037, amended by
+    ADR-038: full-content authoring).
+
+    The model AUTHORS the fix the brief describes by emitting, per changed
+    file, the FULL new file content — NOT a unified diff. The lab then
+    constructs the patch DETERMINISTICALLY (difflib over the cloned original +
+    this content), applies it in the sandbox, and runs the proof command — the
+    RUN decides success, never the model. Hand-computed `@@` hunk headers (the
+    standard LLM diff-authoring failure, branch#1667) are removed entirely:
+    the model supplies intent, the tooling supplies correct patch mechanics.
+    When the brief describes a defect the files must also add or extend a
     regression test that fails without the fix."""
 
-    diff: str = Field(
+    files: list[AuthoredFile] = Field(
+        default_factory=list,
         description=(
-            "A valid unified diff in `git apply` format (`--- a/<path>`, "
-            "`+++ b/<path>`, `@@ … @@` hunks; `--- /dev/null` for a new file). "
-            "It must implement the fix the brief describes AND, when the brief "
-            "describes a defect, add or extend a regression test that fails "
-            "without the fix. Output ONLY the diff — no prose, no code fences."
+            "One entry per file the fix changes or creates, each carrying the "
+            "file's COMPLETE new contents. Implement the fix the brief "
+            "describes AND, when the brief describes a defect, add or extend a "
+            "regression test that fails without the fix. Touch only the files "
+            "the fix requires."
         ),
     )
     notes: str = Field(
         default="",
         description=(
-            "One or two sentences: what the diff changes and the regression "
+            "One or two sentences: what the change does and the regression "
             "test it adds/extends. No claim the fix is proven — the sandbox "
             "run decides that, not you."
         ),
@@ -284,43 +314,43 @@ class LabMockProvider:
                     + f"[mock {digest}]"),
             )
         elif name == "AuthoredDiff":
-            # The diff-authoring mock (ADR-037): a deterministic "model" that
-            # reads the relevant-file context in the prompt and authors a diff
-            # the sandbox can apply. Like the CodeOutcome mock reads exit codes,
-            # this reads the file under repair: when it sees the canned failing
-            # check (`sys.exit(1)`), it authors the one-line flip that makes the
-            # proof command pass AND adds a regression test (the brief asks for
-            # one) — so fixtures can prove brief → authored diff → applied →
-            # proof passes → submit_pr without a live LLM. The lab still decides
+            # The full-content authoring mock (ADR-037 amended by ADR-038): a
+            # deterministic "model" that reads the relevant-file context in the
+            # prompt and emits the FULL new contents of each changed file — NOT
+            # a unified diff. The lab constructs the patch deterministically, so
+            # the mock never hand-computes a `@@` header (the very failure
+            # branch#1667 hit). Like the CodeOutcome mock reads exit codes, this
+            # reads the file under repair: when it sees the canned failing check
+            # (`sys.exit(1)`), it emits the repaired check.py content AND a
+            # regression test (the brief asks for one) — so fixtures can prove
+            # brief → authored content → deterministic patch → applied → proof
+            # passes → submit_pr without a live LLM. The lab still decides
             # success from the RUN, never from this text.
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             test_path = f"tests/test_regression_{digest}.py"
-            regression = (
-                f"--- /dev/null\n"
-                f"+++ b/{test_path}\n"
-                f"@@ -0,0 +1,3 @@\n"
-                f"+# Regression test for the defect in the brief (mock authoring {digest}).\n"
-                f"+def test_defect_fixed():\n"
-                f"+    assert True\n")
+            regression = AuthoredFile(
+                path=test_path,
+                content=(
+                    f"# Regression test for the defect in the brief "
+                    f"(mock authoring {digest}).\n"
+                    f"def test_defect_fixed():\n"
+                    f"    assert True\n"))
             if "sys.exit(1)" in blob:
-                # The fix the brief implies: flip the failing check to pass, and
-                # add the regression test the brief asks for.
-                fix = (
-                    "--- a/check.py\n"
-                    "+++ b/check.py\n"
-                    "@@ -1 +1 @@\n"
-                    "-import sys; sys.exit(1)\n"
-                    "+import sys; sys.exit(0)\n")
+                # The fix the brief implies: emit the repaired check.py (exits
+                # 0) as full content, and add the regression test the brief
+                # asks for. The lab diffs this against the cloned original.
                 parsed = AuthoredDiff(
-                    diff=fix + regression,
-                    notes=("Flips the failing check to exit 0 and adds a "
+                    files=[AuthoredFile(path="check.py",
+                                        content="import sys; sys.exit(0)\n"),
+                           regression],
+                    notes=("Rewrites the failing check to exit 0 and adds a "
                            f"regression test ({test_path}). [mock {digest}]"))
             else:
                 # No recognizable target in context: author the regression test
-                # only (a new file always applies cleanly). The proof command
+                # only (a new file always diffs cleanly). The proof command
                 # decides whether that is enough.
                 parsed = AuthoredDiff(
-                    diff=regression,
+                    files=[regression],
                     notes=(f"Adds a regression test ({test_path}) for the "
                            f"defect described in the brief. [mock {digest}]"))
         elif name == "SeamProposal":
@@ -748,7 +778,7 @@ def _inert_output(output_schema: type, note: str) -> Any:
         if name == "CodeOutcome":
             return output_schema(summary=note)
         if name == "AuthoredDiff":
-            return output_schema(diff="", notes=note)
+            return output_schema(files=[], notes=note)
         if name == "SeamProposal":
             return output_schema(body="", rationale=note)
         if name == "BlogDraft":

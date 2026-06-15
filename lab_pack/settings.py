@@ -120,13 +120,15 @@ class LabSettings(BaseModel):
         ge=1,
         le=5,
         description=(
-            "Bound on the code_worker's diff-authoring retry loop (ADR-037): "
-            "the LLM authors a unified diff from the brief, the lab applies it "
-            "in the sandbox and runs the proof command, and on failure the "
-            "captured output is fed back for up to this many authoring attempts "
-            "total. After the bound, the worker records an honest 'authored a "
-            "diff but could not make it pass' evaluation and opens NO submit_pr "
-            "— a fix must earn its PR by proving in the sandbox."
+            "Bound on the code_worker's fix-authoring retry loop (ADR-037, "
+            "contract amended by ADR-038): the LLM emits the full new content "
+            "of each changed file from the brief, the lab BUILDS the patch "
+            "deterministically (difflib), applies it in the sandbox and runs "
+            "the proof command, and on failure the captured output is fed back "
+            "for up to this many authoring attempts total. After the bound, the "
+            "worker records an honest 'authored a diff but could not make it "
+            "pass' evaluation and opens NO submit_pr — a fix must earn its PR "
+            "by proving in the sandbox."
         ),
     )
     # ── self-dispatched code repair (ADR-036, the self-repair loop's planner) ─
