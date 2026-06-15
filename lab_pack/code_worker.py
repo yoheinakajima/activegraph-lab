@@ -232,9 +232,11 @@ def _authoring_request_text(brief, command, repo, files, tree, attempt,
     """The human/model-visible authoring request: brief, the relevant files,
     the proof command, and (on a retry) the previous attempt + its failure."""
     parts = [
-        f"Code-authoring request (attempt {attempt}/{max_attempts}): author a "
-        f"unified diff that fixes the defect below, to be applied and proved by "
-        f"running '{command}' against {repo}.",
+        f"Code-authoring request (attempt {attempt}/{max_attempts}): author the "
+        f"fix for the defect below by emitting the FULL new contents of each "
+        f"file to change or create (NOT a diff) — the lab builds the patch "
+        f"deterministically and proves it by running '{command}' against "
+        f"{repo}.",
         f"\nBRIEF:\n{brief}",
     ]
     if files:
@@ -245,7 +247,8 @@ def _authoring_request_text(brief, command, repo, files, tree, attempt,
         parts.append("\nREPO FILES (no file body read):\n"
                      + ", ".join(tree[:60]))
     if prev_diff:
-        parts.append("\nPREVIOUS ATTEMPT (did NOT pass — revise, do not "
+        parts.append("\nPREVIOUS ATTEMPT (the patch the lab built from your "
+                     "content did NOT pass — revise the file contents, do not "
                      f"repeat):\n{prev_diff[:4000]}")
     if prev_failure:
         parts.append(f"\nPREVIOUS FAILURE OUTPUT:\n{prev_failure[:4000]}")
@@ -685,18 +688,23 @@ def _maybe_propose_pr(graph, req_meta: dict, proof_eval_id: str,
     tools=[],
 )
 def code_author(event, graph, ctx, out, *, settings: LabSettings):
-    """Author a unified diff for a fix, apply + prove it in the sandbox, retry
-    up to the bound, and on a PROVEN fix hand off to the synthesis stage which
-    opens the gated submit_pr (ADR-037 — the self-repair loop's last mile).
+    """Author a fix as full file content, build the patch deterministically,
+    apply + prove it in the sandbox, retry up to the bound, and on a PROVEN fix
+    hand off to the synthesis stage which opens the gated submit_pr (ADR-037,
+    amended by ADR-038 — the self-repair loop's last mile).
 
     On: object.created (observation, metadata.lab code_authoring_request).
-    The LLM authors a diff from the brief + the relevant files (read from the
-    clone by code_intake). The lab applies it and runs the proof command — the
-    RUN decides success, never the model. Tests pass → emit the synthesis
-    request (the existing propose_pr → submit_pr path). Tests fail → feed the
-    failure back and retry, up to setting.code_author_max_attempts; still
-    failing → an honest 'authored a diff but could not make it pass'
-    evaluation, the task rejected, NO submit_pr (a fix must earn its PR).
+    The LLM emits, per changed file, the FULL new contents (not a unified diff)
+    from the brief + the relevant files (read from the clone by code_intake).
+    The lab BUILDS the patch deterministically (difflib over the cloned
+    original), applies it, and runs the proof command — the RUN decides
+    success, never the model, and the patch applies by construction (no
+    hand-computed hunk header, the branch#1667 failure). Tests pass → emit the
+    synthesis request carrying the git-built diff (the existing propose_pr →
+    submit_pr path). Tests fail → feed the failure back and retry, up to
+    setting.code_author_max_attempts; still failing → an honest 'authored a
+    diff but could not make it pass' evaluation, the task rejected, NO
+    submit_pr (a fix must earn its PR).
     """
     consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
@@ -720,50 +728,64 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
     if not task_id:
         return
 
-    diff = ((getattr(out, "diff", None) or "").strip()) if out is not None else ""
-    if out is None or is_inert(getattr(out, "notes", None)) or not diff:
-        # Inert/empty authoring output (LLM budget, pause, parse) — no diff was
-        # produced. Do NOT burn a retry on a non-authoring failure; record the
-        # honest gap and fail the task (the preceding anomaly observation has
-        # the cause).
+    # ADR-038: the model emits the FULL new contents of each changed file, not
+    # a unified diff. The lab builds the patch deterministically (in
+    # run_repo_task, via difflib over the cloned original), so a hand-computed
+    # hunk header can never be wrong — the branch#1667 failure mode is gone.
+    authored = getattr(out, "files", None) if out is not None else None
+    new_files = {f.path: (f.content or "")
+                 for f in (authored or []) if getattr(f, "path", None)}
+    if out is None or is_inert(getattr(out, "notes", None)) or not new_files:
+        # Inert/empty authoring output (LLM budget, pause, parse) — no content
+        # was produced. Do NOT burn a retry on a non-authoring failure; record
+        # the honest gap and fail the task (the preceding anomaly observation
+        # has the cause).
         _record_authoring_eval(
             graph, task_id, branch_id, repo,
-            (f"Diff authoring produced no usable output on attempt {attempt} "
-             f"(LLM budget, pause, or parse failure). No diff authored; opening "
-             f"no PR."), authored=False)
+            (f"Fix authoring produced no usable output on attempt {attempt} "
+             f"(LLM budget, pause, or parse failure). No content authored; "
+             f"opening no PR."), authored=False)
         _fail_task(graph, task_id,
-                   "code_worker: diff authoring produced no usable output (LLM "
+                   "code_worker: fix authoring produced no usable output (LLM "
                    "budget, pause, or parse failure)")
         return
 
     run_cap = max(1, int(effective_setting(graph, settings, "code_run_cap")))
     timeout = max(5, int(effective_setting(graph, settings,
                                            "sandbox_timeout_seconds")))
-    # Apply the authored diff and run the proof command (the apply + re-run is 2
-    # runs; with run_cap < 2 we cannot prove an authored diff, so fail honestly).
+    # Build the patch from the authored content, apply it, and run the proof
+    # command (the apply + re-run is 2 runs; with run_cap < 2 we cannot prove an
+    # authored fix, so fail honestly).
     if run_cap < 2:
         _record_authoring_eval(
             graph, task_id, branch_id, repo,
-            "Authored a diff but code_run_cap < 2 leaves no room to apply and "
+            "Authored a fix but code_run_cap < 2 leaves no room to apply and "
             "re-run to prove it; opening no PR.", authored=True)
         _fail_task(graph, task_id,
-                   "code_worker: code_run_cap < 2 — cannot prove an authored diff")
+                   "code_worker: code_run_cap < 2 — cannot prove an authored fix")
         return
-    result = run_repo_task(repo, command, ref=ref, diff=diff,
+    result = run_repo_task(repo, command, ref=ref, new_files=new_files,
                            timeout_seconds=timeout)
+    # The patch the lab BUILT and applied (git-apply-valid by construction) —
+    # this is what rides to submit_pr, never a model-authored diff string.
+    diff = result.get("diff") or ""
 
     source_id = _ensure_repo_source(graph, repo, ref)
     stamp = seam_versions_stamp(graph, "prompt.code_author")
     run_obs = graph.add_object("observation", {
-        "text": (f"Authored a fix diff (attempt {attempt}/{max_attempts}) and "
-                 f"applied it in the sandbox. " + evidence_summary(result)),
+        "text": (f"Authored a fix (attempt {attempt}/{max_attempts}) as full "
+                 f"file content, built the patch deterministically, and applied "
+                 f"it in the sandbox. " + evidence_summary(result)),
         "confidence": 0.9,
         "source_ids": [source_id],
         "category": "measurement",
         "metadata": {"lab": "code_authored_run", "task_id": task_id,
                      "lab_branch_id": branch_id, "source_id": source_id,
                      "attempt": attempt, "max_attempts": max_attempts,
+                     # The git-built patch (intent → mechanics, ADR-038) plus
+                     # the files the model authored, for the public record.
                      "authored_diff": diff,
+                     "authored_files": sorted(new_files),
                      "authoring_notes": (getattr(out, "notes", "") or "")[:500],
                      "seam_versions": stamp, "run": _run_metadata(result)},
     })
@@ -771,11 +793,11 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
         graph.add_relation(branch_id, run_obs.id, "supported_by")
 
     if result.get("proven"):
-        # The authored fix is proven in the sandbox. Hand the diff + the proven
-        # run (with the post-fix file states the PR commits) to the synthesis
-        # stage, which writes the honest summary, the sandbox_proven evaluation,
-        # completes the task, and opens the gated submit_pr — ADR-037 reuses
-        # ADR-035's last mile rather than duplicating it.
+        # The authored fix is proven in the sandbox. Hand the BUILT diff + the
+        # proven run (with the post-fix file states the PR commits) to the
+        # synthesis stage, which writes the honest summary, the sandbox_proven
+        # evaluation, completes the task, and opens the gated submit_pr —
+        # ADR-037 reuses ADR-035's last mile rather than duplicating it.
         _emit_synthesis_request(
             graph, title=_task_title(graph, task_id), task_id=task_id,
             branch_id=branch_id, repo=repo, command=command, result=result,

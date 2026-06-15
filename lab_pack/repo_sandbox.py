@@ -44,6 +44,7 @@ subprocess floor acceptable until then.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -263,6 +264,63 @@ def _read_changed_files(repo_dir: str, diff: str) -> dict[str, str]:
     return files
 
 
+# ── deterministic patch construction (ADR-038) ──────────────────────────────
+# The code_author step (ADR-037) emits the FULL new contents of each changed
+# file, NOT a unified diff — the standard LLM diff-authoring failure is a
+# hand-computed `@@` hunk header that `git apply` rejects (branch#1667,
+# observation#1675/#1680). The lab builds the patch HERE, deterministically:
+# read the cloned original, diff it against the model's new content with
+# difflib, and `git apply` the result. The model supplies intent; the tooling
+# supplies correct patch mechanics, so every authored patch applies by
+# construction.
+
+
+def _file_unified_diff(path: str, original: str, new: str) -> str:
+    """A single file's unified diff (git-apply format) from its original and
+    new contents, computed by difflib — never hand-written. Returns "" when the
+    content is unchanged. A new file (original "") emits a `--- /dev/null` /
+    `+++ b/<path>` fragment; an existing file emits `--- a/<path>` /
+    `+++ b/<path>`. Lines are normalized to end with a newline so the last hunk
+    line never runs into the next header (the classic difflib pitfall)."""
+    if original == new:
+        return ""
+    a = original.splitlines(keepends=True)
+    b = new.splitlines(keepends=True)
+    if a and not a[-1].endswith("\n"):
+        a[-1] += "\n"
+    if b and not b[-1].endswith("\n"):
+        b[-1] += "\n"
+    fromfile = f"a/{path}" if original else "/dev/null"
+    tofile = f"b/{path}"
+    return "".join(difflib.unified_diff(a, b, fromfile=fromfile, tofile=tofile))
+
+
+def build_diff_from_new_files(repo_dir: str,
+                              new_files: dict[str, str]) -> tuple[str, Optional[str]]:
+    """Construct one combined unified diff from authored full-file contents,
+    diffing each against its cloned original (ADR-038). Returns
+    (diff, error): a path escaping the repo dir is refused (error set); an
+    authored file identical to the original contributes no fragment. The diff
+    is git-apply-valid by construction — the caller applies it and the RUN
+    proves it."""
+    root = os.path.normpath(repo_dir)
+    parts: list[str] = []
+    for path, content in new_files.items():
+        rel = (path or "").replace(os.sep, "/").lstrip("./")
+        full = os.path.normpath(os.path.join(repo_dir, rel))
+        if not (full == root or full.startswith(root + os.sep)):
+            return "", f"refusing authored path outside the repo: {path}"
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                original = f.read()
+        except (OSError, UnicodeDecodeError):
+            original = ""  # a new file the fix creates
+        fragment = _file_unified_diff(rel, original, content or "")
+        if fragment:
+            parts.append(fragment)
+    return "".join(parts), None
+
+
 def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     """git apply a unified diff inside the cloned repo. Returns an error
     string or None."""
@@ -293,17 +351,29 @@ def run_repo_task(
     *,
     ref: Optional[str] = None,
     diff: Optional[str] = None,
+    new_files: Optional[dict[str, str]] = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     mem_limit_mb: int = DEFAULT_MEM_LIMIT_MB,
 ) -> dict[str, Any]:
-    """Clone an allowlisted repo, run `command`, and (for a fix-task) apply
-    `diff` and re-run to prove it. Returns a structured result:
+    """Clone an allowlisted repo, run `command`, and (for a fix-task) apply a
+    patch and re-run to prove it. The patch comes one of two ways:
+
+      * `diff`      — a candidate unified diff supplied with the task (ADR-036).
+      * `new_files` — {path: full new content} the code_author step emitted
+                      (ADR-037/038); the lab builds the patch DETERMINISTICALLY
+                      (difflib over the cloned original) so no hand-computed
+                      hunk header can be wrong. `new_files` wins if both given.
+
+    Returns a structured result:
 
         {
           "repo", "ref", "command",
           "baseline":   {command, exit_code, timed_out, duration_seconds,
                          stdout, stderr, error},
           "after_diff": {...} | None,     # present only for a fix-task
+          "diff":       str | None,       # the patch actually applied — the
+                         # git-apply-valid one BUILT from new_files, or the
+                         # supplied diff; this is what an approved PR carries
           "proven":     bool,             # the run that decides success exited 0
           "changed_files": {path: content} | None,  # a PROVEN fix-task only:
                          # the post-fix file states the PR commits (ADR-036)
@@ -316,7 +386,7 @@ def run_repo_task(
     """
     base_result: dict[str, Any] = {
         "repo": repo, "ref": ref, "command": command,
-        "baseline": None, "after_diff": None, "proven": False,
+        "baseline": None, "after_diff": None, "diff": None, "proven": False,
         "changed_files": None, "error": None,
     }
     allow_err = _check_repo(repo)
@@ -341,6 +411,21 @@ def run_repo_task(
 
         baseline = _exec(command, repo_dir, timeout_seconds, mem_limit_mb)
         base_result["baseline"] = baseline
+
+        # ADR-038: build the patch deterministically from authored full-file
+        # contents (diffing the cloned original) — never trust a model-written
+        # hunk header. The git-generated patch then flows through the SAME
+        # apply-and-prove path the supplied-diff case uses.
+        if new_files and not diff:
+            diff, build_err = build_diff_from_new_files(repo_dir, new_files)
+            if build_err:
+                base_result["error"] = build_err
+                return base_result
+            if not diff:
+                base_result["error"] = (
+                    "authored content matches the repo — no change to prove")
+                return base_result
+        base_result["diff"] = diff or None
 
         if diff:
             apply_err = _apply_diff(repo_dir, diff)

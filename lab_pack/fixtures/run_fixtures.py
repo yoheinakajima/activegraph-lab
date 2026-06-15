@@ -3099,9 +3099,25 @@ def run_code_authoring() -> bool:
         authored = ((runs[0].data.get("metadata") or {}).get("authored_diff")
                     or "") if runs else ""
         c.that("check.py" in authored and "sys.exit(0)" in authored,
-               "the AUTHORED diff implements the fix (flips the failing check)")
+               "the BUILT diff implements the fix (flips the failing check)")
         c.that("tests/test_regression" in authored,
-               "the authored diff ADDS a regression test (the brief asks for one)")
+               "the built diff ADDS a regression test (the brief asks for one)")
+        # ADR-038: the model emitted full file CONTENT; the lab built the patch
+        # deterministically. Prove the constructed patch is git-apply-valid —
+        # the branch#1667 failure ("corrupt patch") is gone by construction.
+        import shutil as _sh
+        import subprocess as _sp
+        import tempfile as _tf
+        _chk = _tf.mkdtemp(prefix="lab-applycheck-")
+        fake_clone(spec["author_pass"]["repo"], None, _chk)
+        with open(os.path.join(_chk, "authored.patch"), "w") as _pf:
+            _pf.write(authored if authored.endswith("\n") else authored + "\n")
+        _ac = _sp.run(["git", "apply", "--check", "authored.patch"],
+                      cwd=_chk, capture_output=True, text=True)
+        c.that(_ac.returncode == 0,
+               f"the CONSTRUCTED patch applies with `git apply --check` "
+               f"(rc={_ac.returncode}: {(_ac.stderr or '').strip()[:120]})")
+        _sh.rmtree(_chk, ignore_errors=True)
 
         c.that(t_pass is not None and t_pass.data.get("status") == "done",
                f"the proven authored fix completes the task "
