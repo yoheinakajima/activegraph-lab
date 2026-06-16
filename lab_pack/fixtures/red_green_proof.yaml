@@ -62,3 +62,15 @@ source_fix_bad_test:
     [[FIXBADTEST widget]]
   repo: yoheinakajima/activegraph-lab
   command: "python -c \"pass\""
+
+# Leg 5 — branch#1796 reproduction: the worker, unable to see the target file,
+# authors ONLY a NOTE markdown — no source change, no test. The proof command
+# is green regardless, but a doc/markdown-only diff proves nothing: baseline_red
+# is never even computed (there is no test to go red) yet the old code reported
+# proven=true. authored_unproven by definition → NO submit_pr.
+note_only:
+  title: Author a NOTE-only no-op (must be caught)
+  brief: >
+    widget.py answer() must return 42. Fix it. [[NOTEONLY]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""

@@ -3289,10 +3289,12 @@ def run_red_green_proof() -> bool:
     """ADR-040: red-then-green proof for any authored test — pytest OR fixture
     .yaml. A self-repair's regression test must FAIL against the unfixed
     baseline (red) and PASS after the fix (green). A test green on the baseline
-    proves nothing (branch#1751's vacuous fixture; branch#1704's no-op). Four
+    proves nothing (branch#1751's vacuous fixture; branch#1704's no-op). Five
     legs: a real source fix + a red-green FIXTURE → submit_pr; a fix + a VACUOUS
     fixture (green on baseline) → unproven, no PR; a test-only no-op (pytest) →
-    unproven, no PR; a source fix whose test stays red after → unproven, no PR."""
+    unproven, no PR; a source fix whose test stays red after → unproven, no PR;
+    a NOTE/markdown-only no-op (branch#1796) → unproven, no PR (proven must agree
+    with the red-green verdict — no false green through the no-test path)."""
     spec = _load("red_green_proof.yaml")
     print("\n" + "=" * 64)
     print("Fixture: red_green_proof — authored test must be RED on the unfixed "
@@ -3444,6 +3446,32 @@ def run_red_green_proof() -> bool:
                "a source fix whose test stays red is unproven — NO submit_pr")
         print("  source-fix-bad-test: stays red after → unproven, no PR")
 
+        # ── Leg 5: branch#1796 — a NOTE/markdown-only no-op → unproven, no PR ──
+        # The suite is green regardless, but a diff that changes no SOURCE and
+        # authors no red-then-green test proves nothing. metadata.proven and the
+        # submit_pr trigger derive from the SAME predicate — they must agree.
+        b5 = drive(spec["note_only"])
+        t5 = task_for(b5.id)
+        m5 = last_run_meta(b5.id)
+        run5 = m5.get("run") or {}
+        c.that((run5.get("after_diff") or {}).get("exit_code") == 0
+               and run5.get("proven") is False
+               and not (m5.get("authored_tests") or []),
+               "a doc-only diff with a GREEN suite is NOT proven (no source "
+               "change, no executed red-then-green test) — proven agrees with "
+               "the red-green verdict, they no longer disagree")
+        gap5 = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "code_authoring_failed"
+                and (e.data.get("metadata") or {}).get("lab_branch_id") == b5.id]
+        c.that(len(gap5) == 1
+               and "proves nothing" in (gap5[0].data.get("rationale") or ""),
+               "an honest authoring_unproven gap names the doc-only non-proof")
+        c.that(t5 is not None and t5.data.get("status") == "rejected"
+               and not pr_decs(b5.id),
+               "the NOTE/markdown-only self-repair opens NO submit_pr "
+               "(branch#1796 closed)")
+        print("  note-only: green suite, no source/test → unproven, no PR (branch#1796)")
+
         c.that(not opener_calls,
                "NO write token is exercised — every submit_pr stays the "
                "operator's tap")
@@ -3452,6 +3480,112 @@ def run_red_green_proof() -> bool:
         github_write.set_pr_opener(None)
 
     return c.done("red_green_proof")
+
+
+def run_target_file_delivery() -> bool:
+    """branch#1796 (THE ROOT BUG): the authoring context must deliver the target
+    file the brief named. A brief names a file by its BARE basename
+    ('research_worker.py'); the repo holds it at a full path
+    ('lab_pack/research_worker.py'). The old clone_and_read matched hints by
+    EXACT path only, so the named target never matched the tree, fell through to
+    the budget-bounded context fill, and was TRUNCATED or DROPPED — the worker
+    'could not see the file it was told to fix' (it wrote a
+    NOTE_TO_LAB_missing_source.md instead). The fix resolves a hint by
+    basename/suffix and reads it in FULL."""
+    spec = _load("target_file_delivery.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: target_file_delivery — a brief naming a file delivers that "
+          "file's FULL content to the authoring context (branch#1796)")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write, repo_sandbox
+
+    # A LARGE research_worker.py (>30k chars) in a SUBDIRECTORY, plus many small
+    # padding files to create budget pressure — the production shape. The bare
+    # name 'research_worker.py' in the brief must still resolve to this full
+    # path and reach the model UNCUT (the END marker sits past every budget /
+    # truncation bound the old code would have applied).
+    rw_pad = "".join(f"# research_worker line {i:04d} {'y' * 40}\n"
+                     for i in range(600))
+    research_worker = (
+        "# research_worker.py — lab-local research worker (fixture target).\n"
+        "def _source_urls(operator_urls, default_urls):\n"
+        "    # BUG: defaults ordered ahead of the operator's URLs.\n"
+        "    return default_urls + operator_urls\n"
+        + rw_pad
+        + "# RESEARCH_WORKER_END_MARKER\n")
+
+    def fake_clone(repo, ref, dest):
+        os.makedirs(os.path.join(dest, "lab_pack"), exist_ok=True)
+        with open(os.path.join(dest, "lab_pack", "research_worker.py"), "w") as f:
+            f.write(research_worker)
+        # Budget pressure: many small text files the budget fill would consume
+        # before ever reaching the large target if it were not a resolved hint.
+        for i in range(40):
+            with open(os.path.join(dest, f"pad_{i:02d}.py"), "w") as f:
+                f.write(f"# padding module {i}\nVALUE_{i} = {i}\n")
+        return None
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    c = Check()
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    # No approval happens → the write token must never be exercised.
+    opener_calls: list = []
+    github_write.set_pr_opener(
+        lambda *a, **k: (opener_calls.append((a, k)) or {"url": "x", "number": 0,
+                                                         "head": "x", "base": "x"}))
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        # ── unit-level: a brief naming research_worker.py resolves the bare name
+        # to the full tree path and reads it in FULL (the assertion the task asks
+        # for directly). ─────────────────────────────────────────────────────
+        ctx = repo_sandbox.clone_and_read(
+            spec["author"]["repo"], hint_paths=["research_worker.py"])
+        delivered = (ctx.get("files") or {}).get("lab_pack/research_worker.py")
+        c.that(len(research_worker) > 30_000
+               and delivered == research_worker
+               and "RESEARCH_WORKER_END_MARKER" in (delivered or ""),
+               f"clone_and_read resolves the BARE 'research_worker.py' to "
+               f"lab_pack/research_worker.py and reads it UNCUT "
+               f"({len(delivered or '')}/{len(research_worker)} chars)")
+
+        # ── end-to-end: the authoring request the worker actually receives
+        # carries the full target file, in both the canonical files_context AND
+        # the rendered RELEVANT FILES text. ──────────────────────────────────
+        bspec = spec["author"]
+        b = create_branch_fn(g, mission.id, bspec["title"],
+                             bspec["brief"].strip(), status="proposed")
+        rt.run_until_idle()
+        g.patch_object(b.id, {"metadata": {"code_task": {
+            "repo": bspec["repo"], "command": bspec["command"],
+            "propose_pr": True, "brief": bspec["brief"].strip()}}})
+        activate_branch_fn(g, b.id)
+        rt.run_until_idle()
+
+        reqs = [o for o in _lab_obs(g, "code_authoring_request")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == b.id]
+        ctx_full = ((reqs[0].data.get("metadata") or {}).get("files_context") or {}
+                    ).get("lab_pack/research_worker.py", "") if reqs else ""
+        c.that(bool(reqs) and ctx_full == research_worker
+               and "RESEARCH_WORKER_END_MARKER" in ctx_full,
+               f"the authoring request delivers research_worker.py UNCUT in "
+               f"files_context ({len(ctx_full)}/{len(research_worker)} chars)")
+        c.that(bool(reqs)
+               and "lab_pack/research_worker.py" in (reqs[0].data.get("text") or "")
+               and "RESEARCH_WORKER_END_MARKER" in (reqs[0].data.get("text") or ""),
+               "the rendered RELEVANT FILES shows the named target file uncut — "
+               "the worker can SEE the file it was told to fix (branch#1796)")
+        print("  delivery: bare 'research_worker.py' → full lab_pack/"
+              "research_worker.py in the authoring context")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        github_write.set_pr_opener(None)
+
+    c.that(not opener_calls, "no write token exercised in a delivery check")
+    return c.done("target_file_delivery")
 
 
 def run_submit_pr() -> bool:
@@ -4886,6 +5020,7 @@ def run_all() -> None:
         run_code_worker(),
         run_code_authoring(),
         run_red_green_proof(),
+        run_target_file_delivery(),
         run_submit_pr(),
         run_self_repair(),
         run_seam_proposal(),

@@ -52,6 +52,7 @@ from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
 from .llm import AuthoredDiff, CodeOutcome, consume_llm_anomalies, is_inert
 from .repo_sandbox import (
+    _diff_changes_source,
     _regression_executed_and_passed,
     clone_and_read,
     evidence_summary,
@@ -345,6 +346,16 @@ def _failure_excerpt(result: dict) -> str:
         return (f"the proof command passed but the authored regression test "
                 f"did not pass after the fix (exit={reg.get('exit_code')}): "
                 f"{tail[-1000:]}")
+    # ADR-040 hardening — the suite is green but the diff changed no SOURCE and
+    # authored no executed red-then-green test: a doc/markdown/NOTE-only no-op
+    # (branch#1796 wrote NOTE_TO_LAB_missing_source.md and nothing else). The
+    # green suite proves nothing — name THIS precisely, it is not a command or
+    # test failure but a non-proof by construction.
+    if (after.get("exit_code") == 0 and reg is None
+            and not _diff_changes_source(result.get("diff") or "")):
+        return ("the diff changed no source file and authored no red-then-green "
+                "regression test — a NOTE/markdown-only no-op. A green suite "
+                "over a doc-only change proves nothing; no PR.")
     run = result.get("after_diff") or result.get("baseline") or {}
     tail = (run.get("stderr") or "").strip() or (run.get("stdout") or "").strip()
     code = run.get("exit_code")
@@ -883,8 +894,8 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
     _record_authoring_eval(
         graph, task_id, branch_id, repo,
         (f"Authored a diff but could not make it pass after {max_attempts} "
-         f"attempt(s): running '{command}' against {repo} with the authored "
-         f"change applied did not exit 0. {failure} No PR opened."),
+         f"attempt(s): the authored change did not prove against {repo} "
+         f"running '{command}'. {failure} No PR opened."),
         authored=True)
     _fail_task(graph, task_id,
                f"code_worker: authored a diff but could not make it pass after "
