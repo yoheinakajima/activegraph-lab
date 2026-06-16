@@ -246,6 +246,33 @@ def _diff_target_paths(diff: str) -> list[str]:
     return out
 
 
+# Documentation/notes the suite never exercises. A self-repair fix that changes
+# ONLY these — no source, no authored red-then-green test — proves nothing: the
+# suite is green regardless of it (branch#1796 authored
+# NOTE_TO_LAB_missing_source.md and nothing else, yet the proof reported green).
+# Markdown/rst/txt and extensionless note files (NOTE_TO_LAB, README) are docs;
+# everything with a real code/config extension counts as source.
+_DOC_EXTENSIONS = frozenset({".md", ".markdown", ".rst", ".txt", ""})
+
+
+def _is_source_path(path: str) -> bool:
+    """A SOURCE/code/config file (.py, .yaml, .json, .toml, .sh, …) the suite
+    can actually exercise — NOT pure documentation. Markdown/rst/txt and
+    extensionless note files are documentation, never a proof of a code fix."""
+    base = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    ext = os.path.splitext(base)[1].lower()
+    return bool(ext) and ext not in _DOC_EXTENSIONS
+
+
+def _diff_changes_source(diff: str) -> bool:
+    """Does the diff change at least one SOURCE file — not only docs/notes? The
+    no-authored-test proof path (a source-only fix proven by a green suite) is
+    valid ONLY for a real source change; a NOTE/markdown-only diff is green
+    regardless and so proves nothing (branch#1796 — authoring_unproven by
+    definition)."""
+    return any(_is_source_path(p) for p in _diff_target_paths(diff))
+
+
 def _read_changed_files(repo_dir: str, diff: str) -> dict[str, str]:
     """The post-fix contents of the files a proven diff touched, read from the
     cloned-and-patched working tree — the concrete states the PR commits.
@@ -676,9 +703,15 @@ def run_repo_task(
                 proven = green_suite and green_test and baseline_red
             else:
                 # A source-only fix (no authored test): the existing suite must
-                # be green. (A DEFECT brief that authors no regression test
-                # therefore cannot prove green-without-red — it has no test.)
-                proven = green_suite
+                # be green AND the diff must change real SOURCE. A diff that
+                # touches only docs/notes (no source change, no red-then-green
+                # test) proves nothing — the suite is green regardless of it
+                # (branch#1796's NOTE_TO_LAB no-op: proven=true while
+                # baseline_red was never even computed). (A DEFECT brief that
+                # authors no regression test therefore cannot prove
+                # green-without-red — it has no test to go red, and a doc-only
+                # change has no source to exercise.)
+                proven = green_suite and _diff_changes_source(diff)
             base_result["proven"] = proven
             if proven:
                 # The fix is proven — read back the patched file states so the
@@ -702,6 +735,47 @@ _CONTEXT_TEXT_EXT = frozenset({
     ".py", ".md", ".txt", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".json",
     ".js", ".mjs", ".ts", ".tsx", ".sh", ".html", ".css", ".rst",
 })
+
+
+def _resolve_hint_paths(hint_paths: list[str], rel_paths: list[str]) -> list[str]:
+    """Resolve each hint (a path the brief/intent named) to the ACTUAL
+    repo-relative path(s) in the cloned tree.
+
+    A brief names a file the way a human does — usually the BARE basename
+    ('research_worker.py'), not the full tree path ('lab_pack/research_worker.py').
+    An exact tree match wins; otherwise a bare basename matches any tree path
+    with that basename, and a partial path matches any tree path it is a suffix
+    of. This is the branch#1796 fix: the target file the brief named never
+    reached the authoring context because the bare name did not equal the full
+    tree path, so it fell through to the budget-bounded context fill — where it
+    was truncated or dropped entirely, and the worker 'could not see the file it
+    was told to fix' (it wrote NOTE_TO_LAB_missing_source.md instead). Resolved
+    hints are read in FULL, so the named target reaches the model uncut."""
+    rel_set = set(rel_paths)
+    resolved: list[str] = []
+
+    def _add(p: str) -> None:
+        if p not in resolved:
+            resolved.append(p)
+
+    for raw in (hint_paths or []):
+        h = _norm_rel(raw)
+        if not h:
+            continue
+        if h in rel_set:
+            _add(h)
+            continue
+        if "/" in h:
+            matches = [p for p in rel_paths if p == h or p.endswith("/" + h)]
+        else:
+            matches = [p for p in rel_paths if p.rsplit("/", 1)[-1] == h]
+        # A precise hint resolves to one or a few files; an over-broad basename
+        # (e.g. __init__.py across many packages) is not worth flooding the
+        # full-read context with — cap it and let the budget fill cover the rest.
+        if matches and len(matches) <= 4:
+            for p in matches:
+                _add(p)
+    return resolved
 
 
 def clone_and_read(
@@ -761,11 +835,13 @@ def clone_and_read(
         # truncated in the request" → the worker could not author the real fix
         # and fell back to a test-only no-op). Hint files are ALWAYS included
         # and never truncated; the budget below bounds only the extra context.
-        hints = [h.replace(os.sep, "/").lstrip("./") for h in (hint_paths or [])]
-        hint_present: list[str] = []
-        for h in hints:
-            if h in rel_paths and h not in hint_present:
-                hint_present.append(h)
+        # Resolve the hint (target) files the brief/intent named to their ACTUAL
+        # tree paths — a brief usually names a bare basename
+        # ('research_worker.py'), not the full path ('lab_pack/research_worker.py').
+        # Without this the named target never matched the tree, fell through to
+        # the budget-bounded context fill, and was truncated or dropped — the
+        # worker could not see the file it was told to fix (branch#1796).
+        hint_present = _resolve_hint_paths(hint_paths or [], rel_paths)
         hint_set = set(hint_present)
 
         total = 0

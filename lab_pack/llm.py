@@ -376,7 +376,21 @@ class LabMockProvider:
                 content=("from widget import answer\n\n\n"
                          "def test_answer():\n"
                          "    assert answer() == 99\n"))
-            if "[[FIXTUREVACUOUS widget" in blob:
+            # branch#1796: the worker, unable to SEE the target file it was told
+            # to fix, authors ONLY a NOTE markdown — no source change, no test.
+            # The suite is green regardless, so the proof must reject it as a
+            # doc-only non-proof (ADR-040 hardened), opening NO submit_pr.
+            note_only = AuthoredFile(
+                path="NOTE_TO_LAB_missing_source.md",
+                content=("# Note to the lab\n\nThe source file named in the "
+                         "brief was never provided in RELEVANT FILES, so no "
+                         "source fix could be authored — only this note.\n"))
+            if "[[NOTEONLY" in blob:
+                parsed = AuthoredDiff(
+                    files=[note_only],
+                    notes=(f"Could not author a source fix (target file not in "
+                           f"context); left a NOTE only. [mock {digest}]"))
+            elif "[[FIXTUREVACUOUS widget" in blob:
                 parsed = AuthoredDiff(
                     files=[widget_fix, widget_fixture_vacuous],
                     notes=(f"Fixes widget.answer() to 42 and adds a fixture that "

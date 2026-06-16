@@ -1,0 +1,34 @@
+# branch#1796 (THE ROOT BUG): the authoring context did NOT deliver the target
+# file the brief named to the worker. The brief names a file the way a human
+# does — the BARE basename ('research_worker.py') — but the repo holds it at a
+# full path ('lab_pack/research_worker.py'). The old clone_and_read matched
+# hints by EXACT path only, so the bare name never matched the tree; the target
+# fell through to the budget-bounded context fill and was TRUNCATED or DROPPED.
+# Three self-repair attempts could not fix research_worker.py because the worker
+# never received it — the last run wrote NOTE_TO_LAB_missing_source.md saying the
+# file "was never provided in RELEVANT FILES."
+#
+# Fix (ADR-039 Phase 2, hardened): parse the file paths the brief names, RESOLVE
+# them to their actual tree paths (basename / suffix match), and include them
+# UNCUT in RELEVANT FILES. This fixture seeds a LARGE research_worker.py in a
+# subdirectory plus budget-pressure padding, names the bare basename in the
+# brief, and asserts the FULL file content reaches the authoring context.
+settings:
+  crawl_enabled: false
+  code_worker_enabled: true
+  code_author_max_attempts: 1
+
+mission:
+  title: Target-file delivery mission
+
+# A propose_pr authoring task whose brief names research_worker.py by its BARE
+# basename. The file lives at lab_pack/research_worker.py in the clone, behind
+# budget-pressure padding — exactly the production shape that starved the fix.
+author:
+  title: Fix the source-URL ordering in research_worker.py
+  brief: >
+    research_worker.py orders the default source URLs ahead of the operator's
+    URLs and must put the operator's URLs first. Fix the source and add a
+    regression test.
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""
