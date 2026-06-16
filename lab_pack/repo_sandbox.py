@@ -346,17 +346,18 @@ def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     return None
 
 
-# ── proof integrity: actually execute an authored regression test (ADR-039) ──
+# ── proof integrity: red-then-green an authored regression test (ADR-039/040) ─
 # The self-repair proof command is the lab's OWN harness
 # (`python -m lab_pack.fixtures.run_fixtures`), which does NOT run pytest files
-# under lab_pack/tests/. So an authored change that ADDS a pytest regression
-# test would never have that test executed by the proof command — a test-only
-# "fix" sailed through green (branch#1704: a no-op fix that modified no source
-# yet reported 36/36). The integrity rule (ADR-039): when an authored change
-# adds or modifies a test, the proof MUST run THAT test directly with pytest,
-# in addition to the proof command, and the fix is proven only if the test is
-# actually executed AND passes — an unexecuted test can never confabulate a
-# green proof.
+# under lab_pack/tests/ but DOES run fixture .yaml scenarios. Two false-greens
+# followed: branch#1704 added a pytest test the proof never ran; branch#1751
+# added a fixture .yaml the proof DID run but that passed VACUOUSLY against the
+# unfixed code (36/36 — yet the source fix was never made). The integrity rule
+# (ADR-039, hardened by ADR-040): when an authored change adds or modifies a
+# test — pytest file OR fixture .yaml — the proof is RED-THEN-GREEN. The test
+# must FAIL against the unfixed baseline (red) and PASS after the fix (green),
+# with the full suite green after. A test green on the baseline proves nothing,
+# whether it is unexecuted, vacuous, or simply does not exercise the defect.
 
 
 def _pytest_command(test_paths: list[str]) -> str:
@@ -384,6 +385,151 @@ def _regression_executed_and_passed(run: dict) -> bool:
     return True
 
 
+def _regression_is_red(run: dict) -> bool:
+    """Did the authored test RUN and FAIL — a genuine RED against the unfixed
+    baseline (ADR-040)? Distinguished from two non-reds: a test that PASSES
+    (exit 0) proves nothing (branch#1751's vacuous fixture — green regardless
+    of the fix), and a test that never RAN ('no tests collected' / pytest exit
+    5) is an absent test, not a caught defect. Only a run that executed and
+    reported a failure is a real red."""
+    if not run or run.get("exit_code") in (0, None):
+        return False
+    if run.get("exit_code") == 5:  # pytest: nothing collected
+        return False
+    out = ((run.get("stdout") or "") + "\n" + (run.get("stderr") or "")).lower()
+    if "no tests ran" in out or "no tests collected" in out:
+        return False
+    return True
+
+
+# ── authored-test detection: BOTH forms (ADR-040) ───────────────────────────
+# The red-then-green proof covers any authored test, in either form the loop
+# can write: a pytest file the proof command would NOT run on its own, AND a
+# fixture .yaml the suite runner DOES run (which is exactly why a vacuous one
+# slipped through green — branch#1751). Both are subject to red-then-green.
+
+
+def is_pytest_test_path(path: str) -> bool:
+    """A pytest file: a `.py` named `test_*`/`*_test`, or any `.py` under a
+    tests/ or test/ directory. conftest.py is fixture wiring, not a test."""
+    p = (path or "").replace("\\", "/").lower()
+    if not p.endswith(".py"):
+        return False
+    base = p.rsplit("/", 1)[-1]
+    if base == "conftest.py":
+        return False
+    if base.startswith("test_") or base.endswith("_test.py"):
+        return True
+    return any(seg in ("tests", "test") for seg in p.split("/")[:-1])
+
+
+def is_fixture_test_path(path: str) -> bool:
+    """A fixture test: a `.yaml`/`.yml` scenario under a fixtures/ directory —
+    the form branch#1751 authored (research_worker_source_order.yaml) that the
+    suite runner executes and that passed VACUOUSLY against the unfixed code."""
+    p = (path or "").replace("\\", "/").lower()
+    if not (p.endswith(".yaml") or p.endswith(".yml")):
+        return False
+    return any(seg in ("fixtures", "fixture") for seg in p.split("/")[:-1])
+
+
+def is_authored_test_path(path: str) -> bool:
+    """Either authored-test form — a pytest file OR a fixture .yaml."""
+    return is_pytest_test_path(path) or is_fixture_test_path(path)
+
+
+# ── split a combined unified diff into per-file fragments ────────────────────
+# To run the authored test against the UNFIXED baseline (the RED phase) we apply
+# ONLY the test-file fragments of the diff — never the source fix. A unified
+# diff is a concatenation of per-file fragments, each opening with a `--- ` line.
+
+
+def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
+    """[(target_path, fragment), …] — split a combined unified diff at each
+    per-file `--- ` boundary; the target is the fragment's `+++ b/<path>`."""
+    text = diff or ""
+    starts = [m.start() for m in re.finditer(r"(?m)^--- ", text)]
+    out: list[tuple[str, str]] = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else len(text)
+        frag = text[s:e]
+        tm = _DIFF_TARGET_RE.search(frag)
+        out.append(((tm.group(1).strip() if tm else ""), frag))
+    return out
+
+
+def _norm_rel(path: str) -> str:
+    return (path or "").replace("\\", "/").lstrip("./")
+
+
+def _filter_diff_to_paths(diff: str, paths: list[str]) -> str:
+    """The sub-diff touching ONLY the given paths (the authored test files) —
+    applied to a pristine clone for the RED phase."""
+    want = {_norm_rel(p) for p in (paths or [])}
+    return "".join(frag for target, frag in _split_diff_by_file(diff)
+                   if _norm_rel(target) in want)
+
+
+def _regression_commands(test_paths: list[str], proof_command: str) -> list[str]:
+    """The command(s) that exercise the authored test(s) directly, by form: a
+    pytest run over the pytest files, and — for a fixture .yaml — the PROOF
+    command itself (the suite runner is what executes a fixture). Either form's
+    command must go RED on the unfixed baseline and GREEN after the fix."""
+    pytest_paths = [p for p in (test_paths or []) if is_pytest_test_path(p)]
+    fixture_paths = [p for p in (test_paths or []) if is_fixture_test_path(p)]
+    cmds: list[str] = []
+    if pytest_paths:
+        cmds.append(_pytest_command(pytest_paths))
+    if fixture_paths and proof_command not in cmds:
+        cmds.append(proof_command)
+    return cmds
+
+
+def _run_regression(repo_dir: str, reg_commands: list[str], proof_command: str,
+                    after_run: Optional[dict], timeout_seconds: int,
+                    mem_limit_mb: int) -> list[dict]:
+    """Run each regression command, reusing an already-executed proof-command
+    run (the fixture form: the suite IS the regression, no second run needed)."""
+    runs: list[dict] = []
+    for cmd in reg_commands:
+        if after_run is not None and cmd == proof_command:
+            runs.append(after_run)
+        else:
+            runs.append(_exec(cmd, repo_dir, timeout_seconds, mem_limit_mb))
+    return runs
+
+
+def _red_baseline_phase(clone_fn, repo: str, ref: Optional[str],
+                        test_only_diff: str, reg_commands: list[str],
+                        proof_command: str, timeout_seconds: int,
+                        mem_limit_mb: int) -> tuple[bool, list[dict], Optional[str]]:
+    """RED phase (ADR-040): clone a PRISTINE copy, apply ONLY the authored test
+    files (no source fix), and run the regression command(s). They MUST FAIL
+    (red) — a test green here, or one that never runs, is no proof. Returns
+    (baseline_red, runs, error). A separate clone (not a git reset) keeps this
+    working against the canned fixture clones, which are not git repos."""
+    if not (test_only_diff or "").strip():
+        return False, [], ("no authored test fragment to run against the "
+                           "unfixed baseline")
+    workdir = tempfile.mkdtemp(prefix="lab-sandbox-red-")
+    repo_dir = os.path.join(workdir, "repo")
+    try:
+        clone_err = clone_fn(repo, ref, repo_dir)
+        if clone_err:
+            return False, [], clone_err
+        if not os.path.isdir(repo_dir):
+            return False, [], "clone produced no repo directory"
+        apply_err = _apply_diff(repo_dir, test_only_diff)
+        if apply_err:
+            return False, [], f"applying the test-only change failed: {apply_err}"
+        runs = _run_regression(repo_dir, reg_commands, proof_command, None,
+                               timeout_seconds, mem_limit_mb)
+        baseline_red = bool(runs) and all(_regression_is_red(r) for r in runs)
+        return baseline_red, runs, None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def run_repo_task(
     repo: str,
     command: str,
@@ -404,12 +550,15 @@ def run_repo_task(
                       (difflib over the cloned original) so no hand-computed
                       hunk header can be wrong. `new_files` wins if both given.
 
-    `test_paths` (ADR-039): repo-relative paths of authored regression tests
-    that the proof command does NOT itself run (the lab's harness does not run
-    pytest files). When given, after the proof command passes the lab runs
-    those tests DIRECTLY with pytest — and the fix is `proven` only if they are
-    actually executed AND pass. A test that is never executed can never produce
-    a green proof.
+    `test_paths` (ADR-039/040): repo-relative paths of authored regression
+    tests — pytest files the proof command does NOT itself run, AND/OR fixture
+    .yaml scenarios the suite runner DOES run. The proof is RED-THEN-GREEN: the
+    authored test must FAIL against the unfixed baseline (red) and PASS after
+    the fix (green), with the full suite green after. A test green on the
+    baseline proves nothing (branch#1751); a test that never runs is no proof
+    (branch#1704). When `test_paths` is empty the authored-test files are
+    derived from the diff's own targets, so a supplied diff that adds a test is
+    held to the same standard.
 
     Returns a structured result:
 
@@ -418,7 +567,11 @@ def run_repo_task(
           "baseline":   {command, exit_code, timed_out, duration_seconds,
                          stdout, stderr, error},
           "after_diff": {...} | None,     # present only for a fix-task
-          "regression": {...} | None,     # the authored test run (test_paths)
+          "regression": {...} | None,     # the authored test, AFTER the fix
+          "regression_baseline": {...} | None,  # the SAME test on the unfixed
+                         # baseline — it MUST be red (ADR-040)
+          "baseline_red": bool,           # the authored test failed on the
+                         # unfixed baseline (a real red-then-green regression)
           "regression_paths": [str] | None,
           "diff":       str | None,       # the patch actually applied — the
                          # git-apply-valid one BUILT from new_files, or the
@@ -486,17 +639,46 @@ def run_repo_task(
                 return base_result
             after = _exec(command, repo_dir, timeout_seconds, mem_limit_mb)
             base_result["after_diff"] = after
-            proven = (after.get("exit_code") == 0)
-            # ADR-039: when the change authored a regression test, the proof
-            # command alone is not enough — the lab's harness does not run
-            # pytest files, so a test-only no-op fix would pass falsely. Run
-            # the authored test(s) DIRECTLY and require they execute AND pass.
-            if proven and test_paths:
-                regression = _exec(_pytest_command(test_paths), repo_dir,
-                                   timeout_seconds, mem_limit_mb)
-                base_result["regression"] = regression
-                base_result["regression_paths"] = list(test_paths)
-                proven = proven and _regression_executed_and_passed(regression)
+            green_suite = (after.get("exit_code") == 0)
+
+            # The authored test(s) the proof must red-then-green. Either the
+            # caller named them (the authoring path) or we derive them from the
+            # diff's targets (a supplied diff that adds a test) — both forms,
+            # pytest AND fixture .yaml.
+            tests = [_norm_rel(p) for p in (test_paths or [])] or [
+                _norm_rel(t) for t in _diff_target_paths(diff)
+                if is_authored_test_path(t)]
+
+            if tests:
+                base_result["regression_paths"] = list(tests)
+                reg_commands = _regression_commands(tests, command)
+                # ── GREEN phase: the authored test(s) must PASS after the fix.
+                # (Reuse the proof-command run for the fixture form.) ──────────
+                green_runs = _run_regression(repo_dir, reg_commands, command,
+                                             after, timeout_seconds, mem_limit_mb)
+                base_result["regression"] = green_runs[0] if green_runs else None
+                green_test = bool(green_runs) and all(
+                    _regression_executed_and_passed(r) for r in green_runs)
+                # ── RED phase: the SAME test(s) on a PRISTINE clone with NO
+                # source fix MUST FAIL (ADR-040). A test green on the unfixed
+                # baseline proves nothing (branch#1751); a test that never runs
+                # is not a red (branch#1704). ─────────────────────────────────
+                test_only_diff = _filter_diff_to_paths(diff, tests)
+                baseline_red, red_runs, red_err = _red_baseline_phase(
+                    clone_fn, repo, ref, test_only_diff, reg_commands, command,
+                    timeout_seconds, mem_limit_mb)
+                base_result["regression_baseline"] = (
+                    red_runs[0] if red_runs else None)
+                base_result["baseline_red"] = baseline_red
+                if red_err:
+                    base_result["regression_baseline_error"] = red_err
+                # proven = red-on-baseline AND green-after AND full suite green.
+                proven = green_suite and green_test and baseline_red
+            else:
+                # A source-only fix (no authored test): the existing suite must
+                # be green. (A DEFECT brief that authors no regression test
+                # therefore cannot prove green-without-red — it has no test.)
+                proven = green_suite
             base_result["proven"] = proven
             if proven:
                 # The fix is proven — read back the patched file states so the
@@ -649,9 +831,14 @@ def evidence_summary(result: dict[str, Any]) -> str:
     reg = result.get("regression")
     if reg is not None:
         executed = _regression_executed_and_passed(reg)
-        parts.append(f"authored test exit={reg.get('exit_code')} "
+        parts.append(f"authored test after fix exit={reg.get('exit_code')} "
                      f"({'executed+passed' if executed else 'NOT executed/passed'})")
-    verdict = "PROVEN (green)" if result.get("proven") else "not proven"
+    if result.get("regression_baseline") is not None or "baseline_red" in result:
+        parts.append("authored test on unfixed baseline: "
+                     + ("RED (fails → a real regression test)"
+                        if result.get("baseline_red")
+                        else "NOT red (passes/never runs → proves nothing)"))
+    verdict = "PROVEN (red-then-green)" if result.get("proven") else "not proven"
     return (f"sandbox: {result['repo']} — "
             + "; ".join(parts) + f" → {verdict}")
 
