@@ -51,7 +51,13 @@ from pathlib import Path
 from activegraph.packs import behavior, llm_behavior, load_prompts_from_dir
 
 from .llm import AuthoredDiff, CodeOutcome, consume_llm_anomalies, is_inert
-from .repo_sandbox import clone_and_read, evidence_summary, run_repo_task
+from .repo_sandbox import (
+    _regression_executed_and_passed,
+    clone_and_read,
+    evidence_summary,
+    is_authored_test_path,
+    run_repo_task,
+)
 from .seams import effective_setting, seam_versions_stamp
 from .settings import LabSettings
 
@@ -65,21 +71,10 @@ _AUTHOR_PROMPT = _PROMPTS["code_author"]
 _PATH_RE = re.compile(r"[\w][\w./\-]*\.[A-Za-z0-9]{1,8}")
 
 
-def _is_test_path(path: str) -> bool:
-    """Is this authored file a pytest test the proof command would NOT run
-    (ADR-039)? A `.py` whose basename is `test_*`/`*_test`, or any `.py` placed
-    under a tests/ or test/ directory. conftest.py is fixture wiring, not a
-    test. The lab runs these directly with pytest so a self-repair cannot land
-    on a regression test that was never executed (branch#1704)."""
-    p = (path or "").replace("\\", "/").lower()
-    if not p.endswith(".py"):
-        return False
-    base = p.rsplit("/", 1)[-1]
-    if base == "conftest.py":
-        return False
-    if base.startswith("test_") or base.endswith("_test.py"):
-        return True
-    return any(seg in ("tests", "test") for seg in p.split("/")[:-1])
+# Authored-test detection (pytest files AND fixture .yaml) lives canonically in
+# repo_sandbox (is_authored_test_path) — both forms are red-then-green proven
+# there (ADR-040). The code worker only needs to collect the authored test
+# paths and hand them to run_repo_task.
 
 # github.com/<owner>/<repo>[...] → owner/repo (drop a trailing .git / path)
 _REPO_RE = re.compile(r"github\.com[/:]([\w.\-]+/[\w.\-]+?)(?:\.git)?(?:[/#?\s]|$)")
@@ -192,9 +187,13 @@ def _run_metadata(result: dict) -> dict:
     return {"repo": result.get("repo"), "ref": result.get("ref"),
             "baseline": _compact(result.get("baseline")),
             "after_diff": _compact(result.get("after_diff")),
-            # ADR-039: the authored regression test's OWN run — the proof that
-            # the test was actually executed, not merely added.
+            # ADR-039/040: the authored regression test's runs — AFTER the fix
+            # (must pass) AND against the unfixed baseline (must be red). A test
+            # green on the baseline proves nothing; baseline_red records the
+            # red-then-green verdict.
             "regression": _compact(result.get("regression")),
+            "regression_baseline": _compact(result.get("regression_baseline")),
+            "baseline_red": bool(result.get("baseline_red")),
             "regression_paths": result.get("regression_paths"),
             "proven": bool(result.get("proven")),
             # The post-fix file states a proven diff produced (ADR-036): the
@@ -319,20 +318,32 @@ def _emit_authoring_request(graph, settings, *, task_data, task_id, branch_id,
 def _failure_excerpt(result: dict) -> str:
     """A short, secret-free excerpt of why an authored diff did not pass: the
     apply/clone error, else the authored regression test's failure when IT is
-    the part that did not prove (ADR-039 — a test that was never executed or
-    failed against the change), else the deciding command's stderr/stdout tail."""
+    the part that did not prove (ADR-039/040), else the deciding command's
+    stderr/stdout tail."""
     if result.get("error"):
         return f"sandbox error: {result['error']}"
     reg = result.get("regression")
     after = result.get("after_diff") or {}
-    # The proof command passed but the authored test did not execute-and-pass:
-    # name THAT failure precisely so the retry fixes the test/source, not the
-    # command (the branch#1704 unexecuted-test trap).
+    # ADR-040 — the authored test did NOT go red on the unfixed baseline: it
+    # passes regardless of the fix, so it proves nothing (branch#1751's vacuous
+    # fixture; or a no-op test). Name THIS precisely — it is not a command/test
+    # failure, it is a non-proof.
+    if (after.get("exit_code") == 0 and reg is not None
+            and _regression_executed_and_passed(reg)
+            and result.get("baseline_red") is False):
+        base = result.get("regression_baseline") or {}
+        tail = (base.get("stdout") or "").strip() or (base.get("stderr") or "").strip()
+        return ("the authored regression test did not fail against the unfixed "
+                "baseline — it proves nothing (no red-then-green; a test green "
+                f"on the baseline is no regression test). {tail[-800:]}")
+    # The proof command passed but the authored test did not execute-and-pass
+    # AFTER the fix: name THAT failure precisely so the retry fixes the
+    # test/source, not the command (the branch#1704 unexecuted/failing test).
     if (after.get("exit_code") == 0 and reg is not None
             and reg.get("exit_code") != 0):
         tail = (reg.get("stderr") or "").strip() or (reg.get("stdout") or "").strip()
         return (f"the proof command passed but the authored regression test "
-                f"did not execute-and-pass (pytest exit={reg.get('exit_code')}): "
+                f"did not pass after the fix (exit={reg.get('exit_code')}): "
                 f"{tail[-1000:]}")
     run = result.get("after_diff") or result.get("baseline") or {}
     tail = (run.get("stderr") or "").strip() or (run.get("stdout") or "").strip()
@@ -803,12 +814,13 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
         _fail_task(graph, task_id,
                    "code_worker: code_run_cap < 2 — cannot prove an authored fix")
         return
-    # ADR-039 (proof integrity): the authored test files the proof command
-    # would NOT run on its own. The sandbox runs them DIRECTLY with pytest and
-    # the fix proves only if they execute AND pass — a test-only no-op fix
-    # (modifying no source) fails its own regression test against the unfixed
-    # clone and is correctly rejected (branch#1704's false green).
-    test_paths = [p for p in new_files if _is_test_path(p)]
+    # ADR-039/040 (proof integrity): the authored test files — pytest files
+    # the proof command would NOT run on its own AND fixture .yaml the suite
+    # runner DOES run. The sandbox proves them RED-THEN-GREEN: each must FAIL on
+    # the unfixed baseline and PASS after the fix. A test green on the baseline
+    # proves nothing (branch#1751's vacuous fixture); a test that never runs is
+    # no proof (branch#1704). A test-only no-op is rejected either way.
+    test_paths = [p for p in new_files if is_authored_test_path(p)]
     result = run_repo_task(repo, command, ref=ref, new_files=new_files,
                            test_paths=test_paths, timeout_seconds=timeout)
     # The patch the lab BUILT and applied (git-apply-valid by construction) —
@@ -831,7 +843,8 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
                      # the files the model authored, for the public record.
                      "authored_diff": diff,
                      "authored_files": sorted(new_files),
-                     # ADR-039: the authored tests the proof executed directly.
+                     # ADR-039/040: the authored tests the proof red-then-greens
+                     # (pytest files and fixture .yaml alike).
                      "authored_tests": sorted(test_paths),
                      "authoring_notes": (getattr(out, "notes", "") or "")[:500],
                      "seam_versions": stamp, "run": _run_metadata(result)},

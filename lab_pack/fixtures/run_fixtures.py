@@ -3285,6 +3285,175 @@ def run_code_authoring() -> bool:
     return c.done("code_authoring")
 
 
+def run_red_green_proof() -> bool:
+    """ADR-040: red-then-green proof for any authored test — pytest OR fixture
+    .yaml. A self-repair's regression test must FAIL against the unfixed
+    baseline (red) and PASS after the fix (green). A test green on the baseline
+    proves nothing (branch#1751's vacuous fixture; branch#1704's no-op). Four
+    legs: a real source fix + a red-green FIXTURE → submit_pr; a fix + a VACUOUS
+    fixture (green on baseline) → unproven, no PR; a test-only no-op (pytest) →
+    unproven, no PR; a source fix whose test stays red after → unproven, no PR."""
+    spec = _load("red_green_proof.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: red_green_proof — authored test must be RED on the unfixed "
+          "baseline and GREEN after; a baseline-green test proves nothing")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write, repo_sandbox
+
+    # The buggy source under repair: answer() returns 1, must return 42.
+    widget_buggy = ("# widget module — red-green-proof fixture target.\n"
+                    "def answer():\n    return 1  # BUG: should return 42\n")
+    # A tiny suite runner the proof command invokes: it executes every
+    # fixtures/*.yaml and, when one declares expect_answer, asserts widget's
+    # answer() against it. A fixture with NO assertion passes regardless — the
+    # vacuous shape branch#1751's proof mistook for a real regression test.
+    runfix = (
+        "import glob, sys\n"
+        "import yaml\n"
+        "from widget import answer\n\n"
+        "failed = False\n"
+        "for path in sorted(glob.glob('fixtures/*.yaml')):\n"
+        "    with open(path) as f:\n"
+        "        spec = yaml.safe_load(f) or {}\n"
+        "    if 'expect_answer' in spec:\n"
+        "        if answer() != spec['expect_answer']:\n"
+        "            print('FAIL', path, answer(), '!=', spec['expect_answer'])\n"
+        "            failed = True\n"
+        "        else:\n"
+        "            print('PASS', path)\n"
+        "    else:\n"
+        "        print('PASS (no assertion)', path)\n"
+        "sys.exit(1 if failed else 0)\n")
+
+    def fake_clone(repo, ref, dest):
+        os.makedirs(os.path.join(dest, "fixtures"), exist_ok=True)
+        with open(os.path.join(dest, "widget.py"), "w") as f:
+            f.write(widget_buggy)
+        with open(os.path.join(dest, "runfix.py"), "w") as f:
+            f.write(runfix)
+        return None
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    c = Check()
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def drive(bspec):
+        b = create_branch_fn(g, mission.id, bspec["title"],
+                             bspec["brief"].strip(), status="proposed")
+        rt.run_until_idle()
+        g.patch_object(b.id, {"metadata": {"code_task": {
+            "repo": bspec["repo"], "command": bspec["command"],
+            "propose_pr": True, "brief": bspec["brief"].strip()}}})
+        activate_branch_fn(g, b.id)
+        rt.run_until_idle()
+        return b
+
+    def last_run_meta(branch_id):
+        runs = [o for o in _lab_obs(g, "code_authored_run")
+                if (o.data.get("metadata") or {}).get("lab_branch_id") == branch_id]
+        return (runs[-1].data.get("metadata") or {}) if runs else {}
+
+    def pr_decs(branch_id):
+        return [d for d in g.objects(type="decision")
+                if d.data.get("kind") == "submit_pr"
+                and (d.data.get("metadata") or {}).get("lab_branch_id") == branch_id]
+
+    # No approval happens here → the write token must never be exercised.
+    opener_calls: list = []
+    github_write.set_pr_opener(
+        lambda *a, **k: (opener_calls.append((a, k)) or {"url": "x", "number": 0,
+                                                         "head": "x", "base": "x"}))
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        # ── Leg 1: real source fix + a red-then-green FIXTURE → submit_pr ──────
+        b1 = drive(spec["fixture_real"])
+        t1 = task_for(b1.id)
+        m1 = last_run_meta(b1.id)
+        run1 = m1.get("run") or {}
+        c.that("fixtures/widget_check.yaml" in (m1.get("authored_tests") or []),
+               "the authored FIXTURE .yaml is detected as a regression test")
+        c.that(run1.get("baseline_red") is True,
+               "the fixture FAILS against the unfixed baseline (red)")
+        c.that((run1.get("regression") or {}).get("exit_code") == 0
+               and (run1.get("after_diff") or {}).get("exit_code") == 0,
+               "the fixture PASSES after the fix and the suite is green")
+        c.that(t1 is not None and t1.data.get("status") == "done",
+               f"red-then-green fixture proves the fix "
+               f"({t1.data.get('status') if t1 else None})")
+        c.that(len(pr_decs(b1.id)) == 1
+               and pr_decs(b1.id)[0].data.get("status") == "pending",
+               "a PENDING submit_pr is opened for the proven fix")
+        print("  fixture-real: red on baseline → green after → PENDING submit_pr")
+
+        # ── Leg 2: branch#1751 — a fix + a VACUOUS fixture → unproven, no PR ───
+        b2 = drive(spec["fixture_vacuous"])
+        t2 = task_for(b2.id)
+        m2 = last_run_meta(b2.id)
+        run2 = m2.get("run") or {}
+        c.that((run2.get("after_diff") or {}).get("exit_code") == 0
+               and run2.get("baseline_red") is False,
+               "the vacuous fixture passes on the baseline too — never red "
+               "(the false-green is caught)")
+        gap2 = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "code_authoring_failed"
+                and (e.data.get("metadata") or {}).get("lab_branch_id") == b2.id]
+        c.that(len(gap2) == 1
+               and "proves nothing" in (gap2[0].data.get("rationale") or ""),
+               "an honest authored_unproven gap names the no-red non-proof")
+        c.that(t2 is not None and t2.data.get("status") == "rejected"
+               and not pr_decs(b2.id),
+               "the vacuous-fixture self-repair opens NO submit_pr "
+               "(branch#1751 closed)")
+        print("  fixture-vacuous: green on baseline → unproven, no PR (branch#1751)")
+
+        # ── Leg 3: branch#1704 — a test-only no-op (pytest) → unproven, no PR ──
+        b3 = drive(spec["pytest_test_only"])
+        t3 = task_for(b3.id)
+        m3 = last_run_meta(b3.id)
+        run3 = m3.get("run") or {}
+        c.that("tests/test_widget.py" in (m3.get("authored_tests") or []),
+               "the authored pytest test is detected")
+        c.that(run3.get("baseline_red") is True
+               and (run3.get("regression") or {}).get("exit_code") not in (0, None),
+               "the test is red on the baseline AND still red after (no source "
+               "fix) → never green")
+        c.that(t3 is not None and t3.data.get("status") == "rejected"
+               and not pr_decs(b3.id),
+               "the test-only no-op opens NO submit_pr (branch#1704 closed)")
+        print("  pytest-test-only: red baseline, red after → unproven, no PR (branch#1704)")
+
+        # ── Leg 4: a source fix whose test STAYS RED after → unproven, no PR ──
+        b4 = drive(spec["source_fix_bad_test"])
+        t4 = task_for(b4.id)
+        m4 = last_run_meta(b4.id)
+        run4 = m4.get("run") or {}
+        c.that(run4.get("baseline_red") is True
+               and (run4.get("regression") or {}).get("exit_code") not in (0, None),
+               "the authored test fails before AND after the fix (wrong "
+               "assertion) → never green")
+        c.that(t4 is not None and t4.data.get("status") == "rejected"
+               and not pr_decs(b4.id),
+               "a source fix whose test stays red is unproven — NO submit_pr")
+        print("  source-fix-bad-test: stays red after → unproven, no PR")
+
+        c.that(not opener_calls,
+               "NO write token is exercised — every submit_pr stays the "
+               "operator's tap")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        github_write.set_pr_opener(None)
+
+    return c.done("red_green_proof")
+
+
 def run_submit_pr() -> bool:
     """ADR-035, Phase 3: the submit_pr decision kind. A proven change becomes
     an artifact + a PENDING submit_pr decision; approval exercises a (mocked)
@@ -4716,6 +4885,7 @@ def run_all() -> None:
         run_research_worker(),
         run_code_worker(),
         run_code_authoring(),
+        run_red_green_proof(),
         run_submit_pr(),
         run_self_repair(),
         run_seam_proposal(),

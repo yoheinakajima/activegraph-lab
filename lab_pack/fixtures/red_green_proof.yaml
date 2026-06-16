@@ -1,0 +1,64 @@
+# ADR-040: red-then-green proof for any authored test (pytest OR fixture .yaml).
+# A self-repair's regression test must FAIL against the unfixed baseline (red)
+# and PASS after the fix (green). A test green on the baseline proves nothing
+# (branch#1751's vacuous fixture; branch#1704's no-op). The proof can no longer
+# mistake a test that passes regardless for a real regression test.
+#
+# The canned clone seeds a buggy widget.py (answer() returns 1, must be 42), a
+# tiny suite runner (runfix.py) that executes fixtures/*.yaml, and an empty
+# fixtures/ dir. The mock authors the fix + a test per leg (markers in the
+# brief). No live LLM; the RUN decides, never the model.
+settings:
+  crawl_enabled: false
+  code_worker_enabled: true
+  code_author_max_attempts: 2
+  code_run_cap: 8                 # red + green phases run more sandbox commands
+
+mission:
+  title: Red-then-green proof mission
+
+# Leg 1 — a REAL source fix + a FIXTURE that is red-on-baseline, green-after.
+# The suite runner (runfix.py) executes the authored fixture; it asserts
+# answer() == 42, so it FAILS on the unfixed clone and PASSES after the fix.
+# proven (red-then-green) → a PENDING submit_pr.
+fixture_real:
+  title: Author the widget fix and a real regression fixture
+  brief: >
+    widget.py answer() returns the wrong value and must return 42. Fix the
+    source and add a regression FIXTURE that exercises it. [[FIXTURE widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python runfix.py"
+
+# Leg 2 — branch#1751 reproduction: a real source fix BUT a VACUOUS fixture
+# that passes regardless (declares no assertion). The suite is green on the
+# baseline AND after, so the fixture never goes red — it proves nothing.
+# authored_unproven, NO submit_pr.
+fixture_vacuous:
+  title: Author a fix and a vacuous fixture (must be caught)
+  brief: >
+    widget.py answer() must return 42. Fix it and add a regression fixture.
+    [[FIXTUREVACUOUS widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python runfix.py"
+
+# Leg 3 — branch#1704 reproduction (pytest form): a TEST-ONLY change. The
+# authored pytest test asserts answer() == 42 but no source fix is authored, so
+# it is RED on the baseline and STILL RED after. unproven, NO submit_pr.
+pytest_test_only:
+  title: Author a test-only no-op (pytest, must be caught)
+  brief: >
+    widget.py answer() must return 42. Add a regression test for it.
+    [[TESTONLY widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""
+
+# Leg 4 — a source fix whose test STAYS RED after the fix: the source is fixed
+# (answer() == 42) but the authored test asserts the wrong value (== 99), so it
+# fails before AND after. Never green → unproven, NO submit_pr.
+source_fix_bad_test:
+  title: Author a fix whose test stays red after
+  brief: >
+    widget.py answer() must return 42. Fix it and add a regression test.
+    [[FIXBADTEST widget]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python -c \"pass\""

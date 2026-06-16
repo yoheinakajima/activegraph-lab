@@ -328,30 +328,73 @@ class LabMockProvider:
             # success from the RUN, never from this text.
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             test_path = f"tests/test_regression_{digest}.py"
-            regression = AuthoredFile(
+            # A REAL regression test for the check.py defect: it RUNS check.py
+            # and asserts exit 0. Against the unfixed clone (exits 1) it FAILS
+            # (red); after the fix (exits 0) it PASSES (green). ADR-040 requires
+            # this — a test asserting `True` would pass on the baseline and so
+            # prove nothing.
+            check_regression = AuthoredFile(
                 path=test_path,
                 content=(
-                    f"# Regression test for the defect in the brief "
-                    f"(mock authoring {digest}).\n"
-                    f"def test_defect_fixed():\n"
-                    f"    assert True\n"))
-            # ADR-039 proof-integrity legs: author a regression test that
-            # GENUINELY depends on the source module `widget.py` in the clone
-            # (asserts answer() == 42), so the proof's DIRECT pytest run decides
-            # pass/fail honestly. [[FIX widget]] → author the source fix AND the
-            # test (both prove green); [[TESTONLY widget]] → author ONLY the
-            # test, which FAILS against the unfixed clone (the branch#1704
-            # test-only no-op the proof must now catch).
+                    "import subprocess, sys\n\n\n"
+                    "def test_check_exits_zero():\n"
+                    "    r = subprocess.run([sys.executable, 'check.py'])\n"
+                    "    assert r.returncode == 0\n"))
+            # ADR-039/040 proof-integrity legs over the source module
+            # `widget.py` in the clone (answer() must return 42). The authored
+            # tests GENUINELY depend on the source so the proof's red-then-green
+            # decides pass/fail honestly:
+            #   [[FIX widget]]            → source fix + a red-then-green pytest
+            #   [[FIXTURE widget]]        → source fix + a red-then-green fixture
+            #   [[FIXTUREVACUOUS widget]] → source fix + a VACUOUS fixture (green
+            #                               on baseline → no red → unproven; the
+            #                               branch#1751 fixture-vacuous case)
+            #   [[FIXBADTEST widget]]     → source fix + a test that stays RED
+            #                               after the fix (asserts the wrong
+            #                               value → never green → unproven)
+            #   [[TESTONLY widget]]       → ONLY the test, no source fix (red on
+            #                               baseline, still red after → the
+            #                               branch#1704 test-only no-op)
+            widget_fix = AuthoredFile(path="widget.py",
+                                      content="def answer():\n    return 42\n")
             widget_test = AuthoredFile(
                 path="tests/test_widget.py",
                 content=("from widget import answer\n\n\n"
                          "def test_answer():\n"
                          "    assert answer() == 42\n"))
-            if "[[FIX widget" in blob:
+            # A fixture .yaml the clone's suite runner exercises: a REAL one
+            # asserts answer() == 42 (red on baseline, green after); a VACUOUS
+            # one declares no assertion (passes regardless → no red).
+            widget_fixture_real = AuthoredFile(
+                path="fixtures/widget_check.yaml",
+                content="name: widget answers 42\nexpect_answer: 42\n")
+            widget_fixture_vacuous = AuthoredFile(
+                path="fixtures/widget_check.yaml",
+                content="name: widget ordering note\nalways_passes: true\n")
+            widget_test_bad = AuthoredFile(
+                path="tests/test_widget.py",
+                content=("from widget import answer\n\n\n"
+                         "def test_answer():\n"
+                         "    assert answer() == 99\n"))
+            if "[[FIXTUREVACUOUS widget" in blob:
                 parsed = AuthoredDiff(
-                    files=[AuthoredFile(path="widget.py",
-                                        content="def answer():\n    return 42\n"),
-                           widget_test],
+                    files=[widget_fix, widget_fixture_vacuous],
+                    notes=(f"Fixes widget.answer() to 42 and adds a fixture that "
+                           f"does NOT assert the value (vacuous). [mock {digest}]"))
+            elif "[[FIXTURE widget" in blob:
+                parsed = AuthoredDiff(
+                    files=[widget_fix, widget_fixture_real],
+                    notes=(f"Fixes widget.answer() to 42 and adds a fixture "
+                           f"(fixtures/widget_check.yaml) asserting it. "
+                           f"[mock {digest}]"))
+            elif "[[FIXBADTEST widget" in blob:
+                parsed = AuthoredDiff(
+                    files=[widget_fix, widget_test_bad],
+                    notes=(f"Fixes widget.answer() to 42 but the authored test "
+                           f"asserts the wrong value (stays red). [mock {digest}]"))
+            elif "[[FIX widget" in blob:
+                parsed = AuthoredDiff(
+                    files=[widget_fix, widget_test],
                     notes=(f"Fixes widget.answer() to return 42 and adds a "
                            f"regression test (tests/test_widget.py). [mock {digest}]"))
             elif "[[TESTONLY widget" in blob:
@@ -366,15 +409,15 @@ class LabMockProvider:
                 parsed = AuthoredDiff(
                     files=[AuthoredFile(path="check.py",
                                         content="import sys; sys.exit(0)\n"),
-                           regression],
+                           check_regression],
                     notes=("Rewrites the failing check to exit 0 and adds a "
                            f"regression test ({test_path}). [mock {digest}]"))
             else:
-                # No recognizable target in context: author the regression test
-                # only (a new file always diffs cleanly). The proof command
-                # decides whether that is enough.
+                # No recognizable target in context: author a regression test
+                # only (a new file always diffs cleanly). With no source fix it
+                # cannot go red-then-green — the proof correctly rejects it.
                 parsed = AuthoredDiff(
-                    files=[regression],
+                    files=[check_regression],
                     notes=(f"Adds a regression test ({test_path}) for the "
                            f"defect described in the brief. [mock {digest}]"))
         elif name == "SeamProposal":
