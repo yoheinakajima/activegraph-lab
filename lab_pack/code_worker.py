@@ -254,19 +254,21 @@ def _authoring_request_text(brief, command, repo, files, tree, attempt,
     the proof command, and (on a retry) the previous attempt + its failure."""
     parts = [
         f"Code-authoring request (attempt {attempt}/{max_attempts}): author the "
-        f"fix for the defect below by emitting the FULL new contents of each "
-        f"file to change or create (NOT a diff) — the lab builds the patch "
-        f"deterministically and proves it by running '{command}' against "
-        f"{repo}.",
+        f"fix for the defect below. For each EXISTING file you change, emit "
+        f"search/replace edits (a verbatim block to find + its replacement) — "
+        f"NOT the whole file; for each NEW file you create, emit its full "
+        f"content. The lab builds the patch deterministically and proves it by "
+        f"running '{command}' against {repo}.",
         f"\nBRIEF:\n{brief}",
     ]
     if files:
-        # PHASE 2 (ADR-039): render each relevant file in FULL — the target
-        # file the step edits must reach the model uncut. clone_and_read
-        # already reads target (hint) files whole and bounds only the extra
-        # context, so there is no truncation to re-impose here (the [:6000]
-        # slice was the branch#1704 truncation that starved the real fix).
-        parts.append("\nRELEVANT FILES:")
+        # PHASE 2 (ADR-039): render each relevant file in FULL — the model
+        # copies its search blocks VERBATIM from here, so the target file must
+        # reach it uncut. clone_and_read reads target (hint) files whole and
+        # bounds only the extra context; no truncation is re-imposed here (the
+        # [:6000] slice was the branch#1704 truncation that starved the fix).
+        parts.append("\nRELEVANT FILES (copy search blocks from these "
+                     "verbatim):")
         for path, content in list(files.items())[:24]:
             parts.append(f"\n--- {path} ---\n{content or ''}")
     elif tree:
@@ -745,27 +747,35 @@ def _maybe_propose_pr(graph, req_meta: dict, proof_eval_id: str,
                  # authoring a fix is top-tier reasoning, same plane as synthesis)
     view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
     creates=["observation", "evaluation"],
-    max_tokens=4096,
+    # ADR-042: search/replace bounds the output to the CHANGE, not the whole
+    # file — so the model no longer needs ~6.5k tokens just to re-emit a 26k
+    # file (the branch#1837 max_tokens truncation). 8192 leaves ample headroom
+    # for a multi-edit fix plus a new regression test file.
+    max_tokens=8192,
     tools=[],
 )
 def code_author(event, graph, ctx, out, *, settings: LabSettings):
-    """Author a fix as full file content, build the patch deterministically,
-    apply + prove it in the sandbox, retry up to the bound, and on a PROVEN fix
-    hand off to the synthesis stage which opens the gated submit_pr (ADR-037,
-    amended by ADR-038 — the self-repair loop's last mile).
+    """Author a fix as search/replace edits, materialize + build the patch
+    deterministically, apply + prove it in the sandbox, retry up to the bound,
+    and on a PROVEN fix hand off to the synthesis stage which opens the gated
+    submit_pr (ADR-037, amended by ADR-038 then ADR-042 — the self-repair
+    loop's last mile).
 
     On: object.created (observation, metadata.lab code_authoring_request).
-    The LLM emits, per changed file, the FULL new contents (not a unified diff)
-    from the brief + the relevant files (read from the clone by code_intake).
-    The lab BUILDS the patch deterministically (difflib over the cloned
-    original), applies it, and runs the proof command — the RUN decides
-    success, never the model, and the patch applies by construction (no
-    hand-computed hunk header, the branch#1667 failure). Tests pass → emit the
-    synthesis request carrying the git-built diff (the existing propose_pr →
-    submit_pr path). Tests fail → feed the failure back and retry, up to
-    setting.code_author_max_attempts; still failing → an honest 'authored a
-    diff but could not make it pass' evaluation, the task rejected, NO
-    submit_pr (a fix must earn its PR).
+    The LLM emits, per file, search/replace EDITS (to modify an existing file)
+    or full CONTENT (to create a new file) — never a unified diff — from the
+    brief + the relevant files (read in full from the clone by code_intake).
+    The lab MATERIALIZES the new file contents (apply each edit to the cloned
+    original) and BUILDS the patch deterministically (difflib), applies it, and
+    runs the proof command — the RUN decides success, never the model; the
+    patch applies by construction (no hand-computed hunk header, the branch#1667
+    failure) and a large file is never re-emitted whole (the branch#1837
+    max_tokens truncation). Tests pass → emit the synthesis request carrying the
+    git-built diff (the existing propose_pr → submit_pr path). Tests fail (or an
+    edit's search block does not match) → feed the failure back and retry, up to
+    setting.code_author_max_attempts; still failing → an honest 'authored a diff
+    but could not make it pass' evaluation, the task rejected, NO submit_pr (a
+    fix must earn its PR).
     """
     consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
@@ -789,14 +799,21 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
     if not task_id:
         return
 
-    # ADR-038: the model emits the FULL new contents of each changed file, not
-    # a unified diff. The lab builds the patch deterministically (in
-    # run_repo_task, via difflib over the cloned original), so a hand-computed
-    # hunk header can never be wrong — the branch#1667 failure mode is gone.
+    # ADR-042: the model emits, per file, search/replace EDITS (to modify an
+    # existing file — bounded output, the branch#1837 fix) or full CONTENT (to
+    # create a new file). The lab MATERIALIZES the new contents in the sandbox
+    # (apply each edit to the cloned original) and builds the patch
+    # deterministically via difflib — so a hand-computed hunk header can never
+    # be wrong (branch#1667) AND a large file never has to be re-emitted whole
+    # (branch#1837). The model supplies intent; the tooling owns mechanics.
     authored = getattr(out, "files", None) if out is not None else None
-    new_files = {f.path: (f.content or "")
-                 for f in (authored or []) if getattr(f, "path", None)}
-    if out is None or is_inert(getattr(out, "notes", None)) or not new_files:
+    authored_files = [
+        {"path": f.path,
+         "edits": [{"search": e.search, "replace": e.replace}
+                   for e in (getattr(f, "edits", None) or [])],
+         "content": getattr(f, "content", None)}
+        for f in (authored or []) if getattr(f, "path", None)]
+    if out is None or is_inert(getattr(out, "notes", None)) or not authored_files:
         # Inert/empty authoring output (LLM budget, pause, parse) — no content
         # was produced. Do NOT burn a retry on a non-authoring failure; record
         # the honest gap and fail the task (the preceding anomaly observation
@@ -831,8 +848,9 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
     # the unfixed baseline and PASS after the fix. A test green on the baseline
     # proves nothing (branch#1751's vacuous fixture); a test that never runs is
     # no proof (branch#1704). A test-only no-op is rejected either way.
-    test_paths = [p for p in new_files if is_authored_test_path(p)]
-    result = run_repo_task(repo, command, ref=ref, new_files=new_files,
+    test_paths = [f["path"] for f in authored_files
+                  if is_authored_test_path(f["path"])]
+    result = run_repo_task(repo, command, ref=ref, authored_files=authored_files,
                            test_paths=test_paths, timeout_seconds=timeout)
     # The patch the lab BUILT and applied (git-apply-valid by construction) —
     # this is what rides to submit_pr, never a model-authored diff string.
@@ -841,19 +859,19 @@ def code_author(event, graph, ctx, out, *, settings: LabSettings):
     source_id = _ensure_repo_source(graph, repo, ref)
     stamp = seam_versions_stamp(graph, "prompt.code_author")
     run_obs = graph.add_object("observation", {
-        "text": (f"Authored a fix (attempt {attempt}/{max_attempts}) as full "
-                 f"file content, built the patch deterministically, and applied "
-                 f"it in the sandbox. " + evidence_summary(result)),
+        "text": (f"Authored a fix (attempt {attempt}/{max_attempts}) as "
+                 f"search/replace edits, built the patch deterministically, and "
+                 f"applied it in the sandbox. " + evidence_summary(result)),
         "confidence": 0.9,
         "source_ids": [source_id],
         "category": "measurement",
         "metadata": {"lab": "code_authored_run", "task_id": task_id,
                      "lab_branch_id": branch_id, "source_id": source_id,
                      "attempt": attempt, "max_attempts": max_attempts,
-                     # The git-built patch (intent → mechanics, ADR-038) plus
+                     # The git-built patch (intent → mechanics, ADR-042) plus
                      # the files the model authored, for the public record.
                      "authored_diff": diff,
-                     "authored_files": sorted(new_files),
+                     "authored_files": sorted(f["path"] for f in authored_files),
                      # ADR-039/040: the authored tests the proof red-then-greens
                      # (pytest files and fixture .yaml alike).
                      "authored_tests": sorted(test_paths),

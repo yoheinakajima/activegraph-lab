@@ -107,13 +107,51 @@ class CodeOutcome(BaseModel):
     )
 
 
-class AuthoredFile(BaseModel):
-    """One changed (or new) file the code_author behavior emits (ADR-038).
+class SearchReplaceEdit(BaseModel):
+    """One surgical edit to an EXISTING file (ADR-042): a verbatim block to
+    find and the block to replace it with. The lab finds `search` in the
+    cloned original (it must appear EXACTLY ONCE) and replaces it with
+    `replace`, then builds the patch deterministically (difflib). Bounds the
+    model's output to the CHANGE, not the whole file — a 26k-char file no
+    longer has to be re-emitted to fix ten lines (the branch#1837 max_tokens
+    truncation)."""
 
-    The model supplies INTENT — the complete desired contents of a file — and
-    the lab supplies patch MECHANICS: it diffs this content against the cloned
-    original deterministically (difflib) and applies the git-generated patch.
-    The model never hand-computes a unified diff or a `@@` hunk header."""
+    search: str = Field(
+        description=(
+            "The exact, contiguous block of EXISTING text to replace, copied "
+            "VERBATIM from the file in RELEVANT FILES (every character, "
+            "including indentation and comments). It must appear EXACTLY ONCE "
+            "in the file — include enough surrounding lines to be unique. Do "
+            "not paraphrase or abbreviate; a block that does not match the file "
+            "byte-for-byte is rejected."
+        ),
+    )
+    replace: str = Field(
+        description=(
+            "The block to put in place of `search` — the same region as it "
+            "should read AFTER the fix. May be empty to delete the searched "
+            "block."
+        ),
+    )
+
+
+class AuthoredFile(BaseModel):
+    """One changed (or new) file the code_author behavior emits (ADR-042,
+    amending ADR-038).
+
+    The model supplies INTENT and the lab supplies patch MECHANICS (difflib
+    over the cloned original → a git-apply-valid patch); the model never
+    hand-computes a unified diff or a `@@` hunk header. Two ways to express the
+    intent, by whether the file already exists:
+
+      * `edits` — for MODIFYING an existing file: one or more search/replace
+        blocks. PREFERRED for existing files, because the output is bounded to
+        the change (a small fix to a large file emits a few lines, not the
+        whole file — the branch#1837 fix).
+      * `content` — for CREATING a new file (e.g. a regression test): its
+        COMPLETE contents. Also accepted as a whole-file rewrite of an existing
+        file when `edits` is omitted, but prefer `edits` there to stay bounded.
+    """
 
     path: str = Field(
         description=(
@@ -121,38 +159,48 @@ class AuthoredFile(BaseModel):
             "`lab_pack/behaviors.py`, `tests/test_regression_x.py`)."
         ),
     )
-    content: str = Field(
+    edits: list[SearchReplaceEdit] = Field(
+        default_factory=list,
         description=(
-            "The COMPLETE new contents of this file — the entire file as it "
-            "should read AFTER the fix, not a diff and not a fragment. The lab "
-            "computes the patch by diffing this against the cloned original, so "
-            "include every line the file must keep, exactly as-is."
+            "Search/replace edits to apply to an EXISTING file — the preferred "
+            "way to MODIFY a file (bounded output). Each edit's `search` must "
+            "match the file verbatim and exactly once. Leave empty for a new "
+            "file (use `content` instead)."
+        ),
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description=(
+            "The COMPLETE new contents of a NEW file (e.g. the regression "
+            "test). Use this for files that do not yet exist; for an existing "
+            "file prefer `edits`. Ignored when `edits` is non-empty."
         ),
     )
 
 
 class AuthoredDiff(BaseModel):
     """Structured output for the code_author behavior (ADR-037, amended by
-    ADR-038: full-content authoring).
+    ADR-038, then ADR-042: search/replace authoring).
 
-    The model AUTHORS the fix the brief describes by emitting, per changed
-    file, the FULL new file content — NOT a unified diff. The lab then
-    constructs the patch DETERMINISTICALLY (difflib over the cloned original +
-    this content), applies it in the sandbox, and runs the proof command — the
-    RUN decides success, never the model. Hand-computed `@@` hunk headers (the
-    standard LLM diff-authoring failure, branch#1667) are removed entirely:
-    the model supplies intent, the tooling supplies correct patch mechanics.
-    When the brief describes a defect the files must also add or extend a
-    regression test that fails without the fix."""
+    The model AUTHORS the fix the brief describes by emitting, per file, either
+    search/replace edits (to modify an existing file — bounded output) or full
+    content (to create a new file). The lab MATERIALIZES the new file contents
+    (apply each edit to the cloned original) and constructs the patch
+    DETERMINISTICALLY (difflib), applies it in the sandbox, and runs the proof
+    command — the RUN decides success, never the model. Hand-computed `@@` hunk
+    headers (branch#1667) stay gone; full-file re-emission (branch#1837's
+    max_tokens truncation) is replaced by bounded edits. When the brief
+    describes a defect the files must also add or extend a regression test that
+    fails without the fix."""
 
     files: list[AuthoredFile] = Field(
         default_factory=list,
         description=(
-            "One entry per file the fix changes or creates, each carrying the "
-            "file's COMPLETE new contents. Implement the fix the brief "
-            "describes AND, when the brief describes a defect, add or extend a "
-            "regression test that fails without the fix. Touch only the files "
-            "the fix requires."
+            "One entry per file the fix changes or creates. MODIFY an existing "
+            "file with `edits` (search/replace); CREATE a new file with "
+            "`content`. Implement the fix the brief describes AND, when the "
+            "brief describes a defect, add or extend a regression test that "
+            "fails without the fix. Touch only the files the fix requires."
         ),
     )
     notes: str = Field(
@@ -314,25 +362,27 @@ class LabMockProvider:
                     + f"[mock {digest}]"),
             )
         elif name == "AuthoredDiff":
-            # The full-content authoring mock (ADR-037 amended by ADR-038): a
-            # deterministic "model" that reads the relevant-file context in the
-            # prompt and emits the FULL new contents of each changed file — NOT
-            # a unified diff. The lab constructs the patch deterministically, so
-            # the mock never hand-computes a `@@` header (the very failure
-            # branch#1667 hit). Like the CodeOutcome mock reads exit codes, this
-            # reads the file under repair: when it sees the canned failing check
-            # (`sys.exit(1)`), it emits the repaired check.py content AND a
-            # regression test (the brief asks for one) — so fixtures can prove
-            # brief → authored content → deterministic patch → applied → proof
-            # passes → submit_pr without a live LLM. The lab still decides
-            # success from the RUN, never from this text.
+            # The search/replace authoring mock (ADR-037, amended by ADR-038
+            # then ADR-042): a deterministic "model" that reads the
+            # relevant-file context in the prompt and emits, per file, either a
+            # search/replace EDIT (to modify an existing file — bounded output)
+            # or full CONTENT (to create a new file). The lab materializes the
+            # new file contents and builds the patch deterministically, so the
+            # mock never hand-computes a `@@` header (branch#1667) and never
+            # re-emits a whole large file (branch#1837). Like the CodeOutcome
+            # mock reads exit codes, this reads the file under repair: when it
+            # sees the canned failing check (`sys.exit(1)`), it emits the edit
+            # that flips it AND a regression test (the brief asks for one) — so
+            # fixtures prove brief → authored edits → deterministic patch →
+            # applied → proof passes → submit_pr without a live LLM. The lab
+            # still decides success from the RUN, never from this text.
             blob = " ".join(str(getattr(m, "content", m)) for m in messages)
             test_path = f"tests/test_regression_{digest}.py"
             # A REAL regression test for the check.py defect: it RUNS check.py
             # and asserts exit 0. Against the unfixed clone (exits 1) it FAILS
             # (red); after the fix (exits 0) it PASSES (green). ADR-040 requires
             # this — a test asserting `True` would pass on the baseline and so
-            # prove nothing.
+            # prove nothing. A NEW file → full content.
             check_regression = AuthoredFile(
                 path=test_path,
                 content=(
@@ -355,8 +405,14 @@ class LabMockProvider:
             #   [[TESTONLY widget]]       → ONLY the test, no source fix (red on
             #                               baseline, still red after → the
             #                               branch#1704 test-only no-op)
-            widget_fix = AuthoredFile(path="widget.py",
-                                      content="def answer():\n    return 42\n")
+            # The source fix is a bounded EDIT (ADR-042): find the buggy line in
+            # the cloned widget.py (large OR small — both seed the same line)
+            # and replace it, without re-emitting the whole file.
+            widget_fix = AuthoredFile(
+                path="widget.py",
+                edits=[SearchReplaceEdit(
+                    search="    return 1  # BUG: should return 42",
+                    replace="    return 42")])
             widget_test = AuthoredFile(
                 path="tests/test_widget.py",
                 content=("from widget import answer\n\n\n"
@@ -385,7 +441,20 @@ class LabMockProvider:
                 content=("# Note to the lab\n\nThe source file named in the "
                          "brief was never provided in RELEVANT FILES, so no "
                          "source fix could be authored — only this note.\n"))
-            if "[[NOTEONLY" in blob:
+            if "[[BADSEARCH" in blob:
+                # ADR-042: an edit whose search block does NOT match the file —
+                # materialization fails, the failure feeds the bounded retry,
+                # and a still-failing fix records an honest gap (no PR). Locks
+                # "search-not-found → retry, not a silent mis-edit."
+                parsed = AuthoredDiff(
+                    files=[AuthoredFile(
+                        path="check.py",
+                        edits=[SearchReplaceEdit(
+                            search="THIS_BLOCK_IS_NOT_IN_THE_FILE_xyz",
+                            replace="import sys; sys.exit(0)")])],
+                    notes=(f"Emits a search block that does not match the file "
+                           f"(must be caught). [mock {digest}]"))
+            elif "[[NOTEONLY" in blob:
                 parsed = AuthoredDiff(
                     files=[note_only],
                     notes=(f"Could not author a source fix (target file not in "
@@ -417,14 +486,17 @@ class LabMockProvider:
                     notes=(f"Adds a regression test (tests/test_widget.py) for "
                            f"widget.answer() WITHOUT a source fix. [mock {digest}]"))
             elif "sys.exit(1)" in blob:
-                # The fix the brief implies: emit the repaired check.py (exits
-                # 0) as full content, and add the regression test the brief
-                # asks for. The lab diffs this against the cloned original.
+                # The fix the brief implies: a bounded EDIT flipping the failing
+                # check to exit 0 (ADR-042 — no whole-file re-emission), plus
+                # the regression test the brief asks for as a new file. The lab
+                # applies the edit to the cloned original and diffs the result.
                 parsed = AuthoredDiff(
-                    files=[AuthoredFile(path="check.py",
-                                        content="import sys; sys.exit(0)\n"),
+                    files=[AuthoredFile(
+                        path="check.py",
+                        edits=[SearchReplaceEdit(search="sys.exit(1)",
+                                                 replace="sys.exit(0)")]),
                            check_regression],
-                    notes=("Rewrites the failing check to exit 0 and adds a "
+                    notes=("Flips the failing check to exit 0 and adds a "
                            f"regression test ({test_path}). [mock {digest}]"))
             else:
                 # No recognizable target in context: author a regression test

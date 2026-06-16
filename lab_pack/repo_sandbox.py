@@ -349,6 +349,85 @@ def build_diff_from_new_files(repo_dir: str,
     return "".join(parts), None
 
 
+# ── search/replace materialization (ADR-042) ────────────────────────────────
+# The code_author step (ADR-037/038) used to emit the FULL new contents of each
+# changed file. For a large file that is unbounded output: branch#1837 hit the
+# model's max_tokens emitting all 26k chars of research_worker.py to fix ten
+# lines, the JSON truncated, and authoring produced "no usable output." ADR-042
+# bounds the output to the CHANGE: the model emits search/replace edits for an
+# existing file (and full content only for a NEW file). The lab MATERIALIZES the
+# new file contents here — apply each edit to the cloned original — then the
+# EXISTING deterministic-patch path (build_diff_from_new_files → difflib → git
+# apply) and the red-then-green proof are unchanged. The model supplies intent;
+# the tooling still owns patch mechanics.
+
+
+def apply_search_replace(original: str, edits: list[dict],
+                         path: str = "") -> tuple[str, Optional[str]]:
+    """Apply ordered search/replace edits to `original`. Each edit's `search`
+    block must appear EXACTLY ONCE in the progressively-edited text (an
+    ambiguous or missing block is an error fed back to the authoring retry, not
+    a silent mis-edit). Returns (new_text, error)."""
+    text = original
+    for i, ed in enumerate(edits or []):
+        search = ed.get("search") or ""
+        replace = ed.get("replace") or ""
+        if not search:
+            return "", (f"edit {i + 1} for {path}: empty search block — create "
+                        "a new file with `content`, not an empty-search edit")
+        count = text.count(search)
+        if count == 0:
+            return "", (f"edit {i + 1} for {path}: search block not found "
+                        f"(it must match the file verbatim): {search[:160]!r}")
+        if count > 1:
+            return "", (f"edit {i + 1} for {path}: search block is ambiguous "
+                        f"({count} matches) — include more surrounding context "
+                        f"so it is unique: {search[:160]!r}")
+        text = text.replace(search, replace, 1)
+    return text, None
+
+
+def materialize_authored_files(repo_dir: str,
+                               authored: list[dict]) -> tuple[dict[str, str],
+                                                              Optional[str]]:
+    """Turn the model's authored files (ADR-042) into {path: full new content}
+    against the cloned originals, ready for build_diff_from_new_files. Each
+    entry is {path, edits?, content?}: `edits` (search/replace) apply to the
+    cloned original (which must exist); `content` is used verbatim (a new file,
+    or a whole-file rewrite when no edits are given). `edits` wins when both are
+    present. Returns (new_files, error) — a path escaping the repo, a missing
+    original for an edit, or a non-matching search block is an error."""
+    root = os.path.normpath(repo_dir)
+    new_files: dict[str, str] = {}
+    for entry in authored or []:
+        raw_path = entry.get("path")
+        if not raw_path:
+            continue
+        rel = (raw_path or "").replace(os.sep, "/").lstrip("./")
+        full = os.path.normpath(os.path.join(repo_dir, rel))
+        if not (full == root or full.startswith(root + os.sep)):
+            return {}, f"refusing authored path outside the repo: {raw_path}"
+        edits = entry.get("edits") or []
+        content = entry.get("content")
+        if edits:
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    original = f.read()
+            except (OSError, UnicodeDecodeError):
+                return {}, (f"cannot edit {rel}: the file is not in the clone "
+                            "(use `content` to create a new file)")
+            new_text, err = apply_search_replace(original, edits, rel)
+            if err:
+                return {}, err
+            new_files[rel] = new_text
+        elif content is not None:
+            new_files[rel] = content
+        else:
+            return {}, (f"authored file {rel} carries neither edits nor "
+                        "content — nothing to apply")
+    return new_files, None
+
+
 def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     """git apply a unified diff inside the cloned repo. Returns an error
     string or None."""
@@ -564,18 +643,27 @@ def run_repo_task(
     ref: Optional[str] = None,
     diff: Optional[str] = None,
     new_files: Optional[dict[str, str]] = None,
+    authored_files: Optional[list[dict]] = None,
     test_paths: Optional[list[str]] = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     mem_limit_mb: int = DEFAULT_MEM_LIMIT_MB,
 ) -> dict[str, Any]:
     """Clone an allowlisted repo, run `command`, and (for a fix-task) apply a
-    patch and re-run to prove it. The patch comes one of two ways:
+    patch and re-run to prove it. The patch comes one of three ways:
 
-      * `diff`      — a candidate unified diff supplied with the task (ADR-036).
-      * `new_files` — {path: full new content} the code_author step emitted
-                      (ADR-037/038); the lab builds the patch DETERMINISTICALLY
-                      (difflib over the cloned original) so no hand-computed
-                      hunk header can be wrong. `new_files` wins if both given.
+      * `diff`           — a candidate unified diff supplied with the task
+                           (ADR-036).
+      * `authored_files` — the code_author step's search/replace output
+                           (ADR-042): [{path, edits?, content?}]. The lab
+                           MATERIALIZES the new file contents against the cloned
+                           originals (apply each edit), then builds the patch.
+      * `new_files`      — {path: full new content} (ADR-038, still accepted);
+                           the lab builds the patch DETERMINISTICALLY (difflib
+                           over the cloned original) so no hand-computed hunk
+                           header can be wrong.
+
+    Precedence when several are given: `new_files` (already materialized) wins,
+    then `authored_files`, then `diff`.
 
     `test_paths` (ADR-039/040): repo-relative paths of authored regression
     tests — pytest files the proof command does NOT itself run, AND/OR fixture
@@ -642,6 +730,16 @@ def run_repo_task(
 
         baseline = _exec(command, repo_dir, timeout_seconds, mem_limit_mb)
         base_result["baseline"] = baseline
+
+        # ADR-042: materialize the model's search/replace edits into full new
+        # file contents against the cloned originals, then fall into the SAME
+        # deterministic-patch path the full-content case (ADR-038) uses.
+        if authored_files and not new_files and not diff:
+            new_files, mat_err = materialize_authored_files(repo_dir,
+                                                            authored_files)
+            if mat_err:
+                base_result["error"] = mat_err
+                return base_result
 
         # ADR-038: build the patch deterministically from authored full-file
         # contents (diffing the cloned original) — never trust a model-written
