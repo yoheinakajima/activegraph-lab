@@ -3285,6 +3285,166 @@ def run_code_authoring() -> bool:
     return c.done("code_authoring")
 
 
+def run_search_replace_authoring() -> bool:
+    """ADR-042: search/replace authoring. The code_author step emits EDITS for an
+    existing file (and full content only for a NEW file); the lab materializes
+    the new contents against the cloned original, then builds the patch
+    deterministically. This bounds the model's output to the CHANGE — the
+    branch#1837 max_tokens truncation (re-emitting a 26k file to fix ten lines).
+    Unit: apply_search_replace + materialize_authored_files; end-to-end: a
+    bounded edit proves and its diff touches only the changed line; a
+    non-matching search block is caught, retried, and earns no PR."""
+    spec = _load("search_replace_authoring.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: search_replace_authoring — bounded edits → materialize → "
+          "deterministic patch → prove; bad search caught + retried")
+    print("=" * 64)
+
+    import os
+    from lab_pack import github_write, repo_sandbox
+    from lab_pack.repo_sandbox import (apply_search_replace,
+                                       materialize_authored_files)
+
+    c = Check()
+
+    # ── unit: apply_search_replace — match-once, missing, ambiguous ──────────
+    new, err = apply_search_replace("a\nB\nc\n",
+                                    [{"search": "B", "replace": "b"}], "f.py")
+    c.that(new == "a\nb\nc\n" and err is None,
+           f"apply_search_replace replaces a unique block ({new!r}, {err})")
+    _new, err = apply_search_replace("a\nb\n",
+                                     [{"search": "ZZZ", "replace": "q"}], "f.py")
+    c.that(err is not None and "not found" in err,
+           "a search block absent from the file is an error (not a silent skip)")
+    _new, err = apply_search_replace("x\nx\n",
+                                     [{"search": "x", "replace": "y"}], "f.py")
+    c.that(err is not None and "ambiguous" in err,
+           "an ambiguous search block (>1 match) is an error")
+
+    # ── unit: materialize_authored_files — edits over the clone + a new file ──
+    big = ("# header\n" + "".join(f"# pad {i:04d}\n" for i in range(300))
+           + "VALUE = 1  # BUG\n")
+    workdir = __import__("tempfile").mkdtemp(prefix="lab-srmat-")
+    repo_dir = os.path.join(workdir, "repo")
+    os.makedirs(repo_dir)
+    with open(os.path.join(repo_dir, "mod.py"), "w") as f:
+        f.write(big)
+    authored = [
+        {"path": "mod.py",
+         "edits": [{"search": "VALUE = 1  # BUG", "replace": "VALUE = 42"}],
+         "content": None},
+        {"path": "tests/test_mod.py",
+         "edits": [],
+         "content": "from mod import VALUE\n\n\ndef test_v():\n    assert VALUE == 42\n"},
+    ]
+    new_files, mat_err = materialize_authored_files(repo_dir, authored)
+    c.that(mat_err is None
+           and new_files.get("mod.py", "").endswith("VALUE = 42\n")
+           and "# pad 0299" in new_files.get("mod.py", "")
+           and "tests/test_mod.py" in new_files,
+           f"materialize applies edits to the clone (preserving padding) and "
+           f"creates the new file ({mat_err})")
+    # The built diff is BOUNDED — only the changed line, not the 300 pad lines.
+    built, _e = repo_sandbox.build_diff_from_new_files(repo_dir, new_files)
+    c.that("VALUE = 1  # BUG" in built and "VALUE = 42" in built
+           and "# pad 0150" not in built and len(built) < 2000,
+           f"the built diff is bounded to the change ({len(built)} chars), not "
+           "the whole file")
+    # A path escaping the repo is refused.
+    _nf, esc = materialize_authored_files(
+        repo_dir, [{"path": "sub/../../evil.py", "edits": [],
+                    "content": "x\n"}])
+    c.that(esc is not None and "outside the repo" in esc,
+           f"a path escaping the repo is refused ({esc!r})")
+    __import__("shutil").rmtree(workdir, ignore_errors=True)
+
+    # ── end-to-end: a bounded edit proves; a bad search is caught + retried ──
+    def fake_clone(repo, ref, dest):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "check.py"), "w") as f:
+            f.write(_CHECK_FAIL)
+        return None
+
+    rt = _new_runtime(spec, with_gateway=False, with_comm=False)
+    g = rt.graph
+    mission = create_mission_fn(g, spec["mission"]["title"], target_url="")
+
+    def task_for(branch_id):
+        return next((t for t in g.objects(type="task")
+                     if (t.data.get("metadata") or {}).get("lab_branch_id")
+                     == branch_id), None)
+
+    def drive(bspec):
+        b = create_branch_fn(g, mission.id, bspec["title"],
+                             bspec["brief"].strip(), status="proposed")
+        rt.run_until_idle()
+        g.patch_object(b.id, {"metadata": {"code_task": {
+            "repo": bspec["repo"], "command": bspec["command"],
+            "propose_pr": True, "brief": bspec["brief"].strip()}}})
+        activate_branch_fn(g, b.id)
+        rt.run_until_idle()
+        return b
+
+    opener_calls: list = []
+    github_write.set_pr_opener(
+        lambda *a, **k: (opener_calls.append((a, k)) or {"url": "x", "number": 0,
+                                                         "head": "x", "base": "x"}))
+    repo_sandbox.set_clone_hook(fake_clone)
+    try:
+        # Leg 1: bounded edit proves → PENDING submit_pr.
+        b1 = drive(spec["author_edit"])
+        t1 = task_for(b1.id)
+        runs1 = [o for o in _lab_obs(g, "code_authored_run")
+                 if (o.data.get("metadata") or {}).get("lab_branch_id") == b1.id]
+        diff1 = ((runs1[0].data.get("metadata") or {}).get("authored_diff")
+                 or "") if runs1 else ""
+        c.that("sys.exit(0)" in diff1 and "sys.exit(1)" in diff1,
+               "the bounded edit flips the failing check (the diff shows both)")
+        c.that(t1 is not None and t1.data.get("status") == "done",
+               f"the proven bounded-edit fix completes the task "
+               f"({t1.data.get('status') if t1 else None})")
+        pr1 = [d for d in g.objects(type="decision")
+               if d.data.get("kind") == "submit_pr"
+               and (d.data.get("metadata") or {}).get("lab_branch_id") == b1.id]
+        c.that(len(pr1) == 1 and pr1[0].data.get("status") == "pending",
+               "a PENDING submit_pr is opened for the bounded-edit fix")
+        print("  edit: bounded search/replace → proven → PENDING submit_pr")
+
+        # Leg 2: a search block that does not match → caught, retried, no PR.
+        b2 = drive(spec["author_bad_search"])
+        t2 = task_for(b2.id)
+        runs2 = [o for o in _lab_obs(g, "code_authored_run")
+                 if (o.data.get("metadata") or {}).get("lab_branch_id") == b2.id]
+        c.that(len(runs2) == spec["settings"]["code_author_max_attempts"],
+               f"a non-matching search block retries to the bound "
+               f"({len(runs2)}/{spec['settings']['code_author_max_attempts']})")
+        err2 = ((runs2[-1].data.get("metadata") or {}).get("run") or {}).get("run_error") \
+            if runs2 else ""
+        c.that(err2 and "not found" in err2,
+               f"the run records the search-not-found materialization error "
+               f"({(err2 or '')[:80]!r})")
+        gap2 = [e for e in g.objects(type="evaluation")
+                if (e.data.get("metadata") or {}).get("lab") == "code_authoring_failed"
+                and (e.data.get("metadata") or {}).get("lab_branch_id") == b2.id]
+        c.that(len(gap2) == 1,
+               "an honest authoring_unproven gap is recorded for the bad search")
+        c.that(t2 is not None and t2.data.get("status") == "rejected"
+               and not [d for d in g.objects(type="decision")
+                        if d.data.get("kind") == "submit_pr"
+                        and (d.data.get("metadata") or {}).get("lab_branch_id") == b2.id],
+               "a fix whose edit never applies opens NO submit_pr")
+        print("  bad-search: not found → retried → honest gap, no PR")
+
+        c.that(not opener_calls,
+               "NO write token is exercised — the submit_pr stays the "
+               "operator's tap")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        github_write.set_pr_opener(None)
+
+    return c.done("search_replace_authoring")
+
+
 def run_red_green_proof() -> bool:
     """ADR-040: red-then-green proof for any authored test — pytest OR fixture
     .yaml. A self-repair's regression test must FAIL against the unfixed
@@ -5019,6 +5179,7 @@ def run_all() -> None:
         run_research_worker(),
         run_code_worker(),
         run_code_authoring(),
+        run_search_replace_authoring(),
         run_red_green_proof(),
         run_target_file_delivery(),
         run_submit_pr(),

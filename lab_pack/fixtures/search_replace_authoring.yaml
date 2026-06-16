@@ -1,0 +1,40 @@
+# ADR-042: search/replace authoring — the code_author step emits search/replace
+# EDITS for an existing file (and full content only for a NEW file), and the lab
+# materializes the new contents against the cloned original before building the
+# patch deterministically. This bounds the model's output to the CHANGE, not the
+# whole file: branch#1837 hit the model's max_tokens re-emitting all 26k chars of
+# research_worker.py to fix ten lines, the JSON truncated, and authoring produced
+# "no usable output." Edits emit a few lines instead.
+#
+# The LLM is MOCKED (no live LLM in fixtures): the mock emits a bounded edit for
+# the source fix plus a regression test as a new file. A [[BADSEARCH]] brief
+# drives an edit whose search block does not match — proving search-not-found
+# feeds the bounded retry rather than mis-editing silently.
+settings:
+  crawl_enabled: false
+  code_worker_enabled: true
+  code_author_max_attempts: 2
+
+mission:
+  title: Search/replace authoring mission
+
+# An authoring task that PROVES via a bounded edit: the mock flips the failing
+# check with a search/replace edit (not a whole-file rewrite) and adds a
+# regression test. The built diff must touch only the changed line.
+author_edit:
+  title: Author a bounded search/replace fix and prove it
+  brief: >
+    The smoke check in check.py exits nonzero on main. Author a minimal fix so
+    it exits 0, and add a regression test so the defect cannot return.
+  repo: yoheinakajima/activegraph-lab
+  command: "python check.py"
+
+# An authoring task whose edit's search block does NOT match the file: the lab
+# must catch it (materialization error), feed it to the bounded retry, and —
+# still failing — record an honest gap and open NO submit_pr.
+author_bad_search:
+  title: Author an edit whose search block does not match
+  brief: >
+    Fix the check in check.py. [[BADSEARCH]]
+  repo: yoheinakajima/activegraph-lab
+  command: "python check.py"
