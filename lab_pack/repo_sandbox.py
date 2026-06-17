@@ -428,6 +428,35 @@ def materialize_authored_files(repo_dir: str,
     return new_files, None
 
 
+def parse_guard_error(new_files: dict[str, str]) -> Optional[str]:
+    """Reject any authored Python file that does not parse BEFORE it can be
+    built into a patch and proven (ADR-043). A truncated or otherwise
+    unparseable `.py` raises SyntaxError on import, so the lab must NEVER let
+    one become a submit_pr.
+
+    This is the hard backstop for the branch#1859 failure: a 26k-char target
+    (research_worker.py) was shown to the authoring step as TRUNCATED context
+    (clone_and_read caps a non-hint file via _truncate and appends a
+    '…[truncated, N chars total]' marker), the model re-emitted it whole as
+    `content` instead of a bounded edit, materialization replaced the file with
+    that truncated text, and the truncation marker — a SyntaxError — was
+    committed and shipped to main. The proof command often catches such a break
+    (the fixtures fail to import), but a fix that does not import the broken
+    module would not — so the guard is UNCONDITIONAL and sits ahead of the
+    build. Returns an error string for the first non-parsing file, else None."""
+    for path, content in (new_files or {}).items():
+        if not (path or "").endswith(".py"):
+            continue
+        try:
+            compile(content or "", path, "exec")
+        except SyntaxError as exc:
+            return (f"authored file {path} does not parse "
+                    f"(SyntaxError: {exc.msg} at line {exc.lineno or '?'}) — "
+                    "refusing to build a patch from an unparseable file; "
+                    "opening no PR")
+    return None
+
+
 def _apply_diff(repo_dir: str, diff: str) -> Optional[str]:
     """git apply a unified diff inside the cloned repo. Returns an error
     string or None."""
@@ -739,6 +768,19 @@ def run_repo_task(
                                                             authored_files)
             if mat_err:
                 base_result["error"] = mat_err
+                return base_result
+
+        # ADR-043: a syntactically broken authored file must never become a
+        # patch. Parse-check every authored .py (materialized from edits OR
+        # supplied whole as new_files) BEFORE building the diff — the
+        # branch#1859 truncated-file commit, which reached main and broke the
+        # boot, must not recur. The guard sits ahead of the build so a fix that
+        # never imports the broken module cannot slip past the proof command.
+        if new_files:
+            guard_err = parse_guard_error(new_files)
+            if guard_err:
+                base_result["error"] = guard_err
+                base_result["proven"] = False
                 return base_result
 
         # ADR-038: build the patch deterministically from authored full-file

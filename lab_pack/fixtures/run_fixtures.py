@@ -3303,7 +3303,8 @@ def run_search_replace_authoring() -> bool:
     import os
     from lab_pack import github_write, repo_sandbox
     from lab_pack.repo_sandbox import (apply_search_replace,
-                                       materialize_authored_files)
+                                       materialize_authored_files,
+                                       parse_guard_error)
 
     c = Check()
 
@@ -3356,7 +3357,57 @@ def run_search_replace_authoring() -> bool:
                     "content": "x\n"}])
     c.that(esc is not None and "outside the repo" in esc,
            f"a path escaping the repo is refused ({esc!r})")
+
+    # ── ADR-043: the parse-guard rejects an unparseable authored .py ─────────
+    # The branch#1859 failure baked a '…[truncated, N chars total]' marker into
+    # research_worker.py (a non-hint target shown as TRUNCATED context, the
+    # model re-emitted it whole as `content`); the truncated source raised
+    # SyntaxError and broke main's boot. The guard catches it BEFORE a patch.
+    truncated = ("def _source_urls(graph, task_data, cap):\n"
+                 "    meta = task_data.get('metadata') or {}\n"
+                 "    state['failed'].append({'url': url, \n"
+                 "…[truncated, 26366 chars total]")
+    c.that(parse_guard_error({"lab_pack/research_worker.py": truncated})
+           is not None,
+           "the parse-guard rejects a truncated/unparseable authored .py "
+           "(the branch#1859 shape)")
+    c.that(parse_guard_error({"mod.py": "def f(:\n    pass\n"}) is not None,
+           "the parse-guard rejects a SyntaxError authored .py")
+    c.that(parse_guard_error({"mod.py": "VALUE = 42\n"}) is None,
+           "the parse-guard passes a well-formed authored .py")
+    c.that(parse_guard_error({"notes.md": "def f(:\n"}) is None,
+           "the parse-guard ignores non-Python files (only .py is compiled)")
     __import__("shutil").rmtree(workdir, ignore_errors=True)
+
+    # ── end-to-end: run_repo_task refuses to build a patch from a broken file ─
+    # The same truncation, driven through the real apply-and-prove entry point:
+    # the result carries the parse error, proven is False, and NO diff is built.
+    gdir = __import__("tempfile").mkdtemp(prefix="lab-guard-")
+    grepo = os.path.join(gdir, "repo")
+    os.makedirs(grepo)
+    with open(os.path.join(grepo, "mod.py"), "w") as f:
+        f.write("VALUE = 1  # BUG\n")
+
+    def guard_clone(repo, ref, dest):
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, "mod.py"), "w") as f:
+            f.write("VALUE = 1  # BUG\n")
+        return None
+
+    repo_sandbox.set_clone_hook(guard_clone)
+    try:
+        gres = repo_sandbox.run_repo_task(
+            "yoheinakajima/activegraph-lab", "python -c \"import mod\"",
+            authored_files=[{"path": "mod.py", "edits": [],
+                             "content": "VALUE = 1  # BUG\n"
+                                        "def broken(:\n"}])
+        c.that(gres.get("error") and "does not parse" in gres["error"]
+               and not gres.get("proven") and not gres.get("diff"),
+               "run_repo_task refuses an unparseable authored file: error set, "
+               f"no patch, not proven ({(gres.get('error') or '')[:60]!r})")
+    finally:
+        repo_sandbox.set_clone_hook(None)
+        __import__("shutil").rmtree(gdir, ignore_errors=True)
 
     # ── end-to-end: a bounded edit proves; a bad search is caught + retried ──
     def fake_clone(repo, ref, dest):

@@ -199,18 +199,21 @@ def _source_urls(graph, task_data: dict, cap: int) -> list[str]:
     """Candidate sources for a research task, deduped and capped: the
     branch's claim observation URL, the mission's target URL, and any URLs
     written into the task description / claim text (the operator can steer
-    sources by mentioning links). An operator_direction on the task
-    (ADR-027) is scanned the same way — direction URLs come FIRST: the
-    operator named them deliberately, so the fetch cap must not starve them
-    behind the defaults."""
+    sources by mentioning links). Operator-named URLs come FIRST: an
+    operator_direction (ADR-027), then the URLs the operator wrote into the
+    task description and the metadata.activation_message — the operator
+    named them deliberately, so the fetch cap must not starve them behind the
+    derived claim/mission defaults."""
     meta = task_data.get("metadata") or {}
     direction = (meta.get("operator_direction") or "").strip()
     candidates: list[str] = _URL_RE.findall(direction) if direction else []
-    # Operator-supplied URLs (task description + activation_message) come
-    # ahead of the derived claim/mission defaults: the operator named these
-    # deliberately, so the fetch cap must not starve them behind defaults.
-    candidates.extend(_URL_RE.findall(task_data.get("description") or ""))
-    candidates.extend(_URL_RE.findall(meta.get("activation_message") or ""))
+    # Operator-supplied URLs (task description + activation_message) lead the
+    # derived defaults: after operator_direction, before the claim/mission
+    # URLs appended below.
+    for t in (task_data.get("description") or "",
+              meta.get("activation_message") or ""):
+        candidates.extend(_URL_RE.findall(t))
+    claim_texts: list[str] = []
     branch = graph.get_object(meta.get("lab_branch_id")) \
         if meta.get("lab_branch_id") else None
     if branch is not None:
@@ -218,7 +221,7 @@ def _source_urls(graph, task_data: dict, cap: int) -> list[str]:
         claim = graph.get_object(b_meta.get("claim_observation_id")) \
             if b_meta.get("claim_observation_id") else None
         if claim is not None:
-            candidates.extend(_URL_RE.findall(claim.data.get("text") or ""))
+            claim_texts.append(claim.data.get("text") or "")
             c_url = (claim.data.get("metadata") or {}).get("url")
             if c_url:
                 candidates.append(c_url)
@@ -226,6 +229,8 @@ def _source_urls(graph, task_data: dict, cap: int) -> list[str]:
             if branch.data.get("mission_id") else None
         if mission is not None and (mission.data.get("target_url") or "").strip():
             candidates.append(mission.data["target_url"].strip())
+    for t in claim_texts:
+        candidates.extend(_URL_RE.findall(t))
     out: list[str] = []
     for u in candidates:
         clean = _clean_url(u)
@@ -435,5 +440,155 @@ def research_intake(event, graph, ctx, *, settings: LabSettings):
     url = env_url or ""
 
     if fetch_error or (isinstance(status, int) and (status == 0 or status >= 400)):
-        state["failed"].append({"url": url, 
-…[truncated, 26366 chars total]
+        state["failed"].append({"url": url, "status": status,
+                                "error": str(fetch_error or f"status {status}")})
+    else:
+        from .behaviors import _strip_html
+        state["sources"].append({
+            "url": _clean_url(url),
+            "status": status,
+            "source_id": obj_id,
+            "excerpt": _strip_html(html)[:_EXCERPT_CHARS],
+        })
+        # ADR-022/020: a repo tree expands into file-content fetches so the
+        # CONTENTS (not just the tree) become evidence — within the cap.
+        _maybe_expand_repo_tree(graph, task_id, state, call_id, html)
+    _patch_progress(graph, task_id, state, url)
+
+    if state["pending"]:
+        return
+
+    # Last fetch landed: synthesize, or fail with the errors on the record.
+    if not state["sources"]:
+        errs = "; ".join(f"{f['url']}: {f['error']}" for f in state["failed"])
+        _fail_task(graph, task_id,
+                   f"research_worker: all {len(state['failed'])} source "
+                   f"fetches failed ({errs})")
+        return
+    if task_id in _SYNTH_REQUESTED:
+        return
+    _SYNTH_REQUESTED.add(task_id)
+    task = graph.get_object(task_id)
+    intent = (task.data.get("description") or "") if task is not None else ""
+    text = (f"Research synthesis request: synthesize "
+            f"{len(state['sources'])} fetched source(s) for task "
+            f"'{task.data.get('title') if task else task_id}'. Every "
+            "finding must attribute the source URL(s) it rests on.")
+    meta = {"lab": "research_synthesis_request",
+            "task_id": task_id,
+            "lab_branch_id": state["branch_id"],
+            "intent": intent[:300],
+            "sources": state["sources"],
+            "failed_fetches": state["failed"]}
+    direction = state.get("direction") or ""
+    if direction:
+        # The worker must be able to read what the operator ordered: the
+        # direction rides whole in the request's metadata AND as a delimited
+        # block in the text the model's view serializes (ADR-027 — the seam
+        # truncation lesson: an excerpt here IS a truncation in the output).
+        meta["operator_direction"] = direction
+        text += ("\n\nOPERATOR DIRECTION (verbatim — this direction governs "
+                 "source selection and synthesis focus):\n" + direction)
+    graph.add_object("observation", {
+        "text": text,
+        "confidence": 1.0,
+        "category": "fact",
+        "metadata": meta,
+    })
+
+
+@llm_behavior(
+    name="research_worker",
+    on=["object.created"],
+    where={"object.type": "observation",
+           "object.data.metadata.lab": "research_synthesis_request"},
+    description=_PROMPT,
+    output_schema=ResearchSynthesis,
+    model=None,  # routes through setting.model.research_worker (ADR-019)
+    view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
+    creates=["observation", "evaluation"],
+    max_tokens=2048,
+    tools=[],
+)
+def research_worker(event, graph, ctx, out, *, settings: LabSettings):
+    """Synthesize fetched sources into attributed evidence and complete the task.
+
+    Creates: one observation per source-attributed finding (source_ids +
+    metadata.source_urls; findings citing no fetched URL are dropped and
+    counted), one evaluation linked supported_by to the branch, and the
+    task completion patch (work's outcome path takes it from there). Inert
+    output → task failed with the reason recorded.
+    """
+    consume_llm_anomalies(graph)
+    obj = event.payload.get("object", {})
+    data = obj.get("data", {})
+    meta = data.get("metadata") or {}
+    task_id = meta.get("task_id")
+    branch_id = meta.get("lab_branch_id")
+    if not task_id or task_id in _SYNTHESIZED:
+        return
+    _SYNTHESIZED.add(task_id)
+    if not settings.research_worker_enabled:
+        return
+
+    if out is None or is_inert(getattr(out, "summary", None)) or not out.findings:
+        _fail_task(graph, task_id,
+                   "research_worker: synthesis produced no usable output "
+                   "(LLM budget, pause, or parse failure — see the "
+                   "preceding observation)")
+        return
+
+    fetched = {s["url"]: s["source_id"] for s in (meta.get("sources") or [])}
+    stamp = seam_versions_stamp(graph, "prompt.research_worker")
+    written = 0
+    dropped = 0
+    for f in out.findings:
+        urls = [_clean_url(u) for u in (f.source_urls or [])]
+        urls = [u for u in urls if u in fetched]
+        if not urls or not (f.text or "").strip():
+            dropped += 1  # attribution is the contract, not a suggestion
+            continue
+        obs = graph.add_object("observation", {
+            "text": f.text.strip(),
+            "confidence": 0.8,
+            "source_ids": [fetched[u] for u in urls],
+            "category": "fact",
+            "metadata": {"lab": "research_finding", "task_id": task_id,
+                         "lab_branch_id": branch_id, "source_urls": urls,
+                         "seam_versions": stamp},
+        })
+        if branch_id:
+            graph.add_relation(branch_id, obs.id, "supported_by")
+        written += 1
+
+    if not written:
+        _fail_task(graph, task_id,
+                   f"research_worker: synthesis returned {dropped} finding(s) "
+                   "but none carried a valid fetched-source attribution")
+        return
+
+    summary = (out.summary or "").strip()[:500]
+    evaluation = graph.add_object("evaluation", {
+        "subject_id": task_id,
+        "subject_type": "task",
+        "judgment": "research_synthesized",
+        "rationale": (summary +
+                      (f" ({dropped} unattributable finding(s) dropped.)"
+                       if dropped else "")),
+        "evaluator": "lab.research_worker",
+        "metadata": {"lab": "research_synthesis", "task_id": task_id,
+                     "lab_branch_id": branch_id,
+                     "findings_written": written,
+                     "findings_dropped": dropped,
+                     "seam_versions": stamp},
+    })
+    if branch_id:
+        graph.add_relation(branch_id, evaluation.id, "supported_by")
+
+    task = graph.get_object(task_id)
+    t_meta = dict((task.data.get("metadata") if task else {}) or {})
+    t_meta["result_summary"] = summary
+    graph.patch_object(task_id, {"status": "done", "metadata": t_meta})
+
+
+RESEARCH_BEHAVIORS = [research_intake, research_worker]
