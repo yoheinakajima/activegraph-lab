@@ -87,6 +87,14 @@ SEAM_ELIGIBLE_SETTINGS: frozenset[str] = frozenset({
     # MCP surface (ADR-016): send_chat's bounded reply wait — client-facing
     # latency policy, not auth, gating, or budget.
     "mcp_reply_wait_seconds",
+    # The daily heartbeat (ADR-044): cadence, the rotating worklist, and the
+    # spend ceiling are operator policy tuned through the gate — and the
+    # cadence seam ("off") is the heartbeat's instant, no-deploy kill. The
+    # heartbeat's GATE and its clamp to the daily cost cap / kernel ceiling
+    # stay in code; only these three knobs are seam-eligible.
+    "heartbeat_cadence",
+    "heartbeat_worklist",
+    "heartbeat_budget_ceiling_usd",
 })
 
 # Word-ish boundary match so "lab_pack.kernel" hits imports, attribute

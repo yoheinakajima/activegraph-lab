@@ -5201,6 +5201,185 @@ def run_provenance_footer() -> bool:
     return c.done("provenance_footer")
 
 
+def run_heartbeat() -> bool:
+    spec = _load("heartbeat.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: heartbeat — a bounded, gated, killable daily standing "
+          "behavior (ADR-044): one worklist step per cadence window, budget-"
+          "floored, never self-approving")
+    print("=" * 64)
+
+    from datetime import datetime, timezone, timedelta
+    from lab_pack.behaviors import emit_lab_event
+    from lab_pack.heartbeat import maybe_heartbeat, TICK_EVENTS
+    from lab_pack.llm import reset_llm_session
+    from lab_pack.seams import clear_seam_cache
+
+    def fresh(settings=None):
+        clear_lab_registry()
+        reset_llm_session()
+        rt = Runtime(Graph(), llm_provider=LabMockProvider())
+        rt.load_pack(core_pack, settings=CoreSettings())
+        rt.load_pack(lab_pack, settings=settings or LabSettings())
+        bind_live_behaviors(rt)
+        return rt
+
+    def ticks(g):
+        return [e for e in g.events if str(e.type) in TICK_EVENTS]
+
+    def fired(g):
+        return [e for e in g.events if str(e.type) == "heartbeat.fired"]
+
+    def skipped(g):
+        return [e for e in g.events if str(e.type) == "heartbeat.skipped"]
+
+    def approve_seam(g, seam_name, body):
+        # An APPROVED seam artifact — the gate-promoted self-modification the
+        # operator tunes the heartbeat with (here pre-approved for the fixture).
+        g.add_object("artifact", {
+            "kind": "seam", "title": f"{seam_name} v1", "content": body,
+            "format": "plain_text", "status": "approved",
+            "metadata": {"lab": "seam", "seam_name": seam_name, "version": 1}})
+        clear_seam_cache()
+
+    def gate_unchanged(g):
+        """The heartbeat never resolves a decision, publishes, opens a PR, or
+        fires a steering verb — every downstream last mile is still human."""
+        decided = [d for d in g.objects(type="decision")
+                   if d.data.get("status") in ("approved", "rejected")]
+        return (not decided
+                and not any(d.data.get("kind") == "submit_pr"
+                            for d in g.objects(type="decision"))
+                and not any(a.data.get("status") == "published"
+                            for a in g.objects(type="artifact"))
+                and not any(str(e.type) == "lab.steering_applied"
+                            for e in g.events))
+
+    c = Check()
+    day1 = datetime(2026, 6, 21, 12, 0, 0, tzinfo=timezone.utc)
+    day2 = day1 + timedelta(days=1)
+
+    # ── A tick WITHIN the window advances exactly ONE worklist item ──────────
+    rt = fresh()
+    g = rt.graph
+    m = create_mission_fn(g, spec["mission"]["title"],
+                          target_url=spec["mission"]["target_url"])
+    branches = [create_branch_fn(g, m.id, b["title"], b["intent"])
+                for b in spec["branches"]]
+    b1, b2 = branches[0].id, branches[1].id
+    rt.run_until_idle()
+
+    res = maybe_heartbeat(rt, now=day1)
+    c.that(res["status"] == "fired" and res["step"] == "advance_branch",
+           f"within the window: the tick FIRES and advances the default "
+           f"worklist step ({res.get('status')}/{res.get('step')})")
+    c.that(len(fired(g)) == 1, f"exactly one heartbeat.fired event ({len(fired(g))})")
+    fe = fired(g)[0]
+    c.that(fe.payload.get("step") == "advance_branch"
+           and fe.payload.get("target") == b1,
+           "the tick advances exactly the OLDEST proposed branch")
+    c.that(fe.payload.get("window") == "daily:2026-06-21",
+           f"the tick stamps its cadence window ({fe.payload.get('window')})")
+    c.that(g.get_object(b1).data.get("status") != "proposed",
+           "the advanced branch left 'proposed' (dispatch reacts)")
+    c.that(g.get_object(b2).data.get("status") == "proposed",
+           "EXACTLY ONE item advanced — the second branch is untouched")
+    c.that(gate_unchanged(g),
+           "the gate is unchanged: the heartbeat approves/promotes/submits "
+           "nothing — downstream stays a human decision")
+
+    # ── A second tick in the SAME window is a no-op (idempotent) ─────────────
+    n_before = len(ticks(g))
+    res2 = maybe_heartbeat(rt, now=day1)
+    c.that(res2["status"] == "noop" and res2["reason"] == "already_ticked",
+           "a second tick in the same window is a no-op")
+    c.that(len(ticks(g)) == n_before, "the no-op emits no new tick event")
+
+    # ── Restart mid-window does not double-fire (window key lives in the log) ─
+    clear_lab_registry()      # process state gone; the durable log remains
+    reset_llm_session()
+    bind_live_behaviors(rt)
+    res3 = maybe_heartbeat(rt, now=day1)
+    c.that(res3["status"] == "noop" and res3["reason"] == "already_ticked",
+           "restart mid-window does NOT double-fire — idempotent off the log")
+    c.that(len(fired(g)) == 1, "still exactly one heartbeat.fired after restart")
+
+    # ── A NEW window fires again, advancing the next backlog item ────────────
+    res4 = maybe_heartbeat(rt, now=day2)
+    c.that(res4["status"] == "fired", "a new cadence window fires again")
+    c.that(len(fired(g)) == 2, "the rollover adds a second heartbeat.fired")
+    c.that(fired(g)[-1].payload.get("window") == "daily:2026-06-22",
+           "the second tick stamps the NEXT window")
+    c.that(g.get_object(b2).data.get("status") != "proposed",
+           "the rollover advances the next item in the backlog")
+    c.that(gate_unchanged(g), "the gate stays unchanged across windows")
+
+    # ── Spend over the ceiling: heartbeat.skipped:budget, NO work ────────────
+    rt = fresh()
+    g = rt.graph
+    m = create_mission_fn(g, "Budget mission",
+                          target_url=spec["mission"]["target_url"])
+    bb = create_branch_fn(g, m.id, "Budget branch",
+                          "Read the site and check a claim.").id
+    rt.run_until_idle()
+    emit_lab_event(g, "llm.responded",
+                   {"cost_usd": float(spec["budget"]["synthetic_spend"]),
+                    "model": "fixture", "behavior": "fixture"})
+    resb = maybe_heartbeat(rt, now=day1)
+    c.that(resb["status"] == "skipped" and resb["reason"] == "budget",
+           f"spend over the ceiling SKIPS with reason=budget ({resb})")
+    c.that(len(skipped(g)) == 1
+           and skipped(g)[0].payload.get("reason") == "budget",
+           "a heartbeat.skipped:budget event is recorded")
+    c.that(len(fired(g)) == 0, "the over-budget tick fires NO heartbeat.fired")
+    c.that(g.get_object(bb).data.get("status") == "proposed",
+           "the over-budget tick does NO work — the branch stays proposed")
+    c.that(gate_unchanged(g), "an over-budget tick approves/submits nothing")
+
+    # ── cadence='off' (a seam) disables the heartbeat — the no-deploy kill ───
+    rt = fresh()
+    g = rt.graph
+    m = create_mission_fn(g, "Off mission",
+                          target_url=spec["mission"]["target_url"])
+    bo = create_branch_fn(g, m.id, "Off branch",
+                          "Read the site and check a claim.").id
+    rt.run_until_idle()
+    approve_seam(g, "setting.heartbeat_cadence", "off")
+    reso = maybe_heartbeat(rt, now=day1)
+    c.that(reso["status"] == "noop" and reso["reason"] == "off",
+           "cadence='off' disables the heartbeat (the instant, no-deploy kill)")
+    c.that(len(ticks(g)) == 0,
+           "a disabled heartbeat emits NO tick event and does no work")
+    c.that(g.get_object(bo).data.get("status") == "proposed",
+           "off → the branch stays proposed")
+
+    # ── an operator worklist of 'recrawl' rotates to the expensive step ──────
+    rt = fresh()
+    g = rt.graph
+    m = create_mission_fn(g, "Recrawl mission",
+                          target_url=spec["mission"]["target_url"])
+    br = create_branch_fn(g, m.id, "Recrawl branch",
+                          "Read the site and check a claim.").id
+    rt.run_until_idle()
+    approve_seam(g, "setting.heartbeat_worklist", "recrawl")
+    resr = maybe_heartbeat(rt, now=day1)
+    c.that(resr["status"] == "fired" and resr["step"] == "recrawl",
+           f"an operator worklist of 'recrawl' rotates to the recrawl step "
+           f"({resr.get('step')})")
+    crawl_reqs = [s for s in g.objects(type="source")
+                  if s.data.get("kind") == "crawl_request"
+                  and (s.data.get("metadata") or {}).get("requested_by")
+                  == "heartbeat"]
+    c.that(len(crawl_reqs) == 1,
+           "the recrawl step queues exactly one crawl_request the ingest "
+           "behavior reacts to")
+    c.that(g.get_object(br).data.get("status") == "proposed",
+           "the recrawl step activates NO branch — it brings in fresh input")
+    c.that(gate_unchanged(g), "the recrawl tick approves/submits nothing")
+
+    return c.done("heartbeat")
+
+
 def run_all() -> None:
     results = [
         run_bootstrap(),
@@ -5242,6 +5421,7 @@ def run_all() -> None:
         run_crawl_stall(),
         run_compat_regression(),
         run_storage_selection(),
+        run_heartbeat(),
     ]
     passed = sum(results)
     print(f"\n{'=' * 64}")

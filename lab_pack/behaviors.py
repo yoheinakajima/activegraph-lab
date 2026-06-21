@@ -229,6 +229,21 @@ def clear_lab_registry() -> None:
                 object.__setattr__(b, "model", None)
 
 
+def reset_dispatch_dedup(branch_id: str) -> None:
+    """Forget that a branch was already dispatched, so a deliberate
+    re-activation (operator steering, ADR-025; the heartbeat, ADR-044)
+    dispatches a FRESH task. The registry is a cache; the log is append-only
+    and existing observations are never touched."""
+    _DISPATCHED.discard(branch_id)
+
+
+def reset_crawl_dedup(mission_id: str) -> None:
+    """Reset the in-process crawl dedup for a mission, so a deliberate
+    re-crawl (operator recrawl steering, ADR-025; the heartbeat recrawl step,
+    ADR-044) re-fetches rather than no-opping. Cache only — the log stands."""
+    _CRAWLS[mission_id] = {"visited": set(), "fetched": 0, "queued": set()}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
