@@ -1,0 +1,25 @@
+name: heartbeat
+adr: "ADR-044"
+description: >
+  The daily heartbeat is a bounded, gated, killable standing behavior — the
+  lab's first wall-clock cadence, a deliberate departure from reactive-only.
+  A tick within the cadence window advances exactly one worklist item and
+  emits heartbeat.fired; a tick in the same window is a no-op; a restart
+  mid-window does not double-fire; a new window fires again; cadence="off"
+  (a seam) disables it; spend over the heartbeat ceiling records
+  heartbeat.skipped:budget and does no work; the heartbeat never approves,
+  promotes, or submits a PR — the gate is unchanged.
+
+mission:
+  title: "Heartbeat mission"
+  target_url: "https://activegraph.ai"
+
+branches:
+  - title: "Verify the replay-determinism claim"
+    intent: "Read the site and check the replay claim against the evidence."
+  - title: "Verify the fork-and-diff claim"
+    intent: "Read the site and check the fork/diff claim against the evidence."
+
+budget:
+  ceiling_usd: 15.0
+  synthetic_spend: 20.0

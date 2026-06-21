@@ -486,6 +486,19 @@ def _build_runtime():
     print(f"[lab_server] llm daily budget: {used_today} used today (UTC)", flush=True)
     print(f"[lab_server] boot: mode={mode} backend={storage.backend()} "
           f"events={len(rt.graph.events)} pending_decisions={pending}", flush=True)
+    # ADR-044: one wall-clock heartbeat check at boot so the daily tick still
+    # runs unattended (a restart/deploy is "existing activity") even with no
+    # UI traffic on /lab/feed. Idempotent per cadence window and killable via
+    # the heartbeat_cadence seam; guarded so a heartbeat hiccup never fails boot.
+    try:
+        from lab_pack.heartbeat import maybe_heartbeat
+        hb = maybe_heartbeat(rt)
+        if hb.get("status") != "noop":
+            print(f"[lab_server] heartbeat: {hb.get('status')} "
+                  f"({hb.get('reason')}) step={hb.get('step')}", flush=True)
+        rt.save_state()
+    except Exception as exc:  # pragma: no cover - boot must not die on this
+        _record_error("boot.heartbeat", exc)
     return rt
 
 
@@ -1619,8 +1632,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_static(path)
             elif path == "/lab/feed":
                 from lab_pack.watchdog import check_stalls
+                from lab_pack.heartbeat import maybe_heartbeat
                 rt = _get_rt()
                 _run_on_worker(check_stalls)  # A5: stalled work is released
+                # ADR-044: the daily heartbeat rides the same wall-clock
+                # chokepoint as the stall watchdog — at most one tick per
+                # cadence window, killable via the heartbeat_cadence seam.
+                _run_on_worker(maybe_heartbeat)
                 limit = int(qs.get("limit", 100))
                 with _lock:
                     self._send_json(_feed(rt, limit=limit))

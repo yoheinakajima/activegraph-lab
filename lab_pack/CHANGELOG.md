@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- The daily heartbeat — the lab's first standing behavior on a wall-clock
+  cadence, a bounded/gated/killable departure from reactive-only (ADR-044).
+  - **`lab_pack/heartbeat.py`** (PLUMBING, droppable like the watchdog):
+    `maybe_heartbeat(rt)` is a wall-clock WINDOW check (not a self-retriggering
+    loop), called from the same chokepoints as `check_stalls` — the server's
+    `/lab/feed` poll and a guarded boot call. At most ONE tick per cadence
+    window; the window key is stamped into every `heartbeat.fired`/
+    `heartbeat.skipped` marker event, so the once-per-window guarantee rebuilds
+    off the durable log and a mid-window restart never double-fires.
+  - **Fresh input THEN plan** (the "cadence outruns evidence" fix): each tick
+    advances ONE step of the operator `heartbeat_worklist` — `advance_branch`
+    (default, cheapest), `research_direction`, or `recrawl` (expensive, opt-in)
+    — bringing in new observations, then `run_until_idle` lets the existing
+    reactive planner react. It advances the backlog by one step; it never plans
+    from nothing.
+  - **Bounds**: spend at/above `heartbeat_budget_ceiling_usd` (default $15)
+    records `heartbeat.skipped:budget` and does no work; the heartbeat respects
+    the global pause. **The gate is unchanged**: it only activates an existing
+    branch or queues a `crawl_request` the `ingest` behavior reacts to — it
+    NEVER approves, promotes, or submits_pr; everything it causes lands as
+    proposals in the human inbox.
+  - **Killable with no deploy**: the `heartbeat_cadence` seam = "off" stops it
+    instantly (hot-loads through the gate); the global `pause_lab` also stops
+    it. Three seam-eligible knobs (`heartbeat_cadence`, `heartbeat_worklist`,
+    `heartbeat_budget_ceiling_usd`); the gate-preservation and budget clamp
+    stay in code.
+  - **Fan-out follow-up flagged**: a daily `recrawl` exercises the known
+    ~6-7x fan-out amplification, so it is out of the default worklist and
+    trigger-debouncing should land before it runs unattended (ROADMAP queue 6).
+  - **Fixture** `heartbeat` (LLM mocked): within-window fires + advances one
+    item; same-window no-op; restart no double-fire; window rollover fires
+    again; over-budget skip:budget with no work; cadence="off" disables;
+    "recrawl" worklist queues one crawl_request; gate unchanged across all
+    legs. Suite 40/40.
+
 - Self-dispatched code repair — the self-repair loop's FIRST mile, closed
   (ADR-036). The lab repairs the lab; the operator approves the PR.
   - **`self_repair` planner** (`lab_pack/behaviors.py`): a deterministic

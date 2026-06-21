@@ -288,3 +288,55 @@ class LabSettings(BaseModel):
             "and stops cleanly — behaviors receive inert outputs, never errors."
         ),
     )
+    # ── the daily heartbeat (ADR-044) ───────────────────────────────────────
+    # The lab's FIRST standing behavior on a wall-clock cadence — a deliberate
+    # departure from reactive-only (the log is the agent, no scheduler). It is
+    # bounded, gated, and killable without a deploy. All three settings are
+    # seam-eligible so the operator tunes the cadence/worklist/ceiling through
+    # the gate (lab_pack/kernel.py SEAM_ELIGIBLE_SETTINGS), and the cadence
+    # seam is the instant kill: set it to "off" and the heartbeat stops, no
+    # deploy. The heartbeat NEVER approves, promotes, or submits a PR — every
+    # thing it causes still lands as PROPOSALS in the operator inbox (ADR-044).
+    heartbeat_cadence: str = Field(
+        default="daily",
+        description=(
+            "Cadence for the daily heartbeat (ADR-044). 'daily' = at most one "
+            "tick per UTC calendar day; 'off' = disabled (the instant kill — a "
+            "seam override or env value of 'off' stops the heartbeat with NO "
+            "deploy). Any other value is treated as 'daily' so a typo cannot "
+            "make it fire faster. The tick is driven by a wall-clock window "
+            "check on existing activity (the same chokepoint as the stall "
+            "watchdog), NOT a self-retriggering loop — exactly one tick per "
+            "window, idempotent if the process restarts mid-window."
+        ),
+    )
+    heartbeat_worklist: str = Field(
+        default="advance_branch",
+        description=(
+            "Comma-separated operator worklist the heartbeat rotates through "
+            "one step per tick (ADR-044). Known steps: 'advance_branch' "
+            "(activate the oldest proposed/scoped branch — the CHEAPEST useful "
+            "step, no crawl), 'research_direction' (activate the oldest branch "
+            "carrying an operator-noted direction), 'recrawl' (a fresh crawl "
+            "of the mission site — EXPENSIVE: exercises the known fan-out "
+            "amplification, deliberately NOT in the default so the heartbeat "
+            "does not recrawl unattended every day; add it only after trigger "
+            "debouncing lands, ADR-044 follow-up). The heartbeat brings in ONE "
+            "step of fresh input, then the existing reactive planner reacts — "
+            "it advances the backlog by one step, it does not invent work."
+        ),
+    )
+    heartbeat_budget_ceiling_usd: float = Field(
+        default=15.0,
+        ge=0.0,
+        description=(
+            "Spend gate for the heartbeat (ADR-044): before any heartbeat "
+            "work, if today's LLM spend (llm_cost_today, the same native "
+            "per-model accounting the daily cap uses) is at or above this "
+            "ceiling, the tick records 'heartbeat.skipped: budget' and does "
+            "nothing. Defaults well under the $50 daily cap and the $100 "
+            "kernel ceiling so the heartbeat can never approach the cap on its "
+            "own. Seam-eligible — tuning the heartbeat's spend floor is "
+            "self-modification through the gate."
+        ),
+    )
