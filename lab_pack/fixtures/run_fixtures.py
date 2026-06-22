@@ -1603,6 +1603,176 @@ def run_budget_starvation() -> bool:
     return c.done("budget_starvation")
 
 
+def run_plan_gate() -> bool:
+    spec = _load("plan_gate.yaml")
+    print("\n" + "=" * 64)
+    print("Fixture: plan_gate — pre-dispatch gate stops plan's flood + "
+          "starvation; depth=0 view trims the prompt (ADR-045)")
+    print("=" * 64)
+
+    import json
+    from activegraph.core.event import Event
+    from lab_pack.llm import (_LLM_STATE, LabProviderWrapper, _lab_prompt_bodies,
+                              reset_llm_run_counters, reset_llm_session)
+    from lab_pack.tools import register_web_fetch
+
+    c = Check()
+    exp = spec["expected"]
+
+    # ── Phase A: FIX 2a — plan's depth=0 prompt excludes the bulky source ────
+    # A crawl of a big page grounds a claim to a ~10k-char source via the
+    # `grounds` relation (production pages drove the ~87k-token planner prompt).
+    # depth=1 WOULD pull that source into the prompt; depth=0 carries only the
+    # claim. Provenance is preserved out of band (the claim's source_ids), so
+    # nothing the planner needs is lost.
+    big_page = ("<html><body>"
+                + "".join(f"<p>ActiveGraph cuts verification latency by {i} "
+                          f"percent across documented production graph "
+                          f"workloads in trial {i}.</p>" for i in range(40))
+                + "<svg>" + ("M120.5 33.2 L9.1 8.7 " * 6000)
+                + "</svg></body></html>")
+
+    clear_lab_registry()
+    reset_llm_session()
+    rt_a = Runtime(Graph(), llm_provider=LabMockProvider())
+    rt_a.load_pack(core_pack, settings=CoreSettings())
+    rt_a.load_pack(tg_pack, settings=ToolGatewaySettings())
+    rt_a.load_pack(lab_pack, settings=LabSettings())
+    bind_live_behaviors(rt_a)
+    register_web_fetch(
+        lambda url, **_k: {"url": url, "status": 200, "content": big_page},
+        overwrite=True)
+    g_a = rt_a.graph
+    create_mission_fn(g_a, spec["mission"]["title"], "Grow evidence.",
+                      "https://activegraph.ai")
+    rt_a.run_until_idle()
+
+    claims = _lab_obs(g_a, "site_claim")
+    c.that(len(claims) > 0, f"crawl extracted site_claims ({len(claims)})")
+    if claims:
+        obs = claims[0]
+        objs1, _rels1 = g_a.neighborhood(obs.id, depth=1)
+        src_sizes = [len(json.dumps(o.data, default=str))
+                     for o in objs1 if o.type == "source"]
+        max_src = max(src_sizes) if src_sizes else 0
+        c.that(max_src > int(exp["source_data_floor"]),
+               f"depth=1 WOULD pull the bulky source ({max_src} chars > "
+               f"{exp['source_data_floor']}) — the trim is load-bearing")
+
+        plan_b = rt_a.get_behavior("lab.plan")
+        ev = Event(id="evt_plan_probe", type="lab.plan_requested",
+                   payload={"object": {"id": obs.id, "type": obs.type,
+                                       "data": obs.data}})
+        prompt = plan_b.build_prompt(ev, g_a, frame=rt_a.frame)
+        blob = json.dumps(prompt.to_hashable(), default=str)
+        approx_tokens = len(blob) // 4
+        c.that(approx_tokens < int(exp["prompt_token_ceiling"]),
+               f"FIX 2a: plan's depth=0 prompt is small (~{approx_tokens} "
+               f"tokens < {exp['prompt_token_ceiling']})")
+        c.that("M120.5 33.2" not in blob,
+               "FIX 2a: the bulky source page body is NOT in the prompt")
+        c.that(obs.data.get("text", "")[:30] in blob,
+               "FIX 2a: the claim text itself IS still in the prompt "
+               "(subject preserved)")
+        c.that(max_src > len(blob),
+               "FIX 2a: the excluded source alone is larger than the entire "
+               "trimmed prompt")
+        print(f"  FIX 2a: source ~{max_src} chars excluded; plan prompt "
+              f"~{approx_tokens} tokens")
+
+    # ── Phase B: FIX 1 — the gate caps dispatch: no flood, no starvation ─────
+    # A finite per-drain LLM budget stands in for the production runtime's
+    # per-drain budget. N > cap site claims are queued, THEN one downstream
+    # task-outcome (interpret's trigger). Pre-fix, each of the N plan dispatches
+    # spent the per-drain budget (real for the first `cap`, canned-but-still-
+    # charged after) and emitted a fat llm.requested — exhausting the budget
+    # before interpret ran (starvation) and flooding the log. Post-fix, the gate
+    # dispatches plan exactly `cap` times and the rest stop before the provider.
+    cap = int(spec["per_behavior_cap"])
+    n_claims = int(spec["claim_count"])
+    budget_cap = cap + int(spec["budget_headroom"])
+
+    clear_lab_registry()
+    reset_llm_session()
+    wrapper = LabProviderWrapper(LabMockProvider(), max_total=60,
+                                 max_per_behavior=cap, max_daily=200,
+                                 max_daily_cost_usd=50.0,
+                                 prompt_bodies=_lab_prompt_bodies())
+    rt_b = Runtime(Graph(), llm_provider=wrapper,
+                   budget={"max_llm_calls": budget_cap})
+    rt_b.load_pack(core_pack, settings=CoreSettings())
+    rt_b.load_pack(lab_pack,
+                   settings=LabSettings(max_llm_calls_per_behavior_run=cap))
+    bind_live_behaviors(rt_b)
+    g_b = rt_b.graph
+    mission = create_mission_fn(g_b, "Flood", target_url="")
+    branch = create_branch_fn(g_b, mission.id, "Downstream worker branch",
+                              "interpret a completed task")
+    rt_b.run_until_idle()
+    reset_llm_run_counters()  # setup done → a fresh run episode for the cap
+
+    for i in range(n_claims):
+        g_b.add_object("observation", {
+            "text": f"Claim {i}: ActiveGraph replays event {i} deterministically.",
+            "confidence": 0.7, "category": "fact",
+            "metadata": {"lab": "site_claim", "mission_id": mission.id},
+        })
+    g_b.add_object("evaluation", {
+        "subject_id": "task_probe",
+        "subject_type": "task",
+        "judgment": "completed_successfully",
+        "rationale": "The downstream probe task completed.",
+        "evaluator": "lab.work",
+        "metadata": {"lab": "task_outcome", "lab_branch_id": branch.id,
+                     "task_id": "task_probe"},
+    })
+    rt_b.run_until_idle()  # ONE drain — the per-drain budget is shared
+
+    def llm_requested_plan():
+        return len([e for e in g_b.events
+                    if str(e.type) == "llm.requested"
+                    and (e.payload or {}).get("behavior") in ("plan", "lab.plan")])
+
+    def plan_requested_events():
+        return len([e for e in g_b.events
+                    if str(e.type) == "lab.plan_requested"])
+
+    def plan_backoff_obs():
+        return [o for o in _lab_obs(g_b, "llm_behavior_budget")
+                if (o.data.get("metadata") or {}).get("behavior") == "plan"]
+
+    plan_calls = _LLM_STATE["by_behavior"].get("plan", 0)
+    interp_calls = _LLM_STATE["by_behavior"].get("interpret", 0)
+
+    c.that(plan_calls == int(exp["plan_calls"]),
+           f"plan made exactly cap real LLM calls ({plan_calls} == {cap})")
+    c.that(llm_requested_plan() == int(exp["plan_requested_events"]),
+           f"NO FLOOD: exactly cap llm.requested(plan) events, not {n_claims} "
+           f"({llm_requested_plan()})")
+    c.that(plan_requested_events() == cap,
+           f"the gate emitted lab.plan_requested only cap times "
+           f"({plan_requested_events()})")
+    c.that(len(plan_backoff_obs()) == int(exp["backoff_observations"]),
+           f"exactly one planner-backoff observation for the whole episode "
+           f"({len(plan_backoff_obs())}), not one per over-cap claim")
+    c.that(interp_calls >= int(exp["interpret_calls_min"]),
+           f"downstream worker (interpret) STILL got LLM budget "
+           f"({interp_calls} call(s)) — not starved")
+    c.that(rt_b.budget.remaining(),
+           "the per-drain budget survived (the flood would have exhausted it "
+           "before interpret ran)")
+    used = rt_b.budget.used.get("max_llm_calls", 0)
+    c.that(used == cap + interp_calls,
+           f"budget spent is exactly plan({cap}) + interpret({interp_calls}) "
+           f"= {int(used)}, no per-dispatch flood drain")
+    print(f"  FIX 1: {n_claims} claims → plan dispatched "
+          f"{plan_requested_events()}x (cap {cap}), {len(plan_backoff_obs())} "
+          f"backoff obs, interpret {interp_calls}x, budget "
+          f"{int(used)}/{budget_cap}")
+
+    return c.done("plan_gate")
+
+
 def run_decision_rationale() -> bool:
     spec = _load("decision_rationale.yaml")
     print("\n" + "=" * 64)
@@ -5397,6 +5567,7 @@ def run_all() -> None:
         run_provenance_footer(),
         run_operator_controls(),
         run_budget_starvation(),
+        run_plan_gate(),
         run_decision_rationale(),
         run_paused_boot(),
         run_seams(),

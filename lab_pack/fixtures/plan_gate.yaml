@@ -1,0 +1,12 @@
+mission:
+  title: "Plan-gate flood and trim (ADR-045)"
+per_behavior_cap: 5
+claim_count: 12
+budget_headroom: 3
+expected:
+  plan_calls: 5
+  plan_requested_events: 5
+  backoff_observations: 1
+  interpret_calls_min: 1
+  prompt_token_ceiling: 2500
+  source_data_floor: 5000

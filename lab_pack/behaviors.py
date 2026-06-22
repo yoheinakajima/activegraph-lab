@@ -67,6 +67,7 @@ from .llm import (
     consume_llm_anomalies,
     is_inert,
     llm_usage,
+    reserve_plan_dispatch,
 )
 from .seams import (
     charter_file_default,
@@ -613,14 +614,53 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
 # ---------------------------------------------------------------- plan
 
 
-@llm_behavior(
-    name="plan",
+@behavior(
+    name="plan_gate",
     on=["object.created"],
     where={"object.type": "observation", "object.data.metadata.lab": "site_claim"},
+    creates=["observation"],
+)
+def plan_gate(event, graph, ctx, *, settings: LabSettings):
+    """ADR-045 / FIX 1: the pre-dispatch gate in front of lab.plan.
+
+    On: object.created (observation, metadata.lab=site_claim) — the SAME
+        trigger plan used to fire on directly.
+    Creates: observation (the per-run planner-backoff marker, at most once).
+
+    Why a gate and not a body check: the runtime emits llm.requested (carrying
+    the full prompt) and consumes the per-drain budget BEFORE the handler runs,
+    so plan's own body cannot stop the flood (one fat zero-value llm.requested
+    per crawl claim) or the per-dispatch budget drain that starves downstream
+    workers. The only lab-side lever is to NOT dispatch plan at all once its
+    per-run cap is spent. This gate owns the dedup that used to live in plan,
+    reserves a dispatch slot against the per-run cap, and only on success
+    re-emits the work as lab.plan_requested — the event plan now triggers on.
+    Site claims past the cap stop here: no llm.requested, no budget spent, and
+    exactly one backoff observation for the whole run episode.
+    """
+    consume_llm_anomalies(graph)
+    obj = event.payload.get("object", {})
+    obs_id = obj.get("id")
+    if not obs_id or obs_id in _PLANNED_OBS:
+        return
+    _PLANNED_OBS.add(obs_id)
+    cap = int(effective_setting(graph, settings, "max_llm_calls_per_behavior_run"))
+    if not reserve_plan_dispatch(cap):
+        # Cap spent this run cycle: record the (deduped) backoff observation and
+        # stop — the planner does NOT fire, so no prompt is built and no budget
+        # is consumed for this claim.
+        consume_llm_anomalies(graph)
+        return
+    graph.emit("lab.plan_requested", {"object": obj})
+
+
+@llm_behavior(
+    name="plan",
+    on=["lab.plan_requested"],
     description=_file_default_description("plan"),
     output_schema=PlanProposal,
     model=None,
-    view={"around": "event.payload.object.id", "depth": 1, "recent_events": 0},
+    view={"around": "event.payload.object.id", "depth": 0, "recent_events": 0},
     creates=["branch"],
     max_tokens=1024,
     tools=[],
@@ -628,10 +668,17 @@ def ingest(event, graph, ctx, *, settings: LabSettings):
 def plan(event, graph, ctx, out, *, settings: LabSettings):
     """Propose a branch for a weakly evidenced site claim.
 
-    On: object.created (observation, metadata.lab=site_claim)
+    On: lab.plan_requested (re-emitted by plan_gate after the dedup + per-run
+        dispatch reservation, ADR-045 / FIX 1).
     Creates: branch (proposed, gated) + has_branch + supported_by relations.
     The narrated reasoning rides in the branch.created event payload
     (data.metadata.reasoning) — prioritization is prose, never a formula.
+
+    FIX 2a: the view is depth=0 — JUST the claim observation, NOT the bulky
+    source page the `grounds` relation would pull at depth=1 (~87k-token
+    prompts; the source body dominated). Provenance is preserved out of band:
+    the claim carries its source_ids in metadata, and the gate dedup/cap above
+    is unchanged. The planner judges the claim on its own text.
     """
     consume_llm_anomalies(graph)
     obj = event.payload.get("object", {})
@@ -639,9 +686,8 @@ def plan(event, graph, ctx, out, *, settings: LabSettings):
     data = obj.get("data", {})
     mission_id = (data.get("metadata") or {}).get("mission_id")
 
-    if not obs_id or obs_id in _PLANNED_OBS:
+    if not obs_id:
         return
-    _PLANNED_OBS.add(obs_id)
 
     if out is None or not getattr(out, "should_branch", False):
         return
@@ -3392,6 +3438,6 @@ from .research_worker import research_intake, research_worker  # noqa: E402
 # at import time.
 from .code_worker import code_author, code_intake, code_worker  # noqa: E402
 
-BEHAVIORS = [ingest, plan, work, research_intake, interpret, self_repair,
-             digest, gate, draft_writer, research_worker, code_intake,
-             code_worker, code_author, seam_writer, answer]
+BEHAVIORS = [ingest, plan_gate, plan, work, research_intake, interpret,
+             self_repair, digest, gate, draft_writer, research_worker,
+             code_intake, code_worker, code_author, seam_writer, answer]

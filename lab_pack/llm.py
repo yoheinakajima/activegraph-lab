@@ -653,6 +653,14 @@ _LLM_STATE: dict[str, Any] = {
     "paused": False,              # ADR-015; rebuilt from lab.paused/resumed
     "pause_skipped": set(),       # behaviors skipped THIS pause episode
     "behavior_capped": set(),     # per-behavior exhaustion queued THIS run episode
+    # ADR-045 / FIX 1: plan dispatches reserved THIS run episode. The runtime
+    # emits llm.requested (the full prompt) and consumes the per-drain budget
+    # BEFORE a handler runs, so the planner's per-behavior cap cannot be
+    # enforced inside plan's body — by the time plan sees the canned return the
+    # flood + starvation already happened. plan_gate reserves a dispatch slot
+    # against this counter BEFORE the runtime is asked to plan; once the cap is
+    # hit, further site-claim triggers never reach the provider at all.
+    "plan_dispatched": 0,
     "last_model": None,
     # Per-behavior model resolution actually used at call time — the SAME
     # value the runtime stamps on each llm.responded event (ADR-019). The
@@ -752,8 +760,8 @@ def reset_llm_session() -> None:
                       daily_cost_recorded=False, cost_cap_override=None,
                       operator_cost_cap=None,
                       paused=False, pause_skipped=set(),
-                      behavior_capped=set(), last_model=None,
-                      model_by_behavior={})
+                      behavior_capped=set(), plan_dispatched=0,
+                      last_model=None, model_by_behavior={})
 
 
 def _operator_cap_now() -> Optional[float]:
@@ -811,6 +819,42 @@ def reset_llm_run_counters() -> None:
     cycle may record again if it exhausts this one."""
     _LLM_STATE["by_behavior"] = {}
     _LLM_STATE["behavior_capped"] = set()
+    # ADR-045 / FIX 1: the plan-dispatch reservation is a per-run-episode
+    # counter, reset in lockstep with by_behavior so the next run cycle can
+    # plan up to the cap again.
+    _LLM_STATE["plan_dispatched"] = 0
+
+
+def reserve_plan_dispatch(cap: int) -> bool:
+    """ADR-045 / FIX 1: reserve one plan dispatch slot against the per-run cap,
+    BEFORE the runtime is asked to plan.
+
+    Returns True (slot reserved) while fewer than `cap` plan dispatches have
+    been reserved this run episode; returns False once the cap is reached. The
+    caller (plan_gate) emits lab.plan_requested only on True, so the runtime
+    never builds the prompt, never emits llm.requested, and never consumes the
+    per-drain budget for a claim that would only be canned-returned anyway —
+    closing FIX 1's flood (one zero-value llm.requested per crawl claim) and
+    starvation (per-dispatch budget drain ahead of downstream workers).
+
+    On the FIRST over-cap claim this run episode it queues ONE behavior_budget
+    anomaly for plan (reusing the same behavior_capped dedup + consume path the
+    in-provider per-behavior cap uses), so the log still records that the
+    planner backed off — once, not once per claim. Later over-cap claims are
+    silent (already deduped)."""
+    if _LLM_STATE["plan_dispatched"] < cap:
+        _LLM_STATE["plan_dispatched"] += 1
+        return True
+    if "plan" not in _LLM_STATE["behavior_capped"]:
+        _LLM_STATE["behavior_capped"].add("plan")
+        _LLM_STATE["anomalies"].append({
+            "kind": "behavior_budget", "behavior": "plan",
+            "detail": f"per-run cap {cap} reached for plan (planner backoff; "
+                      "further site-claim triggers this run cycle are skipped "
+                      "before the provider — no per-dispatch llm.requested, no "
+                      "downstream starvation)",
+            "raw": None})
+    return False
 
 
 def llm_usage() -> dict[str, Any]:
